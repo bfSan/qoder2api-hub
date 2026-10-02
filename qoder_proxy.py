@@ -2615,6 +2615,49 @@ def _to_int_status(status):
         return 502
 
 
+def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None):
+    """信封层非 200（如 403 队列满/Token被拒、429 等）冷却该账号并解绑会话，触发下次选号轮换。"""
+    if not account or not hasattr(account, "note_error"):
+        return
+    status_int = _to_int_status(getattr(exc, "status", 502))
+    detail = getattr(exc, "detail", "") or ""
+    if session_key and POOL:
+        try:
+            POOL.affinity.unbind(session_key)
+        except Exception:
+            pass
+    total = len(POOL.accounts) if POOL else 1
+    # 针对 10605 / retryAfterSeconds 解析冷却时长
+    retry_secs = 30
+    m = re.search(r'retryAfterSeconds\D+(\d+)', detail)
+    if m:
+        try:
+            retry_secs = int(m.group(1))
+        except Exception:
+            pass
+    if status_int == 429:
+        account.note_error("envelope 429", model=model, cooldown=retry_secs)
+        log("account %s throttled via envelope (429), cooling for %ds"
+            % (account.uid[:8], retry_secs), level="WARN", tag="chat")
+    elif status_int in (401, 403):
+        dead = qoder_accounts.session_dead(detail)
+        # 10605 排队冷却为模型级或账号级
+        is_queue = "10605" in detail or "isQueued" in detail
+        cd = 300 if dead else (retry_secs if is_queue else 60)
+        account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
+                           cooldown=cd, single_account=(total <= 1),
+                           model=model if is_queue else None)
+        log("account %s rejected via envelope (HTTP %s, queue=%s), cooling for %ds and rotating"
+            % (account.uid[:8], status_int, is_queue, cd), level="WARN", tag="chat")
+        if dead:
+            account.enabled = False
+            account.save(ACCOUNTS_DIR) if account.path else None
+            log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
+                % account.uid[:8], level="ERROR")
+    else:
+        account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
+                           cooldown=15, single_account=(total <= 1))
+
 def should_retry_envelope(exc, emitted_bytes, attempt):
     """流内错误信封是否值得**重开上游**再试。
 
@@ -2627,8 +2670,12 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
         return False
     if attempt >= TRANSIENT_MAX_RETRIES:
         return False
-    return _is_transient_upstream(_to_int_status(getattr(exc, "status", 502)),
-                                  getattr(exc, "detail", "") or "")
+    status_int = _to_int_status(getattr(exc, "status", 502))
+    detail = getattr(exc, "detail", "") or ""
+    # 401/403 (含 10605 排队被拒) 与 429 在未吐出字节前均允许通过 reopen 换号重试
+    if status_int in (401, 403, 429):
+        return True
+    return _is_transient_upstream(status_int, detail)
 
 
 def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
@@ -2649,8 +2696,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 obj = aggregate_stream(cur, model, None, holder=holder)
                 return obj, account
             except UpstreamStatus as exc:
-                if attempt >= TRANSIENT_MAX_RETRIES or not _is_transient_upstream(
-                        _to_int_status(exc.status), exc.detail or ""):
+                _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
+                if not should_retry_envelope(exc, False, attempt):
                     raise
                 log("in-stream envelope status %s on model '%s' "
                     "(try %d/%d), reopening upstream"
@@ -5057,6 +5104,7 @@ class Handler(BaseHTTPRequestHandler):
                                          fp=fp, account=account.uid)
                             return
                         except UpstreamStatus as exc:
+                            _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                             # 控制帧（response.created 等）先于数据，不能算
                             # “已输出”；以上游数据行计数判断能否重开。
                             if should_retry_envelope(exc, False, attempts) \
@@ -5250,6 +5298,7 @@ class Handler(BaseHTTPRequestHandler):
                                          fp=fp, account=account.uid)
                             return
                         except UpstreamStatus as exc:
+                            _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                             if should_retry_envelope(exc, emitted, attempts):
                                 attempts += 1
                                 log("chat in-stream envelope status %s on "
