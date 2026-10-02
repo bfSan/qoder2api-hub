@@ -2437,5 +2437,65 @@ check("领取全部福利 = 活动全量 + Pro 福利包（run + travel）",
       'postJSON("/tasks/run"' in _dash25 and 'postJSON("/tasks/travel"' in _dash25)
 
 print()
+print("[26] PR#7 合并回归：信封层 403(10605 排队) -> 账号冷却 + 解绑 + 轮换")
+class _Aff26:
+    def __init__(self): self.calls = []
+    def unbind(self, key): self.calls.append(key)
+class _Pool26:
+    def __init__(self):
+        self.affinity = _Aff26(); self.accounts = [1, 2, 3]
+class _Acc26:
+    def __init__(self):
+        self.uid = "pr7acc12"; self.enabled = True; self.notes = []; self.saved = 0
+        self.path = ""
+    def note_error(self, msg, cooldown=60, single_account=False, model=None, until=None):
+        self.notes.append({"msg": str(msg)[:60], "cooldown": cooldown, "model": model})
+    def save(self, d): self.saved += 1
+class _UpErr26(Exception):
+    def __init__(self, status, detail):
+        self.status = status; self.detail = detail
+
+_orig_pool26 = P.POOL
+_acc26 = _Acc26()
+P.POOL = _Pool26()
+P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+try:
+    P._handle_envelope_account_cooldown(_acc26, _UpErr26(
+        403, '{"code":"10605","message":"{\"isQueued\":true,\"retryAfterSeconds\": 30}"}'),
+        model="qfmodel", session_key="sk-pr7")
+    _n1 = _acc26.notes[-1]
+    P._handle_envelope_account_cooldown(_acc26, _UpErr26(403, "permission denied"),
+                                        model="qfmodel", session_key="sk-pr7")
+    _n2 = _acc26.notes[-1]
+    P._handle_envelope_account_cooldown(_acc26, _UpErr26(429, "rate limit"),
+                                        model="qfmodel", session_key="sk-pr7")
+    _n3 = _acc26.notes[-1]
+    _acc26.enabled = True
+    P._handle_envelope_account_cooldown(_acc26, _UpErr26(401, "TOKEN_EXPIRE session dead"),
+                                        model=None, session_key="sk-pr7")
+    _n4 = _acc26.notes[-1]
+    _aff26_calls = list(P.POOL.affinity.calls)
+finally:
+    P.POOL = _orig_pool26
+check("10605 排队 -> 模型级冷却 30s（按上游 retryAfterSeconds）+ 解绑会话",
+      _n1["cooldown"] == 30 and _n1["model"] == "qfmodel"
+      and set(_aff26_calls) == {"sk-pr7"} and len(_aff26_calls) >= 1,
+      (_n1, _aff26_calls))
+check("403 非排队 -> 账号级冷却 60s", _n2["cooldown"] == 60 and _n2["model"] is None, _n2)
+check("429 -> 模型级冷却 30s", _n3["cooldown"] == 30 and _n3["model"] == "qfmodel", _n3)
+check("死会话 -> 300s + 停用账号（与 open_upstream 同语义）",
+      _acc26.enabled is False and _n4["cooldown"] == 300, _n4)
+for st, detail, want in ((403, "10605", True), (401, "x", True), (429, "x", True),
+                         (418, "DataInspectionFailed", False),
+                         (400, "invalid_parameter_error", False), (500, "x", True)):
+    got = P.should_retry_envelope(P.UpstreamStatus(st, detail), False, 0)
+    check("未吐字节可重开：%s -> %s" % (st, want), got is want, (st, got))
+_src26 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("三处信封捕获点都接入账号冷却",
+      _src26.count("_handle_envelope_account_cooldown(") >= 4,
+      _src26.count("_handle_envelope_account_cooldown("))
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
