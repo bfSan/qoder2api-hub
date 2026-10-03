@@ -195,7 +195,13 @@ def desktop_install_dir(realm):
 
 
 def runtime_info_exe(realm):
-    """定位官方 runtime-info.exe（原生风控身份桥）；找不到返回空串。
+    """定位 runtime-info 原生风控身份桥；找不到返回空串。
+
+    查找顺序（先桌面客户端，再提取目录）：
+      1. <桌面客户端安装目录>/resources/umid/runtime-info.exe（Windows 桌面端）；
+      2. POSIX：$QD_UMID_DIR/runtime-info、<repo>/umid/runtime-info
+         （由 _install_umid.py 从 @qoder-ai/qodercli 提取；两者调用契约一致。
+          Windows 不参与此分支，保持原有桌面客户端路径逐字不变）。
 
     可用 QD_NATIVE_IDENTITY=0 关闭（测试/受限环境不希望拉起客户端二进制时）。
     """
@@ -203,14 +209,27 @@ def runtime_info_exe(realm):
         return ""
     if realm in _native_exe_cache:
         return _native_exe_cache[realm]
-    exe = ""
-    roots = [os.path.join(desktop_install_dir(realm), "resources", "umid")]
     found = ""
+    roots = [os.path.join(desktop_install_dir(realm), "resources", "umid")]
     for root in roots:
         cand = os.path.join(root, "runtime-info.exe")
         if os.path.isfile(cand):
             found = cand
             break
+    if not found and os.name == "posix":
+        # 提取目录（_install_umid.py 的落地位置；Windows 不参与本分支，
+        # 保持原有桌面客户端路径逐字不变）：显式 QD_UMID_DIR 优先于约定目录。
+        extracted = []
+        umid_dir = (os.environ.get("QD_UMID_DIR") or "").strip()
+        if umid_dir:
+            extracted.append(umid_dir)
+        extracted.append(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "umid"))
+        for root in extracted:
+            cand = os.path.join(root, "runtime-info")
+            if os.path.isfile(cand):
+                found = cand
+                break
     _native_exe_cache[realm] = found
     return found
 

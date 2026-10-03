@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.2-2496ED?style=flat-square" alt="Version 1.2.2">
+  <img src="https://img.shields.io/badge/Release-v1.2.3-2496ED?style=flat-square" alt="Version 1.2.3">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -330,7 +330,7 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 ## 六、开发与测试
 
 ```bash
-# 离线确定性测试（461 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
+# 离线确定性测试（482 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
 # 自定义 B64、COSY 签名、双区官方目录全字段（峰谷价/多窗口/思考档位/展示 id/解析）、
 # 独占路由、签到能力运行时探测与 DISABLED 归一化、活动平台归一化、DeepSeek
 # reasoning_content 回填与 flatten 保留、请求体、信封解包、custom 工具转译、
@@ -372,12 +372,26 @@ python _verify_models.py --base http://127.0.0.1:8790
 | `baseprompt.json` | 官方推理请求体模板 |
 | `dashboard.html` | 单文件 Web 看板（本地凭证两步扫描导入 + PAT 导入 + 签到中心的**本机虚拟化检测**卡片） |
 | `_diag_campaign.py` | 签到/活动链路体检（含本机虚拟化状态，中文输出） |
+| `_install_umid.py` | 从官方 npm 包 `@qoder-ai/qodercli` 提取内嵌的原生 UMID 组件（Linux/macOS 拿真机器身份；**机器级身份，解决不了同机多账号**） |
 
 ---
 
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.2.3
+
+**从 `@qoder-ai/qodercli` 提取内嵌 UMID 组件，让 Linux / Docker 部署也能拿到真实机器身份**
+
+- **背景**：v1.2.2 把国际版「没有真身份」如实标成了已知限制（`machine_headers=omitted` + `hint`）。本期把「拿不到真身份」这件事本身解决掉——官方 CLI 的发行包里其实**内嵌了各平台的原生 UMID 组件**。
+- **提取原理（实测）**：`@qoder-ai/qodercli` 是纯 JS bundle，原生组件以 **base64 字符串字面量**内嵌在 `package/bundle/qoder-worker-runtime.mjs` 里（共 11 个长字面量）。新增 `_install_umid.py`：下载官方 tarball（校验 sha512 integrity）→ 扫描长 base64 字面量 → **按格式与架构识别**（解析 ELF `e_machine` / Mach-O `cputype`）→ 选中当前平台的组件 → 原子落盘并 `chmod 755`。零第三方依赖，**不需要 node 作为运行时依赖**。
+- 实测候选清单：`WASM × 5 · Mach-O x86_64/arm64 × 2 · ELF x86-64/aarch64 × 2 · PE x86-64 × 2`；Linux x64 选中 652,488 B、arm64 选中 660,624 B（另注：本机桌面端的 `runtime-info.exe` 与包内 PE 组件同为 480,752 B，互为佐证）。
+- **接入**：`runtime_info_exe()` 在 POSIX 上新增查找路径 `$QD_UMID_DIR/runtime-info` 与 `<repo>/umid/runtime-info`（桌面客户端路径仍优先，**Windows 行为逐字不变**）；调用契约与官方桌面端二进制完全一致（`prod --account-stdin`），调用侧无需改动。
+- **容器**：Dockerfile 改为**构建期多阶段提取**（builder 用 `python:3.11-alpine`，不需要 node；31 MB 的 npm 包不进最终镜像，只多 652 KB 组件），按 `TARGETARCH` 支持 amd64/arm64；提取失败不阻断构建（退化为 `omitted` 而非报错），脚本本身也 COPY 进镜像以便运行期补救。
+- **实测验证**：在 WSL 里真实执行提取出的组件，返回 `machineToken` / `machineType` / `machineCode` / `vmInfo`；连续三次调用身份字段逐字节一致。
+- **明确的能力边界（重要）**：该组件输出的是**机器级**身份，与 `account` 参数无关——不同账号 / 空账号 / 不同 `HOME` / 不同 `XDG_CONFIG_HOME` 全部返回**同一个** `machineToken`，且组件没有 CLI 开关、环境变量或状态文件可以影响它。所以本期**解决的是「Linux 部署拿不到真身份」**，**不是**「同一台机器多账号都能领」——后者是上游按设备去重的策略，需要不同的机器（详见「已知限制」）。
+- 新增 [30] 段 21 条断言（格式/架构识别、平台映射、体积启发式、base64 扫描、integrity 与 magic 双重校验、幂等、端到端全链路、跨模块契约）+ 3 条变异反证。当前基线：**482 checks, 479 passed, 0 failed, 3 skipped, exit 0**。
 
 ### v1.2.2
 
@@ -389,7 +403,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **国际版已知限制提示**：当 realm 为 intl 且本次未发送机器头时，新增 `hint` 字段给出明确文案（「国际版要求真实 UMID 机器身份……活动列表可能不可见、领取可能失败，这是已知限制，不等于今天没有活动」）；国内版不提示（省略在国内版是**正确行为**）。
 - `_diag_campaign.py` 的「活动平台」行改为同时打印身份来源与本次机器头状态，并输出 hint。
 - 新增 [29] 段 8 条断言（状态字段与**实测头集合**同时校验，防止状态与行为脱钩）+ 2 条变异反证（忘记收窄 / 国内版误提示 都会变红）。
-- 当前基线：**461 checks, 458 passed, 0 failed, 3 skipped, exit 0**。
+- 当前基线：**482 checks, 458 passed, 0 failed, 3 skipped, exit 0**。
 - **关于从 `@qoder-ai/qodercli` 提取 UMID 组件**：本轮**未实现**——属于引入第三方二进制的新能力（分发合规、提取链路的可维护性、以及「每台设备每日仅 1 个国际版账号可领」的上游约束），需单独评估。
 
 ### v1.2.1
@@ -420,7 +434,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **`/v1/completions` 不再静默错答**：该路径此前被路由白名单放行却按 Chat 语义处理，legacy `prompt` 请求会被当成空会话转发；现明确返回 404 并给出改用 `/v1/chat/completions` 的指引。
 - **模型数据来源可见**：`GET /v1/models` 新增只读字段 `catalog_source`（`external-json` / `embedded-frozen`）——三套快照的价格口径并不相同，降级即换一套峰谷价，现在一眼可见。
 - **看板三处修复**：账号空态按钮此前调用未定义的 `startLogin()`（点击即 ReferenceError），已接回完整的设备授权链路；「各账号用量透视」因渲染目标 DOM 被删而永久空白，已补回；运行日志改为增量追加（此前每 2 秒全量重建最多 2000 行 DOM）。
-- **测试基线转绿**：离线测试此前因把官方 fixture 目录硬编码成本机 `%TEMP%` 路径而固定 RED（`EXIT=1`）。现改为 `QD_TEST_FIXTURE_DIR` 优先 + 多候选自动探测，缺 fixture 时逐条打印 `[SKIP]` 与候选清单（绝不静默），退出码只由 FAIL 决定；AES-256 两条纯算法 KAT 移出 fixture 分支、永远执行。当前基线：**TOTAL 461 checks, 434 passed, 0 failed, 3 skipped, exit 0**。
+- **测试基线转绿**：离线测试此前因把官方 fixture 目录硬编码成本机 `%TEMP%` 路径而固定 RED（`EXIT=1`）。现改为 `QD_TEST_FIXTURE_DIR` 优先 + 多候选自动探测，缺 fixture 时逐条打印 `[SKIP]` 与候选清单（绝不静默），退出码只由 FAIL 决定；AES-256 两条纯算法 KAT 移出 fixture 分支、永远执行。当前基线：**TOTAL 482 checks, 434 passed, 0 failed, 3 skipped, exit 0**。
 - **容器交付面**：`Dockerfile` 的 `CMD` 不再写死 `--port 8790`，改为尊重 `PORT` / `HOST` 环境变量（compose 配置真正生效）；镜像内补入 `_test` / `_diag` / `_verify` / `_refresh` 验证脚本，容器里具备自检面。
 - **工程卫生**：新增 `.gitattributes`（`*.py` / `*.json` 固定 LF）消除刷新脚本写回时的行尾噪声；`.dockerignore` 排除 `.team/`、`accounts/`、`usage/`；清理 `_IDENTITY_KEYS`、`VOLATILE_FIELDS` 两处死代码；修正 `derive_id` 文档与实现不一致（实测输出 32 位十六进制，实现保持不变以免既有账号机器身份突变）；为 `tempKey`（64-bit 熵）与 RSA-1024 包裹补上风险说明与「不可单方面更改」的理由。
 
@@ -572,9 +586,20 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 ### 1. 国际版签到需要真实 UMID 机器身份
 
-国际版服务端严格校验 `Cosy-MachineToken` / `Cosy-MachineCode` / `Cosy-MachineType`，这套身份由官方 Qoder 客户端的 UMID 组件生成（每 50 分钟刷新）；按上游行为观察，**每台设备每日仅 1 个国际版账号可领取**。
+国际版服务端严格校验 `Cosy-MachineToken` / `Cosy-MachineCode` / `Cosy-MachineType`，这套身份由官方客户端的 UMID 组件生成。**拿不到真身份时，本网关不会用派生假值去撞**——实测发全套派生机器头会让服务端把**可领取状态**的活动整条过滤（issue #10）；此时状态会如实标为 `machine_headers=omitted` 并给出 `hint`。
 
-本网关在拿不到官方组件时**不会用派生假值去撞**——实测发全套派生机器头会让服务端把**可领取状态**的活动整条过滤（issue #10）。现在的行为是：如实把状态标为 `machine_headers=omitted`，并在活动平台结果里给出 `hint` 文案。所以「本机没有原生身份时国际版领不到」属于**已知限制**，不等于今天没有活动。
+**现在 Linux / Docker 部署也能拿到真身份了**：
+
+```bash
+python _install_umid.py          # 从官方 npm 包提取内嵌的原生 UMID 组件
+```
+
+它会下载官方 `@qoder-ai/qodercli` 的发行包（校验 sha512 integrity），把**内嵌在 JS bundle 里的原生组件**按当前平台与架构提取出来（Linux x64/arm64 的 ELF、macOS 的 Mach-O），落地到 `umid/runtime-info` 后由 `runtime_info_exe()` 自动发现（也可用 `QD_UMID_DIR` 指定位置）。零第三方依赖，不需要 node。
+
+> ⚠️ **一个无法绕过的事实（请务必读完再用）**：该组件产出的是**机器级**身份，与账号参数无关。实测：不同账号 / 空账号 / 不存在的账号 / 不同 `HOME` / 不同 `XDG_CONFIG_HOME` —— 返回的 `machineToken` **逐字节完全相同**；组件也没有任何 CLI 开关、环境变量或状态文件可以影响它。因此：
+>
+> - ✅ 它解决的是「**Linux/Docker 部署拿不到真身份**」——提取后活动列表可见、可正常领取；
+> - ❌ 它**不能**解决「同一台机器上多个国际版账号都能领」——上游对同一机器身份是**按设备去重**的（「每台设备每日仅 1 个国际版账号可领」）。要让多个账号各自可领，需要**不同的机器 / 不同的物理指纹**，这不是提取组件这一层能改变的。
 
 > 国内版不受此限制：它只需要宿主头（`Authorization` + `Cosy-ClientType: 10` + `User-Agent: Qoder` + `Accept`），不需要任何 `Cosy-Machine*`。
 >
@@ -586,7 +611,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 ### 3. 容器构建与真实上游链路未经端到端验证
 
-本轮发布的改动经过：离线确定性测试（461 断言）、模块级 `py_compile`、静态核对与变异反证；但 **Docker 构建/运行**（本机 daemon 未运行）与**真实上游端到端**未在发布环境实跑。请以你自己的部署环境验证为准。
+本轮发布的改动经过：离线确定性测试（482 断言）、模块级 `py_compile`、静态核对与变异反证；但 **Docker 构建/运行**（本机 daemon 未运行）与**真实上游端到端**未在发布环境实跑。请以你自己的部署环境验证为准。
 
 ---
 
