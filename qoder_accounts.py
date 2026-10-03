@@ -141,6 +141,13 @@ NATIVE_IDENTITY_TTL = 1800
 # 与生产端字面量不一致导致该分支永不命中（口径分裂 bug，已修）；"native" 仅
 # 作为历史/测试桩别名在消费端兼容，不得作为新的生产端取值。
 MACHINE_IDENTITY_NATIVE = "runtime-info"
+# desktop_headers() 本次实际是否携带 cosy-machine* 机器头（与"身份来源"
+# machine_identity_source 是两个正交维度，勿混用）：
+#   "native"  —— 本次发送了原生桥给出的全套六头
+#   "omitted" —— 本次未发送任何 cosy-machine* 头（无原生桥时的正确行为；
+#                issue #10 修复前会发派生假头，实测会被服务端整条过滤活动）
+MACHINE_HEADERS_NATIVE = "native"
+MACHINE_HEADERS_OMITTED = "omitted"
 _native_exe_cache = {}
 _native_ident_cache = {}
 
@@ -514,8 +521,11 @@ class Account(object):
         # 活动列表短缓存 (at, payload)：该请求约 1–4 秒（上游最慢的一环），
         # 看板切换视图/账号会连续取，缓存后由"领取动作"显式失效。
         self._campaigns_cache = None
-        # 活动平台用的机器身份来源：native(官方原生桥) / derived(派生回退)
+        # 活动平台用的机器身份来源：runtime-info(官方原生桥) / derived(派生回退)
         self.machine_identity_source = "derived"
+        # 最近一次 desktop_headers() 实际是否携带 cosy-machine* 头：
+        # native / omitted（未构造过时按 omitted 保守处理）；与身份来源正交
+        self.machine_headers_state = MACHINE_HEADERS_OMITTED
 
     # -- 持久化 ------------------------------------------------------------
     def to_dict(self):
@@ -706,8 +716,28 @@ class Account(object):
                 derive_id(self.uid, "machinecode")
             h["cosy-machineos"] = MACHINE_OS
             h["cosy-machinehostname"] = MACHINE_HOSTNAME
+            self.machine_headers_state = MACHINE_HEADERS_NATIVE
+        else:
+            # 无原生桥：一个机器头都不发（issue #10）。状态如实登记，供
+            # campaigns().machine_headers 与 INTL 已知限制提示使用。
+            self.machine_headers_state = MACHINE_HEADERS_OMITTED
         self.machine_identity_source = ident.get("source") or "derived"
         return h
+
+    def _machine_headers_hint(self):
+        """机器头状态相关的可读提示；当前只在 INTL + 未发送机器头时非空。
+
+        国际版服务端要求真实的 UMID 机器身份（官方客户端组件生成、每 50 分钟
+        刷新）。本机无该组件时必须"不发头"（issue #10），服务端可能因此不返回
+        活动——这是**已知限制**，不要误报成"今天没有活动"。CN 侧不发头是正确
+        行为，不给提示。
+        """
+        if self.realm == "intl" and \
+                getattr(self, "machine_headers_state", "") == MACHINE_HEADERS_OMITTED:
+            return ("国际版服务端要求真实的 UMID 机器身份（由官方客户端组件生成、"
+                    "每 50 分钟刷新），本机没有该组件、本次未发送机器头：活动列表"
+                    "可能不可见、领取可能失败。这是已知限制，不等于今天没有活动。")
+        return ""
 
     # -- 刷新（按 token 前缀路由） ----------------------------------------
     def refresh(self):
@@ -989,7 +1019,10 @@ class Account(object):
                 q, code, err = q2, code2, err2
         if not isinstance(q, dict):
             return {"ok": False, "available": code not in (404, 405, 410),
-                    "error": err or ("HTTP %d" % code)}
+                    "error": err or ("HTTP %d" % code),
+                    "machine_headers": getattr(self, "machine_headers_state",
+                                               MACHINE_HEADERS_OMITTED),
+                    "hint": self._machine_headers_hint()}
         items = []
         raw = q.get("campaigns")
         for c in (raw if isinstance(raw, list) else []):
@@ -1041,8 +1074,14 @@ class Account(object):
             "claimable": bool(q.get("claimable")),
             "campaign_url": str(q.get("campaignUrl") or ""),
             "campaigns": items,
-            # 机器身份来源：derived 时设备定向活动可能被服务端过滤（列表偏少）
+            # 身份来源（runtime-info=原生桥 / derived=派生回退；与下面的
+            # machine_headers 正交——derived 时本次根本不发机器头，issue #10）
             "identity": getattr(self, "machine_identity_source", "derived"),
+            # 本次实际是否携带 cosy-machine* 机器头：native / omitted
+            "machine_headers": getattr(self, "machine_headers_state",
+                                       MACHINE_HEADERS_OMITTED),
+            # INTL+omitted 时的"已知限制"提示；其余场景为空串（CN 不发提示）
+            "hint": self._machine_headers_hint(),
         }
         self.campaign_status = st
         self._campaigns_cache = (time.time(), st)

@@ -2930,13 +2930,91 @@ check("身份来源口径：自愈条件用真实取值 runtime-info，代码里
       "（注释里的历史说明不算）",
       '"runtime-info"' in _acc_code28 and '== "native"' not in _acc_code28,
       [_l.strip() for _l in _acc_code28.splitlines() if '== "native"' in _l][:2])
-check("身份来源口径：machine_identity_source 赋值只来自 derived 初始化与原生桥 source 回退"
-      "（不得硬编码 native）",
-      'machine_identity_source = "derived"' in _acc_src28
-      and 'machine_identity_source = ident.get("source") or "derived"' in _acc_src28
-      and 'machine_identity_source = "native"' not in _acc_src28,
-      [_l.strip() for _l in _acc_src28.splitlines()
-       if "machine_identity_source =" in _l])
+print()
+print("[29] issue #10 三态可观测性：实际发送行为（native/omitted）+ INTL 已知限制提示")
+_MH29 = ("cosy-machineid", "cosy-machinetoken", "cosy-machinetype",
+         "cosy-machineos", "cosy-machinehostname", "cosy-machinecode")
+_orig_nmi29 = A.native_machine_identity
+_orig_cget29 = A.Account._campaigns_get
+
+
+def _camp29(realm, native):
+    """构造账号：返回 (account, desktop_headers 结果, 机器头状态, campaigns() 结果)。
+
+    native=True 打桩原生桥返回带 machineToken 的真身份；native=False 返回空 dict
+    （= 无原生桥，issue #10 的 derived 场景）。
+    """
+    if native:
+        A.native_machine_identity = lambda r, u, force=False: {
+            "machineToken": "tok29", "machineType": "3", "machineCode": "c29",
+            "source": A.MACHINE_IDENTITY_NATIVE}
+    else:
+        A.native_machine_identity = lambda r, u, force=False: {}
+    acc29 = A.Account({"uid": "u29-%s-%s" % (realm, "n" if native else "d"),
+                       "realm": realm, "accessToken": "dt-x"})
+    hdrs29 = acc29.desktop_headers()
+    state29 = acc29.machine_headers_state
+    A.Account._campaigns_get = lambda self: (
+        {"campaigns": [], "showCampaign": True, "claimable": False}, 200, "")
+    try:
+        st29 = acc29.campaigns(force=True)
+    finally:
+        A.Account._campaigns_get = _orig_cget29
+    return hdrs29, state29, st29
+
+
+try:
+    _h_cn_n29, _s_cn_n29, _c_cn_n29 = _camp29("cn", True)
+    _h_cn_d29, _s_cn_d29, _c_cn_d29 = _camp29("cn", False)
+    _h_in_n29, _s_in_n29, _c_in_n29 = _camp29("intl", True)
+    _h_in_d29, _s_in_d29, _c_in_d29 = _camp29("intl", False)
+    A.Account._campaigns_get = lambda self: (None, 500, "boom29")
+    _acc_fail29 = A.Account({"uid": "u29fail", "realm": "cn", "accessToken": "dt-x"})
+    _st_fail29 = _acc_fail29.campaigns(force=True)
+finally:
+    A.native_machine_identity = _orig_nmi29
+    A.Account._campaigns_get = _orig_cget29
+
+check("三态 cn×native：真发六头 + desktop_headers 与 campaigns() 都报 native",
+      all(_h_cn_n29.get(k) for k in _MH29)
+      and _s_cn_n29 == A.MACHINE_HEADERS_NATIVE
+      and _c_cn_n29.get("machine_headers") == A.MACHINE_HEADERS_NATIVE,
+      (_s_cn_n29, _c_cn_n29.get("machine_headers")))
+check("三态 cn×derived：一个机器头都不发 + 状态 omitted",
+      not any(_h_cn_d29.get(k) for k in _MH29)
+      and _s_cn_d29 == A.MACHINE_HEADERS_OMITTED
+      and _c_cn_d29.get("machine_headers") == A.MACHINE_HEADERS_OMITTED,
+      (_s_cn_d29, _c_cn_d29.get("machine_headers")))
+check("三态 intl×native：真发六头 + 状态 native",
+      all(_h_in_n29.get(k) for k in _MH29)
+      and _s_in_n29 == A.MACHINE_HEADERS_NATIVE
+      and _c_in_n29.get("machine_headers") == A.MACHINE_HEADERS_NATIVE,
+      (_s_in_n29, _c_in_n29.get("machine_headers")))
+check("三态 intl×derived：一个机器头都不发 + 状态 omitted",
+      not any(_h_in_d29.get(k) for k in _MH29)
+      and _s_in_d29 == A.MACHINE_HEADERS_OMITTED
+      and _c_in_d29.get("machine_headers") == A.MACHINE_HEADERS_OMITTED,
+      (_s_in_d29, _c_in_d29.get("machine_headers")))
+check("INTL×omitted 必须带已知限制提示（非空字符串，含 UMID 与「已知限制」措辞）",
+      isinstance(_c_in_d29.get("hint"), str)
+      and "UMID" in _c_in_d29["hint"] and "已知限制" in _c_in_d29["hint"],
+      _c_in_d29.get("hint"))
+check("CN×omitted 的 hint 键存在且为空串（限制提示不得扩散到国内版）",
+      "hint" in _c_cn_d29 and _c_cn_d29.get("hint") == "",
+      _c_cn_d29.get("hint"))
+check("native（两个区域）的 hint 均为空串：只有 INTL×omitted 才提示",
+      _c_cn_n29.get("hint") == "" and _c_in_n29.get("hint") == "",
+      (_c_cn_n29.get("hint"), _c_in_n29.get("hint")))
+check("两个维度正交：derived 身份与 omitted 机器头可同时成立"
+      "（identity 不再被当作「能不能发头」的信号）",
+      _c_cn_d29.get("identity") == "derived"
+      and _c_cn_d29.get("machine_headers") == A.MACHINE_HEADERS_OMITTED,
+      (_c_cn_d29.get("identity"), _c_cn_d29.get("machine_headers")))
+check("失败返回（ok=False）同样带 machine_headers 与 hint 键（消费端无需分支）",
+      _st_fail29.get("ok") is False
+      and _st_fail29.get("machine_headers") == A.MACHINE_HEADERS_OMITTED
+      and "hint" in _st_fail29 and _st_fail29.get("hint") == "",
+      (_st_fail29.get("machine_headers"), sorted(_st_fail29.keys())))
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
