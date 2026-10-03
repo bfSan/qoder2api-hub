@@ -153,6 +153,14 @@ def main():
         print("  [活动平台] ok=%s show=%s claimable=%s identity=%s 条数=%d"
               % (st.get("ok"), st.get("show_campaign"), st.get("claimable"),
                  st.get("identity"), len(st.get("campaigns") or [])))
+        # issue #10：派生的 cosy-machine* 六头会让服务端过滤掉「可领取」的活动，
+        # 因此现在只有原生身份才发送它们。这里把「到底发没发」直接说清楚，
+        # 免得再出现「面板说签到成功、额度却不动」这种需要翻源码才能解释的现象。
+        if st.get("identity") == "runtime-info":
+            print("      （身份=官方原生桥：已发送 cosy-machine* 六头）")
+        else:
+            print("      （身份=%s：按 issue #10 **未**发送 cosy-machine* 六头）"
+                  % (st.get("identity") or "derived"))
         for c in st.get("campaigns") or []:
             print("      - %-18s %-28s %-14s +%s 成就=%s(%s)"
                   % (c["campaign_key"], c["claim_status"], c["action_type"],

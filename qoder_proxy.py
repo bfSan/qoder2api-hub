@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2359,6 +2359,42 @@ def _still_leak_candidate(text):
     return _json_array_prefix_ok(rest)
 
 
+def _leaked_partial_droppable(text, allowed_names=None):
+    """issue #9：正文是网关自己写入历史的工具调用回声、但被截断（JSON 不完整/
+    非法）时，应吞掉整段而不是透传给终端用户。三个条件同时成立才吞：
+      1) strip 后以 LEAK_MARKER 开头（真实散文回复几乎不会这样开头）；
+      2) 本次请求声明了 tools（allowed_names 非空）——与恢复路径同前置条件；
+      3) marker 之后（剥掉围栏后）仍是 JSON 数组字面量的前缀
+         （复用现成的 _json_array_prefix_ok）——即"本该是数组，只是没写完"。
+    返回 True = 应吞掉正文（输出空 content）。
+
+    完整且合法的 JSON 数组不算：那种情况下恢复失败另有原因（工具名未声明 /
+    arguments 非法），保持既有 fail-open 透传语义（见 _test_qoder.py 的 [27]
+    断言"未声明工具名 -> 不吞正文"），只有"数组本身没写完 / 非法"才吞。
+    """
+    if not text or not allowed_names:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    if t == LEAK_MARKER:
+        # 只有 marker、连数组都没开始写：判据 3 的退化情形，同样是回声。
+        return True
+    state, body = _leak_body_offset(t)
+    if state != "body":
+        return False
+    rest = (body or "").strip()
+    if rest.endswith("```"):
+        rest = rest[:-3].strip()
+    if not _json_array_prefix_ok(rest):
+        return False
+    try:
+        json.loads(rest)
+        return False
+    except Exception:
+        return True
+
+
 def _leak_chunk_frame(meta, delta, finish_reason=None):
     """按流式 chat.completion.chunk 形态合成一帧（沿用上游的 id/model）。"""
     payload = {
@@ -2488,6 +2524,11 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
                 }]})
             if clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
+        elif _leaked_partial_droppable(hold, allowed_names):
+            # issue #9：截断的 marker+JSON 回声无法还原成结构化调用，吞掉整段，
+            # 绝不把网关内部协议文本透传给终端用户。
+            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
+                % len(hold), level="WARN", tag="chat")
         else:
             yield _leak_chunk_frame(meta, {"content": hold})
     if finished is not None:
@@ -2823,6 +2864,7 @@ def extract_session_key(headers, payload):
 # 上游瞬时故障（与客户端参数无关，值得同账号快速重试）
 TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
+CHECKIN_MIN_GAP = 1.0              # 签到防风控：账号之间的最小间隔（秒）
 _CLIENT_FAULT_MARKERS = (
     "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
     "invalid_request_error",
@@ -3494,6 +3536,11 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         if _rec:
             message["content"] = _clean
             tool_calls_map = {i: c for i, c in enumerate(_rec)}
+        elif _leaked_partial_droppable(message["content"], allowed_names):
+            # issue #9：截断的 marker+JSON 回声不还原、也不透传，直接清空正文。
+            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
+                % len(message["content"]), level="WARN", tag="chat")
+            message["content"] = ""
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -3956,7 +4003,11 @@ def stream_responses_events(inner_lines, model, holder):
     """
     resp_id, msg_id, rs_id = _new_id("resp_"), _new_id("msg_"), _new_id("rs_")
     created = int(time.time())
-    seq = 0
+    # 上游重开后本生成器会被重建：若 seq 从 0 重来，客户端看到的
+    # sequence_number 会回退。从 holder 恢复历史最大号，保证严格单调。
+    seq = int(holder.get("seq") or 0) if isinstance(holder, dict) else 0
+    if isinstance(holder, dict):
+        holder["resp_id"] = resp_id
     text_parts, reason_parts = [], []
     outputs = []
     reason_index = None
@@ -3990,6 +4041,8 @@ def stream_responses_events(inner_lines, model, holder):
     def ev(etype, payload_obj):
         nonlocal seq
         seq += 1
+        if isinstance(holder, dict):
+            holder["seq"] = seq        # 供外层补发终态事件时续号
         data = {"type": etype, "sequence_number": seq}
         data.update(payload_obj)
         body = json.dumps(data, ensure_ascii=False)
@@ -4245,9 +4298,13 @@ def stream_responses_events(inner_lines, model, holder):
     # 冲刷剩余缓冲文本
     if text_buffer:
         leak_calls, leak_clean = (None, text_buffer)
+        dropped_leak = False
         if not any(text_parts):
             leak_calls, leak_clean = parse_leaked_tool_calls(
                 text_buffer, holder.get("allowed_names"))
+            if leak_calls is None and _leaked_partial_droppable(
+                    text_buffer, holder.get("allowed_names")):
+                dropped_leak = True
         if leak_calls:
             dsml_tool_calls.extend(
                 {"id": c.get("id"),
@@ -4255,6 +4312,11 @@ def stream_responses_events(inner_lines, model, holder):
                  "arguments": (c.get("function") or {}).get("arguments") or "{}"}
                 for c in leak_calls)
             calls_rem, clean_rem = None, leak_clean
+        elif dropped_leak:
+            # issue #9：截断的 marker+JSON 回声 -> 不输出文本、不走 DSML 回退。
+            log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
+                % len(text_buffer), level="WARN", tag="chat")
+            calls_rem, clean_rem = None, None
         else:
             calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
         if calls_rem:
@@ -4339,6 +4401,28 @@ def stream_responses_events(inner_lines, model, holder):
     if finish == "length":
         final["incomplete_details"] = {"reason": "max_output_tokens"}
     yield ev("response.completed", {"response": final})
+
+
+def _responses_failed_frame(holder, code, message):
+    """Responses 流的终态失败事件（response.failed）。
+
+    stream_responses_events 的 ev() 闭包把最新 sequence_number 同步进
+    holder["seq"]，这里在其上 +1 续号，保证严格大于已发出的事件——
+    Responses 客户端只认终态事件，缺了它会一直等（原实现只 _sse_end）。
+    """
+    seq = int((holder or {}).get("seq") or 0) + 1
+    data = {
+        "type": "response.failed",
+        "sequence_number": seq,
+        "response": {
+            "id": (holder or {}).get("resp_id") or _new_id("resp_"),
+            "object": "response",
+            "status": "failed",
+            "error": {"code": str(code), "message": message},
+        },
+    }
+    return ("event: response.failed\ndata: "
+            + json.dumps(data, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -4682,8 +4766,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._error(502, str(exc))
             data = [model_entry(mid, meta) for mid, meta in entries]
+            try:
+                catalog_source = qoder_catalog.snapshot_source(req_realm)
+            except Exception as exc:   # 只读探针：失败也不能拖垮模型列表
+                catalog_source = "unknown"
+                log("catalog source probe failed: %s" % exc, level="WARN")
             return self._json(200, {"object": "list", "data": data,
-                                    "realm": req_realm or CURRENT_REALM})
+                                    "realm": req_realm or CURRENT_REALM,
+                                    "catalog_source": catalog_source})
         if path in ("/usage", "/v1/usage"):
             if not self._authorized():
                 return
@@ -4837,6 +4927,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
+            if qoder_settings.panel_password_is_default(ACCOUNTS_DIR):
+                # 默认密码 = 局域网内任何人都能登录；明文 Key 不能这样交出去。
+                return self._error(
+                    403,
+                    "面板仍在使用默认密码，局域网内任何人都能登录后读到明文 API "
+                    "Key。请先在「设置 → 面板密码」修改密码，再查看明文 Key。",
+                    "permission_error")
             wanted = (query.get("id") or [""])[0]
             for entry in configured_keys():
                 if entry.get("id") == wanted:
@@ -5137,12 +5234,23 @@ class Handler(BaseHTTPRequestHandler):
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
             results = []
+            last_at = None
             for account in targets:
                 if account is None:
                     continue
                 if not account.enabled or not account.access_token:
-                    continue
-                res = qoder_tasks.run_checkin(account, gap=0.4, only_daily=True)
+                    continue            # 跳过的账号不占用防风控等待
+                if last_at is not None:
+                    # 账号之间保持 >= CHECKIN_MIN_GAP（与 qoder_tasks.py 声明的
+                    # >=1.0s 一致）；try/finally 让失败路径同样计时间隔。
+                    idle = CHECKIN_MIN_GAP - (time.time() - last_at)
+                    if idle > 0:
+                        time.sleep(idle)
+                try:
+                    res = qoder_tasks.run_checkin(account, gap=CHECKIN_MIN_GAP,
+                                                  only_daily=True)
+                finally:
+                    last_at = time.time()
                 results.append({
                     "uid": account.uid,
                     "nickname": account.nickname,
@@ -5462,8 +5570,11 @@ class Handler(BaseHTTPRequestHandler):
                                     level="WARN", tag="chat")
                                 time.sleep(attempts)
                                 try:
+                                    # 必须用转换后的 chat 请求体重开：原始
+                                    # Responses 体的会话在 input 字段里，而
+                                    # build_qoder_body 只读 messages -> 空会话。
                                     cur2, account, _ = open_upstream(
-                                        payload, session_key=session_key,
+                                        chat_req, session_key=session_key,
                                         target_realm=req_realm)
                                 except Exception as rex:
                                     log("responses reopen failed: %s"
@@ -5493,6 +5604,12 @@ class Handler(BaseHTTPRequestHandler):
                     log("responses upstream status %s: %s"
                         % (pump_exc.status, msg[:200]), level="ERROR",
                         tag="chat")
+                    # Responses 协议靠终态事件收尾：只关流会让客户端一直等。
+                    try:
+                        self._sse_write(_responses_failed_frame(
+                            holder, _to_int_status(pump_exc.status), msg))
+                    except Exception:
+                        pass
                     self._sse_end()
                     return
                 self._sse_end()
@@ -5505,7 +5622,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
-                    upstream, payload, session_key, req_realm, model,
+                    upstream, chat_req, session_key, req_realm, model,
                     holder, account)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
@@ -5545,8 +5662,16 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not is_account_route and path not in (
                 "/v1/chat/completions", "/chat/completions",
-                "/v1/completions", "/completions",
                 "/v1/responses", "/responses"):
+            if path in ("/v1/completions", "/completions"):
+                # legacy Completions（prompt 而非 messages）本网关不实现：
+                # 明确 404 优于"接受请求却按空会话转发上游"。
+                return self._error(
+                    404,
+                    "the legacy /v1/completions API is not supported here: "
+                    "this gateway speaks Chat Completions and Responses. "
+                    "Use /v1/chat/completions with messages=[...] instead.",
+                    "invalid_request_error")
             return self._error(404, "not found", "invalid_request_error")
         if not self._authorized():
             return
@@ -5848,6 +5973,11 @@ def main():
     elif qoder_settings.panel_password_is_default(ACCOUNTS_DIR):
         log("panel      : password is still the default 'admin' - change it "
             "in the panel")
+        if args.host == "0.0.0.0":
+            log("SECURITY   : LAN mode + default panel password 'admin' - "
+                "anyone on this network can log in and read your API key. "
+                "Change it in the panel, or restart with --panel-password.",
+                level="WARN")
 
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()

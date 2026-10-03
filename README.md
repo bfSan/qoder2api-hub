@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.0-2496ED?style=flat-square" alt="Version 1.2.0">
+  <img src="https://img.shields.io/badge/Release-v1.2.1-2496ED?style=flat-square" alt="Version 1.2.1">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -20,7 +20,7 @@
 - **OAuth 设备授权一键免客户端登录**：PKCE (S256) 设备流（双区 URL 参数按官方差异构造：国内带 `redirect_uri+client_id+machine_id`，国际带 `client_id+machine_id`），点击看板链接在浏览器完成授权即可自动入池；亦支持 PAT (`pt-`) 导入，jobToken 自动交换与轮换。
 - **每日签到与额度体系（双区域 · 真实领取）**：「每日领取 100 Credits」等活动**由网关直接领取**——用桌面端请求头（`Cosy-ClientType: 10` + 机器头，缺了服务端会返回空列表）列出活动 → 对 `CLAIMABLE` 的 Credits 活动 `POST /sash/api/v1/me/campaigns/{id}/claim`（官方幂等：已领返回 `replayed`，不会重复发放）；旧 sash 签到接口仅在仍开放时兜底（能力运行时探测，404 记「本区域无此接口」6 小时后自动重探）；Pro 升级包资格检查与领取、quota/usage 额度与套餐快照实时刷新。
 - **后台常驻定时调度器**：每日整点排程（09:00 / 21:00 签到 · 22:00 Token 集中保活），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
-- **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译、DSML 工具调用回退解析，以及**泄漏文本回读**（模型把历史工具调用序列化复述成正文时，流式/非流式/Responses 三链路都还原为结构化 `tool_calls`，并保持 fail-open 不吞正文）。
+- **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译、DSML 工具调用回退解析，以及**泄漏文本回读**（模型把历史工具调用序列化复述成正文时，流式/非流式/Responses 三链路都还原为结构化 `tool_calls`；若回声被**截断**无法还原，则按严格判据吞掉、绝不把内部标记透给用户，而普通回复一律 fail-open 不吞正文）。
 - **现代化 Web 看板**：弹性指标卡片、签到与福利中心、模型能力清单、性能指标与用量透视、实时请求流水与运行日志。
 
 > ⚡ 本项目架构与交互对齐 WorkBuddy2API-Hub，上游协议替换为 Qoder COSY 签名体系。
@@ -56,7 +56,7 @@
 
 > ⚠️ **"客户端一直显示工作中、一个字都不吐，网关日志也毫无变化"** → 九成是**网关没在跑**：请求根本没到达，所以日志自然一动不动。一条命令确诊：
 > ```bash
-> python _diag_gateway.py --chat   # 端口 → /ping → /health → /v1/models → 真实流式，逐项报出断在哪
+> python _diag_gateway.py --chat   # 端口 → /health → /v1/models → 真实流式，逐项报出断在哪
 > python _diag_campaign.py         # 签到/活动链路体检（含本机虚拟化状态，中文输出）
 > ```
 > - **生命周期就是那个 cmd 窗口**（刻意的设计）：窗口开着网关就活着，**关掉窗口网关即停**，不会有后台残留进程；下次要用重新双击 `start-qoder-proxy.bat` 即可。
@@ -116,7 +116,7 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 ```
 
 - **持久化目录**：`./accounts`（账号凭证及出口设置）与 `./usage`（请求流水与指标快照）；
-- **配置参数**：环境变量 `API_KEY`、`PORT`。
+- **配置参数**：环境变量 `API_KEY`、`PORT`（监听端口，默认 8790）、`HOST`（监听地址，默认 127.0.0.1；容器内如需对外暴露设为 0.0.0.0）。
 
 ---
 
@@ -330,7 +330,7 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 ## 六、开发与测试
 
 ```bash
-# 离线确定性测试（342 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
+# 离线确定性测试（453 项断言：AES-128/256 向量与官方 fixture KAT、QMC/凭证解密、
 # 自定义 B64、COSY 签名、双区官方目录全字段（峰谷价/多窗口/思考档位/展示 id/解析）、
 # 独占路由、签到能力运行时探测与 DISABLED 归一化、活动平台归一化、DeepSeek
 # reasoning_content 回填与 flatten 保留、请求体、信封解包、custom 工具转译、
@@ -352,7 +352,8 @@ python _refresh_catalog.py
 # id/enable/峰谷价/上下文窗口/思考档位/官方介绍/禁用原因/不编造字段/低谷判定）
 #   基准 = 官方动态接口优先（与桌面版选择器同源），本机目录按字段兜底
 python _verify_models.py --base http://127.0.0.1:8790
-#   347 项断言；退出码 0=全部一致；1=存在差异（打印逐条 FAIL 明细）；2=网关不可达
+#   断言数随所选基准而变（双区 JSON 快照基准 = 347 项；本机 catalog-v6 基准约 307 项）；
+#   退出码 0=全部一致；1=存在差异（打印逐条 FAIL 明细）；2=网关不可达
 ```
 
 模块结构：
@@ -377,6 +378,38 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.2.1
+
+**修复 issue #9：截断的工具调用回声不再透传给用户**
+
+- v1.2.0 的回读守卫要求整段正文**恰好**是 `[assistant 请求调用工具]` + 合法 JSON 数组；当模型把数组**写到一半就被截断**（流未收尾）时判据失配，网关会把这段内部协议文本当普通正文透传——客户端直接显示给用户，且这段文本进入会话历史后会让模型继续引用它、滚雪球式产生更多回声（issue #9 的真实样本：Qwen3.8-Flash / intl / stream=true，255 字符数组从未闭合）。
+- 新增**严格的截断吞掉判据**（三条件同时成立）：正文以标记开头、本次请求声明了 tools、标记之后仍是 JSON 数组字面量的**前缀**。命中时**吞掉正文**（输出空 content，`finish_reason` 保持 `stop`）并记一条 WARN 日志；完整可解析的回声仍走原有还原路径，而**讨论该标记的普通回复、marker 后接散文、未声明 tools** 三种情形一律不吞（fail-open 保持）。
+- 三条 finalize 路径全覆盖：流式 chat 收尾、非流式聚合（含非流式 Responses）、Responses 流式；新增 [27.5] 段 12 条回归断言。
+
+**修复 issue #10：derived 机器身份会让「每日领取 100 Credits」被整条过滤**
+
+- **现象**（Linux/Docker 部署）：容器里没有官方风控桥 `runtime-info.exe` → 取不到原生身份 → 网关仍发出**派生**的 `cosy-machine*` 六头 → 服务端把**可领取状态**的 Credits 活动整条过滤掉，列表只剩详情类活动；旧 sash 兜底又是 `DISABLED`，于是 `run_checkin` 返回 `ok=True`、面板显示「签到成功」，而额度一动不动。
+- **根因**由 issue 作者逐头隔离实测定位：六个机器头**单独任一个**出现时活动可见，**全套一起发**即被过滤（去掉 `machinetoken` 或 `machineid` 后恢复可见）。
+- **修法**：`desktop_headers()` 仅在**原生身份可用**（`machineToken` 非空）时才发送六个 `cosy-machine*` 头；derived 分支一律不发，但 `User-Agent: Qoder` / `cosy-clienttype` / `cosy-version` 照发（这三个是服务端展示活动所必需的）。native 分支行为逐字未动——不影响「真机器头可能额外解锁设备定向活动」这条尚未验证的路径。
+- **顺带修掉一个相邻死逻辑**：身份自愈分支写成 `source == "native"`，而该字段的真实取值只有 `runtime-info` / `derived`（源码里根本不存在 `native`）→ 自愈从未触发过。现统一到常量 `MACHINE_IDENTITY_NATIVE`，消费端保留历史别名兼容；探针实证：修复前同输入只发 1 次请求（死逻辑），修复后发 2 次并强制刷新身份。
+- `_diag_campaign.py` 的「活动平台」行补一条直白提示——当前身份是否携带机器头，避免再出现需要翻源码才能解释的「签到成功但没到账」。
+- 新增**双向**回归断言：derived 分支**不得**出现六头、原生分支**必须**齐发。
+
+**其余修复（本轮全项目体检所得）**
+
+- **Responses 链路重试丢上下文**：流内信封重试与瞬时错误重开会话时，传给上游的是**原始 Responses payload**，而请求体构造只读 `messages`——重试即变成空会话（观感是「重试后模型失忆」）。现改为传转换后的 chat 请求。
+- **Responses 流式失败没有终态事件**：上游信封错误时只关流、不发终态，客户端会一直等。现补发 `response.failed`（含 `error.code/message`），并让事件序号在重开后**续号**而非回退到 0。
+- **明文 Key 暴露面收窄**：面板仍在用默认密码（默认 `admin`）时，`GET /settings/reveal` 直接返回 403 并提示先改密码——局域网模式下这原本等于「任何人登录后都能读走明文 API Key」；启动时检测到「默认密码 + LAN 监听」会额外打印 WARN。
+- **防风控间隔对齐**：`/accounts/checkin` 此前用 0.4s 间隔且账号之间零停顿，与模块声明的「>= 1.0s」不符；现统一为 `CHECKIN_MIN_GAP = 1.0`，账号之间按「与上次调用耗时叠加」等待，失败路径同样计入（try/finally）。活动平台内部的领取间隔也改为可透传（未指定时默认 1.0s，成功/被挡/失败三类结果统一等待）。
+- **Pro 福利包计数虚增**：已领取（409/ALREADY）此前照样按 +1800 累进批量 `credit_added`；现区分「真实新增」与「本就已领」，已领取记 0 并给出 `already_claimed` 状态，旧字段全部保留。
+- **调度器重启不再重复签到**：`enabled/last_run_time/next_run_time` 等状态此前只在内存，进程重启就会重新触发一次真实领取；现状态落盘（`<账号目录>/scheduler/state.json`，原子写），并对启动巡检加「当日最多补签一次」闸门（mark-before-act，崩溃不重放）。
+- **`/v1/completions` 不再静默错答**：该路径此前被路由白名单放行却按 Chat 语义处理，legacy `prompt` 请求会被当成空会话转发；现明确返回 404 并给出改用 `/v1/chat/completions` 的指引。
+- **模型数据来源可见**：`GET /v1/models` 新增只读字段 `catalog_source`（`external-json` / `embedded-frozen`）——三套快照的价格口径并不相同，降级即换一套峰谷价，现在一眼可见。
+- **看板三处修复**：账号空态按钮此前调用未定义的 `startLogin()`（点击即 ReferenceError），已接回完整的设备授权链路；「各账号用量透视」因渲染目标 DOM 被删而永久空白，已补回；运行日志改为增量追加（此前每 2 秒全量重建最多 2000 行 DOM）。
+- **测试基线转绿**：离线测试此前因把官方 fixture 目录硬编码成本机 `%TEMP%` 路径而固定 RED（`EXIT=1`）。现改为 `QD_TEST_FIXTURE_DIR` 优先 + 多候选自动探测，缺 fixture 时逐条打印 `[SKIP]` 与候选清单（绝不静默），退出码只由 FAIL 决定；AES-256 两条纯算法 KAT 移出 fixture 分支、永远执行。当前基线：**TOTAL 453 checks, 434 passed, 0 failed, 3 skipped, exit 0**。
+- **容器交付面**：`Dockerfile` 的 `CMD` 不再写死 `--port 8790`，改为尊重 `PORT` / `HOST` 环境变量（compose 配置真正生效）；镜像内补入 `_test` / `_diag` / `_verify` / `_refresh` 验证脚本，容器里具备自检面。
+- **工程卫生**：新增 `.gitattributes`（`*.py` / `*.json` 固定 LF）消除刷新脚本写回时的行尾噪声；`.dockerignore` 排除 `.team/`、`accounts/`、`usage/`；清理 `_IDENTITY_KEYS`、`VOLATILE_FIELDS` 两处死代码；修正 `derive_id` 文档与实现不一致（实测输出 32 位十六进制，实现保持不变以免既有账号机器身份突变）；为 `tempKey`（64-bit 熵）与 RSA-1024 包裹补上风险说明与「不可单方面更改」的理由。
 
 ### v1.2.0
 

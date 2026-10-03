@@ -508,6 +508,25 @@ a:hover{text-decoration:underline}
     </div>
 
     <!-- 表格 1：各账号用量透视与各模型消耗明细 -->
+    <section>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <h2 style="margin:0">各账号用量透视 <em id="analyticsAcctCount"></em></h2>
+        <div style="font-size:12px;color:var(--dim)">按账号维度汇总请求与 Token；末列为该账号各模型的消耗明细</div>
+      </div>
+      <div class="table-wrap"><table>
+        <thead>
+          <tr>
+            <th style="text-align:left">账号</th>
+            <th style="text-align:center;width:88px">区域</th>
+            <th style="text-align:center;width:160px">积分</th>
+            <th style="width:90px">请求数</th>
+            <th style="width:120px">总 Token</th>
+            <th style="text-align:left">模型消耗明细</th>
+          </tr>
+        </thead>
+        <tbody id="analyticsAccountTbody"></tbody>
+      </table></div>
+    </section>
     
 
     <!-- 表格 2：模型用量透视与响应指标 -->
@@ -1734,7 +1753,7 @@ function renderAccounts(){
       + '<div style="color:var(--dim);font-size:13px;margin-bottom:18px">'
       +   '请先登录或导入一个 ' + viewName + ' 账号，之后相关请求都会走该账号'
       + '</div>'
-      + '<button onclick="startLogin()" style="font-size:14px;padding:10px 22px">'
+      + '<button onclick="openLoginModal()" style="font-size:14px;padding:10px 22px">'
       +   '登录新账号 (OAuth)'
       + '</button>'
       + '</div>';
@@ -2988,6 +3007,12 @@ let logAutoScroll = true;
 let logPollTimer = null;
 let logFetching = false;
 let logUserScrolledUp = false;
+// 增量渲染游标：DOM 已渲染到 logEntries 里的哪个 id、当前过滤条件签名、已渲染行数。
+// 命中增量路径时只追加新行并从头部裁掉超限行，避免每 2s 全量重建最多 2000 行 DOM。
+let logRenderedLastId = null;
+let logRenderedKey = '';
+let logRenderedRows = 0;
+const LOG_MAX_ROWS = 2000;   // 与 logEntries 的保留上限一致
 
 function startLogPolling(){
   if(logPollTimer) clearInterval(logPollTimer);
@@ -3031,7 +3056,7 @@ async function fetchNewLogs(forceReset){
       } else if(logEntries.length > 0){
         lastLogId = logEntries[logEntries.length - 1].id;
       }
-      renderLogs();
+      renderLogs(forceReset);
       updateLogStats();
     }
     if(statusEl) statusEl.textContent = '就绪 · ' + new Date().toLocaleTimeString();
@@ -3140,39 +3165,97 @@ function escapeHtml(s){
   return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function renderLogs(){
+function logFilterKey(){
+  return logFilterLevel + '|' + logFilterTag + '|' + logSearchText;
+}
+
+// 过滤判定与「复制」共用，保证复制内容与屏幕所见一致
+function logPassesFilter(item){
+  if(logFilterLevel && item.level !== logFilterLevel) return false;
+  if(logFilterTag && item.tag !== logFilterTag) return false;
+  if(logSearchText){
+    const haystack = ((item.msg || '') + ' ' + (item.tag || '') + ' ' + (item.time || '')).toLowerCase();
+    if(!haystack.includes(logSearchText)) return false;
+  }
+  return true;
+}
+
+function logLineHTML(item){
+  const lvlCls = 'lvl-' + (item.level || 'INFO');
+  const tagCls = 'tag-' + (item.tag || 'system');
+  return '<div class="log-line">' +
+      '<span class="log-ts">' + escapeHtml(item.time || '') + '</span>' +
+      '<span class="log-lvl ' + lvlCls + '">' + escapeHtml(item.level || 'INFO') + '</span>' +
+      '<span class="log-tag ' + tagCls + '">[' + escapeHtml(item.tag || 'system') + ']</span>' +
+      '<span class="log-msg">' + escapeHtml(item.msg || '') + '</span>' +
+    '</div>';
+}
+
+// 增量渲染：常态只追加本轮新增行，并从头部裁掉超出上限的行；仅在过滤条件变化、
+// 强制重拉（forceFull）或游标条目已不在缓冲区内时，才回退到全量重建。
+// 视觉样式、自动滚动与空态文案与原实现保持完全一致。
+function renderLogs(forceFull){
   const body = document.getElementById('logTerminalBody');
   if(!body) return;
 
-  const filtered = logEntries.filter(item => {
-    if(logFilterLevel && item.level !== logFilterLevel) return false;
-    if(logFilterTag && item.tag !== logFilterTag) return false;
-    if(logSearchText){
-      const haystack = ((item.msg || '') + ' ' + (item.tag || '') + ' ' + (item.time || '')).toLowerCase();
-      if(!haystack.includes(logSearchText)) return false;
+  const key = logFilterKey();
+  let start = 0;
+  let full = !!forceFull || key !== logRenderedKey || logRenderedLastId === null;
+  if(!full){
+    // 从尾部倒查游标（容忍重复 id），找不到说明已被裁头或整体替换 → 全量
+    let idx = -1;
+    for(let i = logEntries.length - 1; i >= 0; i--){
+      if(logEntries[i].id === logRenderedLastId){ idx = i; break; }
     }
-    return true;
-  });
+    if(idx < 0) full = true;
+    else start = idx + 1;
+  }
+  if(full){
+    body.innerHTML = '';
+    logRenderedRows = 0;
+    start = 0;
+  }
 
-  if(filtered.length === 0){
-    body.innerHTML = '<div class="log-empty">暂无匹配的日志记录</div>';
+  if(logEntries.length === 0){
+    if(!body.firstElementChild){
+      body.innerHTML = '<div class="log-empty">暂无匹配的日志记录</div>';
+    }
+    logRenderedLastId = null;
+    logRenderedKey = key;
     return;
   }
 
   const htmlParts = [];
-  filtered.forEach(item => {
-    const lvlCls = 'lvl-' + (item.level || 'INFO');
-    const tagCls = 'tag-' + (item.tag || 'system');
-    htmlParts.push(
-      '<div class="log-line">' +
-        '<span class="log-ts">' + escapeHtml(item.time || '') + '</span>' +
-        '<span class="log-lvl ' + lvlCls + '">' + escapeHtml(item.level || 'INFO') + '</span>' +
-        '<span class="log-tag ' + tagCls + '">[' + escapeHtml(item.tag || 'system') + ']</span>' +
-        '<span class="log-msg">' + escapeHtml(item.msg || '') + '</span>' +
-      '</div>'
-    );
-  });
-  body.innerHTML = htmlParts.join('');
+  for(let i = start; i < logEntries.length; i++){
+    if(logPassesFilter(logEntries[i])) htmlParts.push(logLineHTML(logEntries[i]));
+  }
+  if(htmlParts.length){
+    const ph = body.querySelector('.log-empty');
+    if(ph) ph.parentNode.removeChild(ph);
+    body.insertAdjacentHTML('beforeend', htmlParts.join(''));
+    logRenderedRows += htmlParts.length;
+  }
+
+  // 裁头：DOM 行数不超过 LOG_MAX_ROWS，等价于原来「只展示最新 2000 条」的口径
+  let trimmedHeight = 0;
+  while(logRenderedRows > LOG_MAX_ROWS && body.firstElementChild){
+    trimmedHeight += body.firstElementChild.offsetHeight;
+    body.removeChild(body.firstElementChild);
+    logRenderedRows--;
+  }
+  if(trimmedHeight && logUserScrolledUp){
+    // 用户上翻阅读历史时补偿被裁掉的高度，避免视口跳动
+    body.scrollTop = Math.max(0, body.scrollTop - trimmedHeight);
+  }
+
+  if(logRenderedRows === 0 && !body.querySelector('.log-empty')){
+    body.innerHTML = '<div class="log-empty">暂无匹配的日志记录</div>';
+  }
+
+  const lastItem = logEntries[logEntries.length - 1];
+  // 上游没给 id 时退化为全量渲染（原行为），不猜游标
+  logRenderedLastId = (lastItem && lastItem.id != null) ? lastItem.id : null;
+  logRenderedKey = key;
 
   if(logAutoScroll && !logUserScrolledUp){
     body.scrollTop = body.scrollHeight;
@@ -3180,15 +3263,8 @@ function renderLogs(){
 }
 
 function copyFilteredLogs(){
-  const filtered = logEntries.filter(item => {
-    if(logFilterLevel && item.level !== logFilterLevel) return false;
-    if(logFilterTag && item.tag !== logFilterTag) return false;
-    if(logSearchText){
-      const haystack = ((item.msg || '') + ' ' + (item.tag || '') + ' ' + (item.time || '')).toLowerCase();
-      if(!haystack.includes(logSearchText)) return false;
-    }
-    return true;
-  });
+  // 与 renderLogs 共用同一套判定，保证「复制」内容与屏幕所见一致
+  const filtered = logEntries.filter(logPassesFilter);
   const text = filtered.map(x => '[' + (x.ts || x.time) + '] [' + x.level + '] [' + x.tag + '] ' + x.msg).join('\n');
   navigator.clipboard.writeText(text).then(() => {
     toast('已复制 ' + filtered.length + ' 行日志', 'ok');

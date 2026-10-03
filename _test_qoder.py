@@ -6,6 +6,20 @@ body construction, SSE envelope unwrapping, Responses-API custom-tool
 translation, and check-in response normalization.
 
     python _test_qoder.py
+
+外部 fixture（可选）：[4.5] 组的官方加解密 KAT 需要协议 fixture 目录
+（内含 credential.json 与 model-cache.json）。目录按以下顺序自动探测：
+    1) 环境变量 QD_TEST_FIXTURE_DIR
+    2) <仓库>/testdata/protocol/1.1.34
+    3) <仓库>/tests/fixtures/protocol/1.1.34
+    4) <仓库>/../qoder-ref/cli2api/testdata/protocol/1.1.34
+    5) %TEMP%/qoder-ref/cli2api/testdata/protocol/1.1.34
+    6) ~/qoder-ref/cli2api/testdata/protocol/1.1.34
+缺 fixture 时依赖它的 3 条断言打印 [SKIP]（不计失败），**绝不静默**：
+[SKIP] 行、候选清单、末行汇总都会报出跳过数量。同组的 AES-256
+密钥表 / 互逆 KAT 不依赖 fixture，永远执行。
+
+退出码：0 = 无 FAIL（允许存在 SKIP）；1 = 存在 FAIL。
 """
 import hashlib
 import json
@@ -28,7 +42,7 @@ import qoder_catalog as C
 import qoder_accounts as A
 import qoder_tasks as T
 
-PASS = FAIL = 0
+PASS = FAIL = SKIP = 0
 
 
 def check(label, cond, extra=""):
@@ -39,6 +53,17 @@ def check(label, cond, extra=""):
     else:
         FAIL += 1
         print("  [FAIL] " + label + ("  " + str(extra) if extra else ""))
+
+
+def skip(label, reason=""):
+    """显式跳过（缺外部 fixture / 缺环境），绝不静默。
+
+    SKIP 不改变退出码（退出码只看 FAIL），但会打印醒目行并计入末行汇总，
+    所以"这组没跑"永远可见；补齐 fixture 后必须重跑到它真的 PASS。
+    """
+    global SKIP
+    SKIP += 1
+    print("  [SKIP] " + label + (("  -- " + str(reason)) if reason else ""))
 
 
 print("[1] Qoder custom base64 variant")
@@ -1348,9 +1373,44 @@ check("job family", A.token_family(acc_j) == "job")
 print()
 print("[4.5] credential / model-cache crypto KATs (official fixtures)")
 import base64 as _b64
-_FIX = r"C:\Users\shuishui\AppData\Local\Temp\qoder-ref\cli2api\testdata\protocol\1.1.34"
-if os.path.isdir(_FIX):
-    fx = json.load(open(os.path.join(_FIX, "credential.json"), encoding="utf-8"))
+# fixture 探测：环境变量优先，其次按候选顺序找；不再硬编码单个 %TEMP% 路径。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_FIX_ENV = os.environ.get("QD_TEST_FIXTURE_DIR") or ""
+_FIX_CANDIDATES = [
+    _FIX_ENV,
+    os.path.join(_HERE, "testdata", "protocol", "1.1.34"),
+    os.path.join(_HERE, "tests", "fixtures", "protocol", "1.1.34"),
+    os.path.join(_HERE, os.pardir, "qoder-ref", "cli2api", "testdata",
+                 "protocol", "1.1.34"),
+    os.path.join(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp",
+                 "qoder-ref", "cli2api", "testdata", "protocol", "1.1.34"),
+    os.path.join(os.path.expanduser("~"), "qoder-ref", "cli2api",
+                 "testdata", "protocol", "1.1.34"),
+]
+if _FIX_ENV and not os.path.isdir(_FIX_ENV):
+    print("  [WARN] QD_TEST_FIXTURE_DIR 指向的目录不存在：%s" % _FIX_ENV)
+_FIX, _FIX_TRIED = "", []
+for _cand in _FIX_CANDIDATES:
+    if not _cand:
+        continue
+    _cand_abs = os.path.abspath(_cand)
+    _FIX_TRIED.append(_cand_abs)
+    if os.path.isdir(_cand_abs):
+        _FIX = _cand_abs
+        break
+if _FIX:
+    print("  fixture 目录: %s" % _FIX)
+else:
+    print("  fixture 目录: 未找到；已探测 %d 条候选：" % len(_FIX_TRIED))
+    for _p in _FIX_TRIED:
+        print("      -  %s" % _p)
+    print("      指定方式: QD_TEST_FIXTURE_DIR=<dir> python _test_qoder.py")
+
+_CRED_FP = os.path.join(_FIX, "credential.json") if _FIX else ""
+_MCACHE_FP = os.path.join(_FIX, "model-cache.json") if _FIX else ""
+
+if _CRED_FP and os.path.isfile(_CRED_FP):
+    fx = json.load(open(_CRED_FP, encoding="utf-8"))
     mkey = fx["input"]["machine_key"].encode()
     fx_ct = _b64.b64decode(fx["expected"]["encrypted"])
     dec = S.aes_cbc_decrypt(fx_ct, mkey, mkey)
@@ -1359,19 +1419,28 @@ if os.path.isdir(_FIX):
     enc = _b64.b64encode(S.aes_cbc_encrypt(dec, mkey, mkey)).decode()
     check("credential fixture encrypt byte-exact",
           enc == fx["expected"]["encrypted"])
-    mf = json.load(open(os.path.join(_FIX, "model-cache.json"), encoding="utf-8"))
+else:
+    _miss_cred = "缺 credential.json" if _FIX else "缺 fixture 目录"
+    skip("credential fixture decrypt byte-exact", _miss_cred)
+    skip("credential fixture encrypt byte-exact", _miss_cred)
+
+if _MCACHE_FP and os.path.isfile(_MCACHE_FP):
+    mf = json.load(open(_MCACHE_FP, encoding="utf-8"))
     plain = S.qmc_decrypt(mf["expected"]["encrypted"], mf["input"]["uid"])
     check("model-cache (QMC v1) fixture decrypt byte-exact",
           plain.decode() == mf["expected"]["decrypted"])
-    # AES-256 互逆（QMC 用 32 字节 key -> 14 轮）
-    k256 = bytes(range(32))
-    blk = bytes(range(16))
-    rks = S._expand_key(k256)
-    check("AES-256 key schedule = 15 round keys", len(rks) == 15, len(rks))
-    check("AES-256 block roundtrip",
-          S._decrypt_block(S._encrypt_block(blk, rks), rks) == blk)
 else:
-    check("official crypto fixtures present", False, _FIX)
+    skip("model-cache (QMC v1) fixture decrypt byte-exact",
+         "缺 model-cache.json" if _FIX else "缺 fixture 目录")
+
+# AES-256 互逆（QMC 用 32 字节 key -> 15 个轮密钥）：纯算法、不依赖 fixture，
+# 因此永远执行（此前被误放进 fixture 分支，缺 fixture 时连算法 KAT 都一起没跑）。
+k256 = bytes(range(32))
+blk = bytes(range(16))
+rks = S._expand_key(k256)
+check("AES-256 key schedule = 15 round keys", len(rks) == 15, len(rks))
+check("AES-256 block roundtrip",
+      S._decrypt_block(S._encrypt_block(blk, rks), rks) == blk)
 
 print()
 print("[4.6] local credential scan (reads THIS machine's official stores)")
@@ -1603,10 +1672,18 @@ _hdrs = _t_cn.desktop_headers()
 check("desktop headers carry Cosy-ClientType=10 + Cosy-Version + UA Qoder",
       _hdrs["cosy-clienttype"] == "10" and _hdrs["User-Agent"] == "Qoder"
       and bool(_hdrs["cosy-version"]), _hdrs.get("cosy-clienttype"))
-check("desktop headers carry the machine identity set",
-      all(_hdrs.get(k) for k in ("cosy-machineid", "cosy-machinetoken",
-                                 "cosy-machinetype", "cosy-machineos",
-                                 "cosy-machinehostname", "cosy-machinecode")))
+# 前提：文件头已设 QD_NATIVE_IDENTITY=0，且本机 runtime_info_exe("cn") 返回空 ->
+# 本进程内的身份来源必为 "derived"（:1679 那条断言独立守这一点）。
+# issue #10：**derived** 身份不得携带 cosy-machine* 六头——服务端一旦看到一整套
+# 派生机器头，就会把 CN 的「每日领取 100 Credits」等可领取活动整条过滤掉（列表变空）。
+# 语义 = 服务端可见值必须为空/缺失（实现删除键或置空都满足）；"能红"面 = 回退成
+# 无条件发头即失败。
+_MACHINE_HDRS20 = ("cosy-machineid", "cosy-machinetoken", "cosy-machinetype",
+                   "cosy-machineos", "cosy-machinehostname", "cosy-machinecode")
+check("derived 身份不得发送 cosy-machine* 六头（issue #10：全套派生机器头会让服务端"
+      "过滤掉可领取的 Credits 活动）",
+      not any(_hdrs.get(k) for k in _MACHINE_HDRS20),
+      {k: _hdrs.get(k) for k in _MACHINE_HDRS20 if _hdrs.get(k)})
 check("native identity bridge can be disabled (derived fallback)",
       os.environ.get("QD_NATIVE_IDENTITY") == "0"
       and _t_cn.machine_identity_source == "derived"
@@ -1614,6 +1691,24 @@ check("native identity bridge can be disabled (derived fallback)",
       _t_cn.machine_identity_source)
 check("desktop headers keep the Bearer token",
       _hdrs["Authorization"].startswith("Bearer "))
+# issue #10 的正向面：修复只能收窄 derived，**native 原生身份必须照旧发六头**。
+# 打桩原生身份返回值（当前 desktop_headers 以 native_machine_identity() 的返回
+# 为判据；若实现改判据，这条会红——这正是要它守住的契约）。
+_orig_nmi20 = A.native_machine_identity
+try:
+    A.native_machine_identity = lambda realm, account_id, force=False: {
+        "machineToken": "nt-token", "machineType": "3",
+        "machineCode": "nc-1", "source": "runtime-info"}
+    _t_native20 = A.Account({"uid": "h20native", "realm": "cn",
+                             "accessToken": "dt-x"})
+    _h_native20 = _t_native20.desktop_headers()
+finally:
+    A.native_machine_identity = _orig_nmi20
+check("原生桥身份分支（source=runtime-info）仍发送 cosy-machine* 六头"
+      "（issue #10 只收窄 derived，不砍原生能力）",
+      _t_native20.machine_identity_source == "runtime-info"
+      and all(_h_native20.get(k) for k in _MACHINE_HDRS20),
+      {k: _h_native20.get(k) for k in _MACHINE_HDRS20})
 check("campaign claim/reward path templates (official growth-page contract)",
       A.PATH_CAMPAIGN_CLAIM == "/sash/api/v1/me/campaigns/%s/claim"
       and A.PATH_CAMPAIGN_REWARD == "/sash/api/v1/me/campaigns/%s/reward")
@@ -1758,7 +1853,10 @@ def _stub_native(realm, account_id, force=False):
 A.Account._campaigns_get = _stub_get
 A.native_machine_identity = _stub_native
 _acc25 = A.Account({"uid": "cp25", "realm": "cn", "accessToken": "dt-x"})
-_acc25.machine_identity_source = "native"
+# Lead 口径裁决：machine_identity_source 合法值只有 "runtime-info"（原生桥可用）
+# 与 "derived"（回退）；此处桩值必须是真实取值——过去写成 "native" 会让实现里
+# 永不命中的死逻辑（== "native"）被测试掩盖成"已验证"。
+_acc25.machine_identity_source = "runtime-info"
 try:
     _st25 = _acc25.campaigns()
 finally:
@@ -2424,8 +2522,13 @@ check("不带 only_kinds：积分与券类都领",
 # --- 25.3 面板/接口接线：账号面板走 only_daily，福利中心走全量 ---
 _src25 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "qoder_proxy.py"), encoding="utf-8").read()
-check("账号面板 /accounts/checkin 只做每日签到",
-      "run_checkin(account, gap=0.4, only_daily=True)" in _src25)
+check("账号面板 /accounts/checkin 只做每日签到，且间隔传 CHECKIN_MIN_GAP 常量本身",
+      # 恢复被弱化的精确语义：调用点必须写 CHECKIN_MIN_GAP，常量定义值必须与
+      # **运行时** P.CHECKIN_MIN_GAP 一致（引用运行时值，不把 1.0 硬编码进字符串，
+      # 下次调间隔只改实现一处）。
+      "run_checkin(account, gap=CHECKIN_MIN_GAP" in _src25
+      and "only_daily=True" in _src25
+      and ("CHECKIN_MIN_GAP = %r" % P.CHECKIN_MIN_GAP) in _src25)
 check("签到与福利中心 /tasks/run 仍是全量领取",
       "run_batch_checkin(targets, gap=1.0)" in _src25)
 _dash25 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -2620,5 +2723,240 @@ check("写入侧只引用 LEAK_MARKER 常量（无重复字面量）",
       _src27.count(json.dumps(P.LEAK_MARKER, ensure_ascii=False)))
 
 print()
-print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
+print("[27.5] issue #9：截断的 marker+JSON 回声必须吞掉、不得透传（P0）")
+_TRUNC27 = _M27 + "\n" + _CALLS27[:40]      # 未闭合字符串的截断回声（issue #9 样本形态）
+check("判据：截断数组 -> True",
+      P._leaked_partial_droppable(_TRUNC27, {"terminal"}) is True)
+check("判据：只有 marker -> True",
+      P._leaked_partial_droppable(_M27, {"terminal"}) is True)
+check("判据：围栏 + 截断数组 -> True",
+      P._leaked_partial_droppable("```json\n" + _TRUNC27, {"terminal"}) is True)
+check("判据：marker + 散文 -> False",
+      P._leaked_partial_droppable(_M27 + "\n这是一段解释文字。",
+                                 {"terminal"}) is False)
+check("判据：不以 marker 开头的讨论回复 -> False",
+      P._leaked_partial_droppable("网关会写入 " + _M27 + " 这样的提示。",
+                                 {"terminal"}) is False)
+check("判据：未声明 tools / 空 names -> False",
+      P._leaked_partial_droppable(_TRUNC27, None) is False
+      and P._leaked_partial_droppable(_TRUNC27, set()) is False)
+check("判据：完整但未声明工具名的数组 -> False（保持 fail-open 透传）",
+      P._leaked_partial_droppable(_LEAK27, {"other"}) is False)
+
+_frames_trunc = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_TRUNC27[:12]), _raw27(_TRUNC27[12:]), _raw27("", "stop")]),
+    {"terminal"})]
+_text_trunc = "".join(_f["choices"][0]["delta"].get("content") or ""
+                      for _f in _frames_trunc)
+check("流式：截断回声被吞（正文既无 marker、也无 terminal 明文）",
+      _text_trunc == ""
+      and P.LEAK_MARKER not in json.dumps(_frames_trunc, ensure_ascii=False),
+      _text_trunc)
+check("流式：吞掉后 finish_reason 仍为 stop（Lead 裁定）",
+      _frames_trunc[-1]["choices"][0]["finish_reason"] == "stop",
+      _frames_trunc)
+
+_obj_trunc = P.aggregate_stream(
+    _Resp27([_env27(_TRUNC27[:12]), _env27(_TRUNC27[12:]), _env27("", "stop")]),
+    "m27", None, allowed_names={"terminal"})
+_msg_trunc = _obj_trunc["choices"][0]["message"]
+check("非流式：截断回声 -> content 清空、无 tool_calls、finish=stop",
+      _msg_trunc.get("content") == "" and not _msg_trunc.get("tool_calls")
+      and _obj_trunc["choices"][0]["finish_reason"] == "stop", _obj_trunc)
+
+_ev_trunc = [f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_TRUNC27[:12]), _raw27(_TRUNC27[12:]), _raw27("", "stop")]),
+    "m27", {"usage": None, "custom_names": set(),
+            "allowed_names": {"terminal"}})]
+_joined_trunc = "".join(_ev_trunc)
+_parsed_trunc_lk = [json.loads(_ln[6:]) for _fr in _ev_trunc
+                       for _ln in _fr.splitlines() if _ln.startswith("data: ")]
+_text_delta_trunc = "".join(e.get("delta") or "" for e in _parsed_trunc_lk
+                            if isinstance(e, dict)
+                            and e.get("type") == "response.output_text.delta")
+check("Responses 流式：截断回声不出现在正文增量里（不再用短词匹配整个事件流）",
+      _text_delta_trunc == "" and P.LEAK_MARKER not in _joined_trunc,
+      (_text_delta_trunc[:120], _joined_trunc[:120]))
+
+_frames_falsify = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_M27), _raw27("\n这是一段解释文字。"), _raw27("", "stop")]),
+    {"terminal"})]
+_text_falsify = "".join(_f["choices"][0]["delta"].get("content") or ""
+                        for _f in _frames_falsify)
+check("流式：证伪（marker 后接散文）-> 仍 fail-open 补发原文",
+      _M27 in _text_falsify and "解释文字" in _text_falsify, _text_falsify)
+
+print()
+print("[28] 发布前补强：终局验证 §10.7#5 的零覆盖项（防止静默回归）")
+import ast as _ast28
+import re as _re28
+import shutil as _sh28
+import tempfile as _tf28
+import time as _t28
+import qoder_scheduler as _S28
+
+_src28 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+
+
+def _arg_src28(src_text, func_name):
+    """AST 级提取：func_name(...) 每个调用的位置参数源码片段（离线可变异的判据）。"""
+    tree = _ast28.parse(src_text)
+    out = []
+    for node in _ast28.walk(tree):
+        if isinstance(node, _ast28.Call) and isinstance(node.func, _ast28.Name) \
+                and node.func.id == func_name:
+            out.append([_ast28.get_source_segment(src_text, a) for a in node.args])
+    return out
+
+
+# --- 28.1 Responses 重试上下文：两处重开必须用转换后的 chat_req ---
+_i0_28 = _src28.index("chat_req = responses_to_chat(payload)")
+_i1_28 = _src28.index("\n    def ", _i0_28 + 10)
+_resp_block28 = _src28[_i0_28:_i1_28]
+check("Responses 重开：两处重试都以 chat_req 发起"
+      "（open_upstream 与 aggregate_with_envelope_retry）",
+      "chat_req, session_key=session_key" in _resp_block28
+      and "upstream, chat_req, session_key" in _resp_block28)
+_strip28 = _resp_block28.replace("chat_req = responses_to_chat(payload)", "")
+_idents28 = _re28.findall(r"(?<![\w.])payload(?![\w])", _strip28)
+_gets28 = len(_re28.findall(r"payload\.get\(", _strip28))
+check("Responses 分支：原始 payload 只用于读字段（payload.get），不再作为上游请求体"
+      "——回退成 payload 即红",
+      len(_idents28) == _gets28 and _gets28 >= 1,
+      (_idents28, _gets28))
+_agg_args28 = _arg_src28(_src28, "aggregate_with_envelope_retry")
+check("AST：aggregate_with_envelope_retry 实参里 chat_req（Responses）与 payload"
+      "（chat）各司其职——单一断言同时锁住两条链路",
+      any(len(a) > 1 and a[1] == "chat_req" for a in _agg_args28)
+      and any(len(a) > 1 and a[1] == "payload" for a in _agg_args28),
+      [a[:2] for a in _agg_args28])
+
+# --- 28.2 response.failed 终态事件与 sequence_number 续号 ---
+_h28 = {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}}
+_ev28 = [json.loads(_ln[6:])
+         for _f in P.stream_responses_events(
+             iter([_raw27("hi"), _raw27("", "stop")]), "m27", _h28)
+         for _ln in _f.decode().splitlines() if _ln.startswith("data: ")]
+_max28 = max(e["sequence_number"] for e in _ev28)
+_fail_raw28 = P._responses_failed_frame(_h28, 418, "upstream boom")
+_fail_obj28 = json.loads([_l for _l in _fail_raw28.decode().splitlines()
+                          if _l.startswith("data: ")][0][6:])
+check("response.failed：终态事件名 / status / error.code 正确",
+      _fail_raw28.decode("utf-8").startswith("event: response.failed\n")
+      and _fail_obj28["type"] == "response.failed"
+      and _fail_obj28["response"]["status"] == "failed"
+      and _fail_obj28["response"]["error"]["code"] == "418",
+      _fail_obj28)
+check("response.failed：sequence_number 严格大于此前所有事件（续号，不回退到 0）",
+      _fail_obj28["sequence_number"] > _max28,
+      (_fail_obj28["sequence_number"], _max28))
+_h28b = {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}}
+_ev28b1 = [json.loads(_ln[6:])
+           for _f in P.stream_responses_events(
+               iter([_raw27("a"), _raw27("", "stop")]), "m27", _h28b)
+           for _ln in _f.decode().splitlines() if _ln.startswith("data: ")]
+_ev28b2 = [json.loads(_ln[6:])
+           for _f in P.stream_responses_events(
+               iter([_raw27("b"), _raw27("", "stop")]), "m27", _h28b)
+           for _ln in _f.decode().splitlines() if _ln.startswith("data: ")]
+check("Responses 重开后 sequence_number 续号（第二条流从第一条流的 max+1 开始）",
+      min(e["sequence_number"] for e in _ev28b2)
+      == max(e["sequence_number"] for e in _ev28b1) + 1,
+      (max(e["sequence_number"] for e in _ev28b1),
+       min(e["sequence_number"] for e in _ev28b2)))
+
+# --- 28.3 catalog_source 只读来源标注 ---
+_SRC_SET28 = ("external-json", "embedded-frozen", "unknown")
+check("catalog_source：snapshot_source() 取值在允许集合内，未知 realm 走 cn 分支",
+      C.snapshot_source("cn") in _SRC_SET28
+      and C.snapshot_source("intl") in _SRC_SET28
+      and C.snapshot_source("bogus-realm") == C.snapshot_source("cn"),
+      (C.snapshot_source("cn"), C.snapshot_source("intl")))
+check("catalog_source：/v1/models 既有字段未变、新增来源标注（含异常兜底 unknown）",
+      '"object": "list", "data": data' in _src28
+      and '"catalog_source": catalog_source' in _src28
+      and 'catalog_source = "unknown"' in _src28,
+      [_l.strip() for _l in _src28.splitlines() if "catalog_source" in _l][:4])
+
+# --- 28.4 Scheduler：状态落盘子目录 + 启动补签闸门（mark-before-act） ---
+_tmp28 = _tf28.mkdtemp(prefix="qd-test-sched-")
+_sched_err28 = None
+try:
+    _pool28 = A.AccountPool(_tmp28)
+    _s1_28 = _S28.Scheduler(_pool28, state_dir=_tmp28)
+    _gate_first28 = _s1_28._allow_complement_checkin(_S28.CYCLE_STARTUP)
+    _state_path28 = _s1_28._state_path()
+    _state_exists28 = os.path.isfile(_state_path28)
+    with open(_state_path28, encoding="utf-8") as _fh28:
+        _state_json28 = json.load(_fh28)
+    _gate_second28 = _s1_28._allow_complement_checkin(_S28.CYCLE_STARTUP)
+    _s2_28 = _S28.Scheduler(_pool28, state_dir=_tmp28)     # 模拟进程重启
+    _gate_restart28 = _s2_28._allow_complement_checkin(_S28.CYCLE_STARTUP)
+    _gate_hour28 = _s2_28._allow_complement_checkin(_S28.CYCLE_HOUR)
+    _accounts28 = _pool28.load()
+except Exception as _exc28:
+    _sched_err28 = _exc28
+    _state_path28 = ""
+    _state_exists28 = False
+    _state_json28 = {}
+    _gate_first28 = _gate_second28 = _gate_restart28 = _gate_hour28 = None
+    _accounts28 = []
+finally:
+    _sh28.rmtree(_tmp28, ignore_errors=True)
+
+check("Scheduler：state.json 落在账号目录的子目录，且不会被 AccountPool.load 当成账号",
+      _sched_err28 is None
+      and _state_path28 == os.path.join(_tmp28, "scheduler", "state.json")
+      and _state_exists28 and _accounts28 == [],
+      (_sched_err28, _state_path28, len(_accounts28)))
+check("Scheduler：mark-before-act——首次启动补签返回 True，且当日标记已先落盘",
+      _gate_first28 is True
+      and _state_json28.get("startup_claim_date") == _t28.strftime("%Y-%m-%d"),
+      _state_json28.get("startup_claim_date"))
+check("Scheduler：同一天第二次启动补签被闸门拒绝（False）",
+      _gate_second28 is False, _gate_second28)
+check("Scheduler：进程重启后不重放（新实例读同一 state.json 仍为 False）",
+      _gate_restart28 is False, _gate_restart28)
+check("Scheduler：整点巡回来由不受启动闸门限制（True）",
+      _gate_hour28 is True, _gate_hour28)
+
+# --- 28.5 身份来源口径（Lead 裁决：合法值只有 runtime-info / derived） ---
+_acc_src28 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "qoder_accounts.py"), encoding="utf-8").read()
+_acc_code28 = "\n".join(_l for _l in _acc_src28.splitlines()
+                          if not _l.lstrip().startswith("#"))
+check("身份来源口径：自愈条件用真实取值 runtime-info，代码里不得再有 == \"native\" 死逻辑"
+      "（注释里的历史说明不算）",
+      '"runtime-info"' in _acc_code28 and '== "native"' not in _acc_code28,
+      [_l.strip() for _l in _acc_code28.splitlines() if '== "native"' in _l][:2])
+check("身份来源口径：machine_identity_source 赋值只来自 derived 初始化与原生桥 source 回退"
+      "（不得硬编码 native）",
+      'machine_identity_source = "derived"' in _acc_src28
+      and 'machine_identity_source = ident.get("source") or "derived"' in _acc_src28
+      and 'machine_identity_source = "native"' not in _acc_src28,
+      [_l.strip() for _l in _acc_src28.splitlines()
+       if "machine_identity_source =" in _l])
+
+print()
+print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
+      % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
+print("RESULT: %s (exit %d)  SKIP=%d  |  语义: 0=GREEN(无 FAIL，允许 SKIP)；"
+      "1=RED(存在 FAIL)；SKIP 永不计入通过"
+      % ("RED" if FAIL else "GREEN", 1 if FAIL else 0, SKIP))
+# 口径自证：静态源码里以 check(/skip( 开头的顶层断言点 vs 运行时执行数。
+# 两者差值来自循环展开（多执行）与条件分支未走（少执行）；以运行时数字为准。
+try:
+    with open(os.path.abspath(__file__), encoding="utf-8") as _fh:
+        _self_src = _fh.read()
+    _static = len([_ln for _ln in _self_src.splitlines()
+                   if _ln.lstrip().startswith(("check(", "skip("))])
+    print("CHECK-SOURCES: static-top-level=%d, runtime-executed=%d, skipped=%d, "
+          "delta=%+d (循环展开/条件分支)"
+          % (_static, PASS + FAIL, SKIP, (PASS + FAIL) - _static))
+except Exception as _exc:
+    print("CHECK-SOURCES: 静态口径统计失败（%s）" % _exc)
+if SKIP:
+    print("NOTE: %d 条断言被跳过（缺 fixture/环境），没有被当成通过；"
+          "补齐后请重跑确认它们真的通过。" % SKIP)
 sys.exit(1 if FAIL else 0)
