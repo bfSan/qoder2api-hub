@@ -2497,5 +2497,128 @@ check("三处信封捕获点都接入账号冷却",
       _src26.count("_handle_envelope_account_cooldown("))
 
 print()
+print("[27] 泄漏文本回读（issue #8：模型照格式复述 tool_calls 序列化）")
+_M27 = P.LEAK_MARKER
+_CALLS27 = json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+_LEAK27 = _M27 + "\n" + _CALLS27
+
+_rec27, _clean27 = P.parse_leaked_tool_calls(_LEAK27, {"terminal"})
+check("严格形态：marker+JSON 数组 -> 还原为结构化调用且正文清空",
+      bool(_rec27) and _clean27 == ""
+      and _rec27[0]["function"]["name"] == "terminal"
+      and json.loads(_rec27[0]["function"]["arguments"])["cmd"] == "ls",
+      (_rec27, _clean27))
+check("围栏形态（```json ... ```）同样还原",
+      bool(P.parse_leaked_tool_calls("```json\n" + _LEAK27 + "\n```", {"terminal"})[0]))
+check("无语言标记围栏（``` ... ```）同样还原",
+      bool(P.parse_leaked_tool_calls("```\n" + _LEAK27 + "\n```", {"terminal"})[0]))
+check("普通正文（讨论该标记）不误判",
+      P.parse_leaked_tool_calls("网关会写入 " + _M27 + " 这样的提示，不是调用。")[0] is None)
+check("数组后带多余文本不还原",
+      P.parse_leaked_tool_calls(_LEAK27 + "\n以上。", {"terminal"})[0] is None)
+check("未声明的工具名不还原（守卫：只认本次声明的 tools）",
+      P.parse_leaked_tool_calls(_LEAK27, {"other"})[0] is None)
+check("空数组不还原", P.parse_leaked_tool_calls(_M27 + "\n[]")[0] is None)
+check("arguments 为对象 -> 规范化为 JSON 字符串",
+      json.loads(P.parse_leaked_tool_calls(
+          _M27 + "\n" + json.dumps([{"name": "t", "arguments": {"a": 1}}],
+                                   ensure_ascii=False),
+          {"t"})[0][0]["function"]["arguments"]) == {"a": 1})
+check("arguments 非法 JSON 字符串 -> 不还原",
+      P.parse_leaked_tool_calls(
+          _M27 + "\n" + json.dumps([{"name": "t", "arguments": "{not-json"}]),
+          {"t"})[0] is None)
+check("声明工具名提取兼容 chat 与 responses 两种 tools 形态",
+      P._tool_names_from_payload({"tools": [
+          {"type": "function", "function": {"name": "a"}},
+          {"type": "function", "name": "b"}]}) == {"a", "b"})
+
+
+def _raw27(content=None, fin=None, **kw):
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    delta.update(kw)
+    inner = {"id": "c27", "model": "m27", "created": 1, "choices": [
+        {"index": 0, "delta": delta, "finish_reason": fin}]}
+    return ("data: " + json.dumps(inner, ensure_ascii=False)
+            + "\n\n").encode("utf-8")
+
+
+def _env27(content=None, fin=None, **kw):
+    inner = json.loads(_raw27(content, fin, **kw)[6:])
+    return ("data: " + json.dumps(
+        {"statusCodeValue": 200, "body": json.dumps(inner, ensure_ascii=False)},
+        ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+class _Resp27:
+    def __init__(self, items):
+        self.items = list(items)
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def close(self):
+        pass
+
+
+_obj27 = P.aggregate_stream(
+    _Resp27([_env27(_LEAK27[:12]), _env27(_LEAK27[12:]),
+             _env27("", "stop")]),
+    "m27", None, allowed_names={"terminal"})
+_msg27 = _obj27["choices"][0]["message"]
+check("非流式聚合：泄漏正文 -> 结构化 tool_calls，finish_reason=tool_calls",
+      _obj27["choices"][0]["finish_reason"] == "tool_calls"
+      and _msg27.get("content") == ""
+      and ((_msg27.get("tool_calls") or [{}])[0].get("function")
+           or {}).get("name") == "terminal", _obj27)
+
+_frames27 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_LEAK27[:9]), _raw27(_LEAK27[9:]), _raw27("", "stop")]),
+    {"terminal"})]
+_c27 = [_f["choices"][0] for _f in _frames27]
+check("流式：marker 跨增量分段仍回读为 tool_calls 增量 + 收尾帧改写",
+      not any(_d.get("delta", {}).get("content") for _d in _c27)
+      and any(_d.get("delta", {}).get("tool_calls") for _d in _c27)
+      and _c27[-1]["finish_reason"] == "tool_calls", _c27)
+
+_frames27b = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("[1, 2"), _raw27(", 3] 这是正文"), _raw27("", "stop")]))]
+check("流式：以 [ 开头但被证伪 -> 原样补发正文，不改 finish",
+      "".join(_f["choices"][0]["delta"].get("content") or ""
+              for _f in _frames27b) == "[1, 2, 3] 这是正文"
+      and _frames27b[-1]["choices"][0]["finish_reason"] == "stop", _frames27b)
+
+_frames27c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_LEAK27), _raw27("", "stop")]), {"other_tool"})]
+check("流式：未声明工具名 -> 不吞正文，按普通文本透传",
+      "".join(_f["choices"][0]["delta"].get("content") or ""
+              for _f in _frames27c) == _LEAK27, _frames27c)
+
+_ev27 = [f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_LEAK27), _raw27("", "stop")]), "m27",
+    {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}})]
+_parsed27 = [json.loads(_ln[6:]) for _fr in _ev27
+             for _ln in _fr.splitlines() if _ln.startswith("data: ")]
+_text27 = "".join(e.get("delta") or "" for e in _parsed27
+                  if e.get("type") == "response.output_text.delta")
+_fc27 = [e["item"] for e in _parsed27
+         if e.get("type") == "response.output_item.done"
+         and (e.get("item") or {}).get("type") == "function_call"]
+check("Responses 流式：泄漏不回显为 output_text，转为 function_call 项",
+      _text27 == "" and _fc27 and _fc27[0].get("name") == "terminal",
+      (_text27, _fc27))
+
+_src27 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("写入侧只引用 LEAK_MARKER 常量（无重复字面量）",
+      _src27.count(json.dumps(P.LEAK_MARKER, ensure_ascii=False)) == 1
+      and "LEAK_MARKER + " in _src27,
+      _src27.count(json.dumps(P.LEAK_MARKER, ensure_ascii=False)))
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

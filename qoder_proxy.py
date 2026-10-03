@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.1.9"
+VERSION = "1.2.0"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2198,6 +2198,312 @@ def parse_dsml_tool_calls(text):
 
 
 # ---------------------------------------------------------------------------
+# 历史工具调用文本形态的「回读」（issue #8）
+# ---------------------------------------------------------------------------
+# flatten_messages() 会把 assistant 历史里的 tool_calls 序列化成
+#   marker（LEAK_MARKER，见下）+ 一个 JSON 数组 [{name, arguments}, ...]
+# 给上游模型当上下文。长会话里模型偶发**照格式复述**成正文（没有结构化
+# tool_calls），客户端就会把这段 JSON 当正文显示、本轮工具调用不执行。
+# 这里补齐回读：在严格守卫下还原成结构化 tool_calls 并从正文移除。
+LEAK_MARKER = "[assistant 请求调用工具]"
+
+
+def parse_leaked_tool_calls(text, allowed_names=None):
+    """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
+
+    严格守卫（避免把"讨论该标记的普通回复"误判为工具调用）：
+      1) 整段正文 strip 后必须**恰好**是 marker + JSON 数组（可带 ``` 围栏）；
+      2) 数组非空，每项 name 为非空字符串、arguments 为合法 JSON（字符串或对象）；
+      3) 本次请求声明了 tools 时，所有 name 必须命中声明集合。
+
+    返回 (tool_calls|None, clean_text)：识别成功时 clean_text 为空串
+    （整段都是该块）；未识别时原样返回 text。
+    """
+    t = (text or "").strip()
+    # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
+    if t.startswith("```") and t.endswith("```") and len(t) > 6:
+        inner = t[3:]
+        if inner[:4].lower() == "json":
+            inner = inner[4:]
+        t = inner[:-3].strip()
+    if not t.startswith(LEAK_MARKER):
+        return None, text
+    rest = t[len(LEAK_MARKER):].strip()
+    if not (rest.startswith("[") and rest.endswith("]")):
+        return None, text
+    try:
+        arr = json.loads(rest)
+    except Exception:
+        return None, text
+    if not isinstance(arr, list) or not arr:
+        return None, text
+    calls = []
+    for item in arr:
+        if not isinstance(item, dict):
+            return None, text
+        name = item.get("name")
+        args = item.get("arguments")
+        if not isinstance(name, str) or not name.strip():
+            return None, text
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args, ensure_ascii=False)
+        if not isinstance(args, str):
+            return None, text
+        if args.strip():
+            try:
+                json.loads(args)
+            except Exception:
+                return None, text
+        calls.append({
+            "id": _new_id("call_"),
+            "type": "function",
+            "function": {"name": name.strip(), "arguments": args},
+        })
+    if allowed_names:
+        if not all(c["function"]["name"] in allowed_names for c in calls):
+            return None, text
+    return calls, ""
+
+
+def _leak_body_offset(text):
+    """把「marker 之前的围栏前缀 / marker 之后的正文」解析出来。
+
+    返回 (state, body)：state='pre'（还处在围栏/前缀区，未到 marker）、
+    state='body'（已越过 marker，body 为其后文本）、state='no'（显然不是）。
+    流式暂存与判真共用同一套前缀规则（含 ``` 与 ```json 围栏）。
+    """
+    t = (text or "").lstrip()
+    if not t or LEAK_MARKER.startswith(t):
+        return "pre", None
+    if t.startswith(LEAK_MARKER):
+        return "body", t[len(LEAK_MARKER):]
+    if not t.startswith("`"):
+        return "no", None
+    if len(t) < 3:
+        return ("pre", None) if "```".startswith(t) else ("no", None)
+    if not t.startswith("```"):
+        return "no", None
+    rest = t[3:]
+    low = rest.lstrip().lower()
+    if low.startswith("json"):
+        after = rest.lstrip()[4:].lstrip()
+    elif LEAK_MARKER.startswith(low) or low.startswith(LEAK_MARKER):
+        after = rest.lstrip()          # 无语言标记的 ``` 围栏
+    elif "json".startswith(low):
+        return "pre", None             # 语言标记还没打完（j/js/json）
+    else:
+        return "no", None
+    if LEAK_MARKER.startswith(after):
+        return "pre", None
+    if after.startswith(LEAK_MARKER):
+        return "body", after[len(LEAK_MARKER):]
+    return "no", None
+
+
+def _leak_prefix_hold(text):
+    """文本仍可能是泄漏块的前缀？（流式 hold-back 用）"""
+    return _leak_body_offset(text)[0] != "no"
+
+
+def _tool_names_from_payload(payload):
+    """取客户端本次请求声明的工具名集合（回读守卫用）。"""
+    names = set()
+    for t in (payload or {}).get("tools") or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name") or ""
+        if name:
+            names.add(str(name))
+    return names or None
+
+
+def _json_array_prefix_ok(text):
+    """text 是否仍可能扩展成合法 JSON 数组字面量（流式暂存判定用）。"""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if not s.startswith("["):
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception as exc:
+        msg = str(exc)
+        # 未闭合字符串的报错位置在字符串开头，但仍可继续扩展
+        if msg.startswith("Unterminated string"):
+            return True
+        pos = getattr(exc, "pos", None)
+        if pos is None:
+            return False
+        if msg.startswith("Extra data"):
+            # 数组已完整，尾随的只能是（可能还没打完的）``` 收尾围栏
+            tail = s[pos:].strip()
+            return (not tail) or "```".startswith(tail)
+        # 语法错误点落在末尾（未闭合括号等）→ 还允许继续扩展
+        return pos >= len(s) - 1
+
+
+def _still_leak_candidate(text):
+    """整段文本目前是否仍是「marker + JSON 数组」候选？（流式暂存判定用）"""
+    state, body = _leak_body_offset(text)
+    if state == "pre":
+        return True
+    if state == "no":
+        return False
+    rest = (body or "").lstrip()
+    if not rest:
+        return True
+    if rest.endswith("```"):
+        rest = rest[:-3]
+    return _json_array_prefix_ok(rest)
+
+
+def _leak_chunk_frame(meta, delta, finish_reason=None):
+    """按流式 chat.completion.chunk 形态合成一帧（沿用上游的 id/model）。"""
+    payload = {
+        "id": meta.get("id") or "chatcmpl-qoder",
+        "object": "chat.completion.chunk",
+        "created": meta.get("created") or int(time.time()),
+        "model": meta.get("model") or "",
+        "choices": [{"index": 0, "delta": delta,
+                     "finish_reason": finish_reason}],
+    }
+    return ("data: " + json.dumps(payload, ensure_ascii=False)
+            + "\n\n").encode("utf-8")
+
+
+def _frame_without_content(payload):
+    """复制一帧并去掉 delta.content（保留 tool_calls/reasoning/收尾信息）。"""
+    out = dict(payload)
+    choices = []
+    for ch in payload.get("choices") or []:
+        if not isinstance(ch, dict):
+            choices.append(ch)
+            continue
+        ch2 = dict(ch)
+        delta = ch2.get("delta")
+        if isinstance(delta, dict) and "content" in delta:
+            d2 = dict(delta)
+            d2.pop("content", None)
+            ch2["delta"] = d2
+        choices.append(ch2)
+    out["choices"] = choices
+    return out
+
+
+def recover_leaked_tool_calls(frames, allowed_names=None):
+    """流式回读（issue #8）：把模型逐块吐出的「marker + JSON 数组」正文恢复
+    成结构化 tool_calls 增量帧；其余内容原样透传（fail-open）。
+
+    与 parse_leaked_tool_calls 同一套严格守卫，另加：
+      - 只有当已输出的正文仍是该块的「前缀/候选」时才暂存（期间不发正文）；
+      - 候选被证伪（出现别的字 / JSON 非法）→ 立刻把暂存整段补发为正文；
+      - 收尾帧暂存到流末，识别成功时改写 finish_reason=tool_calls；
+      - 上游中断时暂存直接丢弃（正文未发，交给上游重试/错误帧处理）。
+    """
+    hold = None          # 正在暂存的候选正文（None = 未暂存）
+    finished = None      # 暂存的收尾帧：(payload, 原 finish_reason)
+    recovered = False
+    meta = {"id": None, "model": None, "created": None}
+
+    for raw in frames:
+        text = (raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else raw)
+        data = strip_data_prefix(text)
+        payload = None
+        if data and data != "[DONE]":
+            try:
+                payload = json.loads(data)
+            except Exception:
+                payload = None
+        if not isinstance(payload, dict):
+            yield raw
+            continue
+        if payload.get("id"):
+            meta["id"] = payload["id"]
+        if payload.get("model"):
+            meta["model"] = payload["model"]
+        if payload.get("created"):
+            meta["created"] = payload["created"]
+        choices = payload.get("choices") or []
+        choice = (choices[0] if choices and isinstance(choices[0], dict)
+                  else {})
+        delta = choice.get("delta") or {}
+        piece_raw = delta.get("content")
+        piece = piece_raw if isinstance(piece_raw, str) else ""
+        fin = choice.get("finish_reason")
+        if piece_raw is not None and not isinstance(piece_raw, str):
+            # 非字符串 content（罕见）：不参与暂存判断，原样透传
+            if hold is not None:
+                yield _leak_chunk_frame(meta, {"content": hold})
+                hold = None
+            yield raw
+            continue
+        if hold is not None:
+            hold += piece
+            if _still_leak_candidate(hold):
+                if fin:
+                    finished = (payload, fin)
+                elif (delta.get("tool_calls")
+                      or delta.get("reasoning_content")
+                      or delta.get("role")):
+                    other = _frame_without_content(payload)
+                    yield ("data: "
+                           + json.dumps(other, ensure_ascii=False)
+                           + "\n\n").encode("utf-8")
+                continue
+            # 证伪：暂存整段补发为普通正文
+            yield _leak_chunk_frame(meta, {"content": hold})
+            hold = None
+            if fin:
+                finished = (payload, fin)
+            continue
+        if fin and not piece:
+            finished = (payload, fin)
+            continue
+        if piece and _leak_prefix_hold(piece):
+            hold = piece
+            if fin:
+                finished = (payload, fin)
+            continue
+        if piece and fin:
+            yield _leak_chunk_frame(meta, {"content": piece}, fin)
+            continue
+        if piece:
+            yield _leak_chunk_frame(meta, {"content": piece})
+            continue
+        yield raw
+
+    if hold is not None:
+        calls, clean = parse_leaked_tool_calls(hold, allowed_names)
+        if calls:
+            recovered = True
+            for i, call in enumerate(calls):
+                yield _leak_chunk_frame(meta, {"tool_calls": [{
+                    "index": i,
+                    "id": call.get("id"),
+                    "type": call.get("type") or "function",
+                    "function": call.get("function") or {},
+                }]})
+            if clean:
+                yield _leak_chunk_frame(meta, {"content": clean})
+        else:
+            yield _leak_chunk_frame(meta, {"content": hold})
+    if finished is not None:
+        payload, fin = finished
+        if recovered:
+            payload = json.loads(json.dumps(payload))
+            for ch in payload.get("choices") or []:
+                if isinstance(ch, dict) and ch.get("finish_reason"):
+                    ch["finish_reason"] = "tool_calls"
+        yield ("data: " + json.dumps(payload, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
+    elif recovered:
+        yield _leak_chunk_frame(meta, {}, "tool_calls")
+
+
+# ---------------------------------------------------------------------------
 # Qoder 数据面：请求体构造
 # ---------------------------------------------------------------------------
 def _flatten_content_text(content):
@@ -2271,7 +2577,7 @@ def flatten_messages(messages, keep_reasoning=False):
                 calls.append({"name": fn.get("name") or "",
                               "arguments": fn.get("arguments") or ""})
             if calls:
-                text = (text or "") + "\n\n[assistant 请求调用工具]\n" + \
+                text = (text or "") + "\n\n" + LEAK_MARKER + "\n" + \
                     json.dumps(calls, ensure_ascii=False)
             item = {"role": "assistant", "content": text or ""}
             if keep_reasoning and m.get("reasoning_content") is not None:
@@ -2693,7 +2999,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
     try:
         for attempt in range(TRANSIENT_MAX_RETRIES + 1):
             try:
-                obj = aggregate_stream(cur, model, None, holder=holder)
+                obj = aggregate_stream(cur, model, None, holder=holder,
+                                       allowed_names=_tool_names_from_payload(payload))
                 return obj, account
             except UpstreamStatus as exc:
                 _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -3085,8 +3392,12 @@ def iter_inner_sse(resp, holder=None):
         yield ("data: " + cleaned + "\n\n").encode("utf-8")
 
 
-def aggregate_stream(resp, model, resp_id=None, holder=None):
-    """把上游信封流折叠成一个非流式 chat.completion 对象。"""
+def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None):
+    """把上游信封流折叠成一个非流式 chat.completion 对象。
+
+    allowed_names：本次请求声明的工具名集合；用于「泄漏文本回读」的守卫
+    （见 parse_leaked_tool_calls / issue #8）。
+    """
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
     usage = holder.get("usage") if holder else None
@@ -3117,7 +3428,16 @@ def aggregate_stream(resp, model, resp_id=None, holder=None):
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             if delta.get("content"):
-                content.append(delta["content"])
+                _c = delta["content"]
+                if isinstance(_c, str):
+                    content.append(_c)
+                elif isinstance(_c, list):
+                    for _p in _c:
+                        if isinstance(_p, str):
+                            content.append(_p)
+                        elif (isinstance(_p, dict)
+                              and isinstance(_p.get("text"), str)):
+                            content.append(_p["text"])
             if delta.get("reasoning_content"):
                 reasoning.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
@@ -3166,6 +3486,14 @@ def aggregate_stream(resp, model, resp_id=None, holder=None):
     message = {"role": "assistant", "content": "".join(content)}
     if reasoning:
         message["reasoning_content"] = "".join(reasoning)
+    # 回读（issue #8）：上游未给结构化 tool_calls，但正文恰好是网关自己写入
+    # 历史的「LEAK_MARKER + JSON 数组」形态（模型照格式复述）——还原为结构化
+    # 调用并从正文移除，避免客户端把 JSON 当正文显示、本轮调用不执行。
+    if not tool_calls_map and message.get("content"):
+        _rec, _clean = parse_leaked_tool_calls(message["content"], allowed_names)
+        if _rec:
+            message["content"] = _clean
+            tool_calls_map = {i: c for i, c in enumerate(_rec)}
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -3803,7 +4131,11 @@ def stream_responses_events(inner_lines, model, holder):
                     })
                 # DSML 缓冲：不把原始 DSML 标签流给客户端
                 text_buffer += piece
-                while text_buffer:
+                # 泄漏回读（issue #8）：正文还一个字没吐、缓冲仍是
+                # 「marker + JSON 数组」候选时先压住，流末统一判定。
+                _leak_defer = not any(text_parts) and _leak_prefix_hold(
+                    text_buffer)
+                while text_buffer and not _leak_defer:
                     idx = text_buffer.find("<")
                     if idx == -1:
                         text_parts.append(text_buffer)
@@ -3912,7 +4244,19 @@ def stream_responses_events(inner_lines, model, holder):
                  {"output_index": entry["output_index"], "item": fc_item})
     # 冲刷剩余缓冲文本
     if text_buffer:
-        calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
+        leak_calls, leak_clean = (None, text_buffer)
+        if not any(text_parts):
+            leak_calls, leak_clean = parse_leaked_tool_calls(
+                text_buffer, holder.get("allowed_names"))
+        if leak_calls:
+            dsml_tool_calls.extend(
+                {"id": c.get("id"),
+                 "name": (c.get("function") or {}).get("name") or "",
+                 "arguments": (c.get("function") or {}).get("arguments") or "{}"}
+                for c in leak_calls)
+            calls_rem, clean_rem = None, leak_clean
+        else:
+            calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
         if calls_rem:
             dsml_tool_calls.extend(calls_rem)
         if clean_rem:
@@ -5029,7 +5373,8 @@ class Handler(BaseHTTPRequestHandler):
             % (model, want_stream, len(chat_req.get("messages") or []),
                chat_req.get("reasoning_effort"),
                sorted(custom_names) or "-"))
-        holder = {"usage": None, "custom_names": custom_names}
+        holder = {"usage": None, "custom_names": custom_names,
+                  "allowed_names": _tool_names_from_payload(chat_req)}
         try:
             req_realm = self._request_realm() or CURRENT_REALM
             blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
@@ -5280,7 +5625,9 @@ class Handler(BaseHTTPRequestHandler):
                     while True:
                         try:
                             for line in sse_with_heartbeat(
-                                    iter_inner_sse(cur, holder=holder),
+                                    recover_leaked_tool_calls(
+                                        iter_inner_sse(cur, holder=holder),
+                                        allowed_names=_tool_names_from_payload(payload)),
                                     self._sse_write):
                                 if first_ms is None:
                                     first_ms = int((time.time() - t_start) * 1000)

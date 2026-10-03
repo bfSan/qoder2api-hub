@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.1.9-2496ED?style=flat-square" alt="Version 1.1.9">
+  <img src="https://img.shields.io/badge/Release-v1.2.0-2496ED?style=flat-square" alt="Version 1.2.0">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -20,7 +20,7 @@
 - **OAuth 设备授权一键免客户端登录**：PKCE (S256) 设备流（双区 URL 参数按官方差异构造：国内带 `redirect_uri+client_id+machine_id`，国际带 `client_id+machine_id`），点击看板链接在浏览器完成授权即可自动入池；亦支持 PAT (`pt-`) 导入，jobToken 自动交换与轮换。
 - **每日签到与额度体系（双区域 · 真实领取）**：「每日领取 100 Credits」等活动**由网关直接领取**——用桌面端请求头（`Cosy-ClientType: 10` + 机器头，缺了服务端会返回空列表）列出活动 → 对 `CLAIMABLE` 的 Credits 活动 `POST /sash/api/v1/me/campaigns/{id}/claim`（官方幂等：已领返回 `replayed`，不会重复发放）；旧 sash 签到接口仅在仍开放时兜底（能力运行时探测，404 记「本区域无此接口」6 小时后自动重探）；Pro 升级包资格检查与领取、quota/usage 额度与套餐快照实时刷新。
 - **后台常驻定时调度器**：每日整点排程（09:00 / 21:00 签到 · 22:00 Token 集中保活），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
-- **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译与 DSML 工具调用回退解析。
+- **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译、DSML 工具调用回退解析，以及**泄漏文本回读**（模型把历史工具调用序列化复述成正文时，流式/非流式/Responses 三链路都还原为结构化 `tool_calls`，并保持 fail-open 不吞正文）。
 - **现代化 Web 看板**：弹性指标卡片、签到与福利中心、模型能力清单、性能指标与用量透视、实时请求流水与运行日志。
 
 > ⚡ 本项目架构与交互对齐 WorkBuddy2API-Hub，上游协议替换为 Qoder COSY 签名体系。
@@ -378,6 +378,19 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
+### v1.2.0
+
+**修复 issue #8：工具调用被模型以文本复述后泄漏为正文**
+
+- 成因：`flatten_messages()` 会把历史里的 assistant `tool_calls` 序列化成 `[assistant 请求调用工具]` + JSON 数组交给上游模型当上下文；长会话里模型会**照格式复述**成普通正文（没有结构化 tool_calls），客户端于是把这段内部 JSON 当正文显示、本轮工具调用也不执行。
+- 新增**严格守卫的「回读」**：整段正文必须**恰好**是 `[assistant 请求调用工具]` + JSON 数组（可带 ``` / ```json 围栏）；数组非空、每项 `name` 为非空字符串、`arguments` 为合法 JSON（对象自动规范化）；请求声明了 tools 时**工具名必须命中声明集合**——讨论该标记的普通回复、数组后带多余文字、未声明工具名一律不误判。
+- **三条链路全覆盖**：
+  - 非流式 `chat.completions`：聚合时还原为结构化 `tool_calls` 并从正文移除，`finish_reason` 置为 `tool_calls`；
+  - 流式 `chat.completions`：marker 前缀先压住不发（跨增量分段也能认），识别成功改发 `tool_calls` 增量帧并改写收尾帧 `finish_reason=tool_calls`；一旦被证伪立即把暂存整段补发为正文，**绝不吞字**（fail-open）；
+  - `Responses API`：流式转成 `function_call` 输出项，不再回显为 `output_text`。
+- **不改写入侧序列化格式、不注入/篡改给上游的提示词**；另对上游 `content` 为 parts 列表等非字符串形态做了防御性展开。
+- 新增 [27] 段 16 条回归断言（形态守卫、围栏、跨增量、证伪补发、未声明工具名、三条链路端到端）。
+
 ### v1.1.9
 
 **合并 PR #7**（by @XD06）：修复信封层 `403 (10605 / isQueued)` 排队满时不停重试同一受限账号的问题——
@@ -385,8 +398,6 @@ python _verify_models.py --base http://127.0.0.1:8790
 - 未向客户端吐出字节前允许 401/403/429 重开换号（重试预算与"已输出"保护保持不变）；
 - 死会话（TOKEN_EXPIRE）经信封层同样停用账号；非流式 / Responses / Chat 流式三处接入；
 - 新增 [26] 段回归断言（模型级/账号级冷却、解绑、停用、重开语义与内容审核不重试）。
-
-### v1.1.8
 
 ### v1.1.8
 
@@ -401,8 +412,6 @@ python _verify_models.py --base http://127.0.0.1:8790
 **关于"自动把任务做完"（边界说明）**
 - 站点类任务（如 `sites_first_use`）在官方客户端里是 **agent 工具链**（`prepare_site` → `get_publish_status` → `publish_site`，由客户端打包上传并维护 release 状态），网关作为 HTTP 反向代理**无法执行客户端工具**，也不应伪造发布以套取活动权益（活动条款明确禁止异常手段、官方按"人"去重并可收回）；
 - 网关做到的是：**探测到任务已完成就自动领取**（含名额发完的次日 10:00 重试）；任务未完成的账号会在任务中心明确标注「需先在官方桌面端完成新人任务（成就 xxx）」并给出活动页入口——在桌面端做完一次后无需再管，领取全自动。
-
-### v1.1.7
 
 ### v1.1.7
 
