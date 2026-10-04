@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.2.5"
+VERSION = "1.2.6"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -600,6 +600,7 @@ def _perf_stats_uncached(sample=5000, realm=None):
         "sampled": total,
         "success": ok,
         "errors": err,
+        "inner_errors": inner_error_snapshot(),
         "success_rate_pct": round(ok * 100.0 / total, 1) if total else None,
         "ttft_ms": block(ttfts),
         "generation_ms": block(gens),
@@ -2741,14 +2742,90 @@ def _current_turn_start(messages):
     return 0
 
 
-def flatten_messages(messages, keep_reasoning=False):
+# ---------------------------------------------------------------------------
+# 结构化工具历史（task-32：tool 消息 / assistant.tool_calls 原样透传）
+# ---------------------------------------------------------------------------
+# 依据 task-31 实测（.team/tiedan.md §17）：legacy 通道在 Qwen 全系 / GLM 上
+# 接受结构化历史并被正确消费（含 3 轮链、结构化+旧文本信封混合、并行调用、
+# id 不匹配）；DeepSeek / Kimi 在 assistant.content=null 时被拒，**content=""
+# 即通过**。因此本实现恒用空字符串，绝不发 null。
+STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5")
+_STRUCTURED_LOG_ONCE = {"done": False}
+
+
+def _structured_mode():
+    """QD_STRUCTURED_TOOL_HISTORY 三态：'on' / 'off' / 'auto'（默认）。"""
+    raw = (os.environ.get("QD_STRUCTURED_TOOL_HISTORY") or "").strip().lower()
+    if not raw or raw == "auto":
+        return "auto"
+    if raw in ("1", "on", "true", "yes", "enable", "enabled", "force"):
+        return "on"
+    if raw in ("0", "off", "false", "no", "disable", "disabled"):
+        return "off"
+    return "auto"
+
+
+def _tool_ids_ok(messages):
+    """结构化前提：每条 tool 有 tool_call_id，每个 assistant.tool_calls 条目有 id。"""
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "tool":
+            if not str(m.get("tool_call_id") or "").strip():
+                return False
+        elif role == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"] or []:
+                if not isinstance(tc, dict) \
+                        or not str(tc.get("id") or "").strip():
+                    return False
+    return True
+
+
+def structured_tool_history_enabled(model="", model_key="", realm="",
+                                    messages=None):
+    """本次请求是否走结构化工具历史。
+
+    - off          -> False（一键回退文本化）
+    - on           -> True（显式强制：DeepSeek / Kimi / INTL 补验证用）
+    - auto（默认） -> 仅「CN 出口 + provider 白名单 + id 齐备」为真：
+        task-31 实测只在 CN / legacy 通道覆盖过（INTL 超时未取得结果），
+        故 auto 不在 INTL 启用；DeepSeek / Kimi 待补端到端验证，同样排除。
+    任何模式下 id 不齐备都回退文本化（fail-safe：宁可少用，不发畸形请求）。
+    """
+    if not _tool_ids_ok(messages):
+        return False
+    mode = _structured_mode()
+    if mode == "off":
+        return False
+    if mode == "on":
+        return True
+    if (realm or "") != "cn":
+        return False
+    for cand in (str(model_key or ""), str(model or "")):
+        low = cand.strip().lower()
+        if low and low.startswith(STRUCTURED_TOOL_HISTORY_WHITELIST):
+            if not _STRUCTURED_LOG_ONCE["done"]:
+                _STRUCTURED_LOG_ONCE["done"] = True
+                log("structured tool history: ON (model=%s key=%s realm=%s)"
+                    % (model, model_key, realm), tag="chat")
+            return True
+    return False
+
+
+def flatten_messages(messages, keep_reasoning=False, structured=False):
     """把客户端会话压平成 Qoder 上游可接受的 {role, content} 序列。
 
     返回 (system_text, flat_msgs, images)：
       - 首个 system/developer 消息抽为 system_text（模板 system 的替换源）
       - user/assistant 原位保留（content 压平为字符串）
-      - tool 结果降级为 user 消息（上游不认识 tool 角色）
-      - assistant 的 tool_calls 序列化进 content，保证上下文不丢
+      - tool 结果：structured=True 时保留 {role:"tool", tool_call_id, content}
+        （content 恒为空字符串而非 null——task-31 实测 null 会让上游转换层丢掉
+        配对的 assistant 消息，DeepSeek/Kimi 直接 provider_error）；
+        否则降级为 user 文本（上游历史上不认识 tool 角色）
+      - assistant 的 tool_calls：structured=True 时原样透传
+        （id/type/function，arguments 统一为 JSON 字符串）；
+        否则序列化进 content（LEAK_MARKER + JSON 数组）
       - assistant 的 reasoning_content 仅在 keep_reasoning=True（DeepSeek 族）
         时保留：这族模型的多轮一致性与该字段绑定，其它模型不带（避免上游
         因未知字段拒答）。此前 flatten 无条件丢弃该字段，使
@@ -2778,12 +2855,42 @@ def flatten_messages(messages, keep_reasoning=False):
             body = text or ""
             if _keep and _idx < _cur_start:
                 body = _shrink_tool_result(body, _keep)
+            if structured:
+                # 结构化直传：保留 tool 角色与配对 id；content 用空字符串而非
+                # null（task-31：null 会让上游丢掉配对的 assistant 消息）。
+                flat.append({"role": "tool",
+                             "tool_call_id": str(m.get("tool_call_id") or ""),
+                             "content": body})
+                continue
             flat.append({"role": "user",
                          # 前缀逐字节不变（TOOL_RESULT_MARKER + name + "]\n"）；
                          # 削减只发生在正文部分。
                          "content": TOOL_RESULT_MARKER + name + "]\n" + body})
             continue
         if role == "assistant" and m.get("tool_calls"):
+            if structured:
+                # 结构化直传：保 id/type/function；content 恒为空字符串。
+                # arguments 统一成 JSON 字符串（OpenAI 规范形态；dict 会被
+                # 客户端/上游两侧的转换层按字符串处理，字符串最稳）。
+                calls = []
+                for tc in m["tool_calls"]:
+                    tc = tc if isinstance(tc, dict) else {}
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments")
+                    if isinstance(args, (dict, list)):
+                        args = json.dumps(args, ensure_ascii=False)
+                    elif not isinstance(args, str):
+                        args = "" if args is None else str(args)
+                    calls.append({"id": str(tc.get("id") or ""),
+                                  "type": tc.get("type") or "function",
+                                  "function": {"name": fn.get("name") or "",
+                                               "arguments": args}})
+                item = {"role": "assistant", "content": text or "",
+                        "tool_calls": calls}
+                if keep_reasoning and m.get("reasoning_content") is not None:
+                    item["reasoning_content"] = m.get("reasoning_content") or ""
+                flat.append(item)
+                continue
             calls = []
             for tc in m["tool_calls"]:
                 fn = (tc or {}).get("function") or {}
@@ -2822,8 +2929,11 @@ def build_qoder_body(payload, account, model_key, realm=None):
     model = payload.get("model") or ""
     messages = backfill_reasoning_content(messages, model, model_key)
 
+    use_structured = structured_tool_history_enabled(
+        model=model, model_key=model_key, realm=r, messages=messages)
     system_text, flat, images = flatten_messages(
-        messages, keep_reasoning=is_deepseek_model(model, model_key))
+        messages, keep_reasoning=is_deepseek_model(model, model_key),
+        structured=use_structured)
     # 模板只保留 system 基座（其自带的示例 user 轮次是样例内容，必须丢弃），
     # 真实会话随后追加。
     tmpl_system = [m for m in (body.get("messages") or [])
@@ -3555,6 +3665,83 @@ def sse_with_heartbeat(source, send, interval=None, idle_limit=None):
         yield item
 
 
+# ---------------------------------------------------------------------------
+# 上游内层错误可观测性（task-34）
+# ---------------------------------------------------------------------------
+# 形态：HTTP 200 + 信封 statusCodeValue=200，但**内层 chunk** 里带 error
+# （如 provider_error → invalid_request_error："Messages with role 'tool'
+# must be a response to a preceding message with 'tool_calls'"）。
+# 既有路径对此完全无感：客户端只看到 200 的空正文，排障成本极高。
+# 本段只做计数 + 按类别首次告警，**绝不改行为**（不吞、不改映射、不改重试）。
+_INNER_ERR_LOCK = threading.Lock()
+_INNER_ERR_STATS = {"total": 0, "kinds": {}, "warned": set()}
+
+
+def inner_error_snapshot():
+    """内层错误计数快照（挂到 /usage/perf 等运行信息输出）。"""
+    with _INNER_ERR_LOCK:
+        return {"total": _INNER_ERR_STATS["total"],
+                "kinds": dict(_INNER_ERR_STATS["kinds"]),
+                "warned": sorted(_INNER_ERR_STATS["warned"])}
+
+
+def _inner_error_kind(code, message):
+    """把内层错误归类（用于首次告警去重）。返回 "" = 不是错误形态。"""
+    low = ("%s %s" % (code or "", message or "")).lower().strip()
+    if not low:
+        return ""
+    if any(k in low for k in ("datainspectionfailed", "inappropriate content",
+                              "contentfilter", "sensitivecontent",
+                              "data_inspection")):
+        return "content_policy"
+    if any(k in low for k in ("rate_limit", "throttl", "frequency limit",
+                              "10605", "too many")):
+        return "rate_limit"
+    if any(k in low for k in ("invalid_request", "invalid_parameter",
+                              "provider_error", "not found",
+                              "must be a response", "unsupported")):
+        return "invalid_request"
+    if any(k in low for k in ("unauthor", "forbidden", "permission",
+                              "expired", "token")):
+        return "auth"
+    return "other"
+
+
+def note_inner_upstream_error(obj, status=None):
+    """检测内层 chunk 的错误指示：计数 + 按类别首次 WARN。返回命中类别。
+
+    只观测、不改行为：调用点不做任何分支，yield 与清洗流程原样继续。
+    """
+    if not isinstance(obj, dict):
+        return ""
+    err = obj.get("error")
+    if isinstance(err, dict):
+        code = err.get("code") or err.get("type") or ""
+        msg = err.get("message") or ""
+    elif isinstance(err, str):
+        code, msg = "", err
+    else:
+        return ""
+    kind = _inner_error_kind(code, msg)
+    if not kind:
+        return ""
+    with _INNER_ERR_LOCK:
+        _INNER_ERR_STATS["total"] += 1
+        kinds = _INNER_ERR_STATS["kinds"]
+        kinds[kind] = kinds.get(kind, 0) + 1
+        total = _INNER_ERR_STATS["total"]
+        first = kind not in _INNER_ERR_STATS["warned"]
+        if first:
+            _INNER_ERR_STATS["warned"].add(kind)
+    if first:
+        log("upstream error hidden in HTTP 200 envelope: kind=%s status=%s "
+            "code=%s total=%d | %s"
+            % (kind, status, str(code)[:40], total,
+               ("%s %s" % (code, msg)).strip()[:300]),
+            level="WARN", tag="chat")
+    return kind
+
+
 def iter_inner_sse(resp, holder=None):
     """把上游 SSE 信封流解包成标准 OpenAI chunk 的 "data: ..." 行。
 
@@ -3598,6 +3785,9 @@ def iter_inner_sse(resp, holder=None):
             inner = json.loads(body)
         except Exception:
             continue
+        if isinstance(inner, dict):
+            # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
+            note_inner_upstream_error(inner, status=status)
         if holder is not None and inner.get("usage") and not holder.get("usage"):
             holder["usage"] = inner["usage"]
         cleaned = clean_chunk(body)

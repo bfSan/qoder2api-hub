@@ -2830,6 +2830,130 @@ check("开关：默认值 = 2000（保守）",
       P._tool_result_keep_chars() == P.TOOL_RESULT_KEEP_DEFAULT == 2000)
 
 print()
+print("[27.7] 结构化工具历史直传（task-32：provider 白名单 + 一键回退）")
+_SMSGS32 = [
+    {"role": "user", "content": "weather?"},
+    {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function",
+         "function": {"name": "get_weather", "arguments": {"city": "SZ"}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "name": "get_weather",
+     "content": "25C"},
+    {"role": "user", "content": "thanks"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_2", "type": "function",
+         "function": {"name": "get_weather",
+                      "arguments": "{\"city\": \"BJ\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_2", "name": "get_weather",
+     "content": "18C"},
+]
+_flat32s = P.flatten_messages(_SMSGS32, structured=True)[1]
+_flat32t = P.flatten_messages(_SMSGS32, structured=False)[1]
+os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+check("开关：auto + CN + Qwen -> 结构化",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="cn", messages=_SMSGS32) is True)
+check("开关：auto + CN + GLM（上游 key gm5x）-> 结构化",
+      P.structured_tool_history_enabled(model="glm-5.3-flash",
+                                        model_key="gm53flash",
+                                        realm="cn", messages=_SMSGS32) is True)
+check("开关：auto + CN + DeepSeek -> 文本化（未验证 provider 默认不启用）",
+      P.structured_tool_history_enabled(model="deepseek-flash",
+                                        model_key="deepseek-flash",
+                                        realm="cn", messages=_SMSGS32) is False)
+check("开关：auto + INTL -> 文本化（INTL legacy 未实测）",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="intl", messages=_SMSGS32)
+      is False)
+os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+check("开关：on 强制（DeepSeek / INTL 也走结构化，供补验证）",
+      P.structured_tool_history_enabled(model="deepseek-flash",
+                                        model_key="deepseek-flash",
+                                        realm="intl", messages=_SMSGS32) is True)
+check("守卫：缺 tool_call_id -> 一律回退文本化（fail-safe）",
+      P.structured_tool_history_enabled(
+          model="qwen", model_key="qwen", realm="cn",
+          messages=[{"role": "user", "content": "x"},
+                    {"role": "tool", "content": "y"}]) is False)
+os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "off"
+check("开关：off 一键回退（即使 Qwen）",
+      P.structured_tool_history_enabled(model="qwen3.8-flash",
+                                        model_key="qwen3.8-flash",
+                                        realm="cn", messages=_SMSGS32) is False)
+del os.environ["QD_STRUCTURED_TOOL_HISTORY"]
+check("产物：tool 消息保留 role/tool_call_id，content 是非 null 字符串",
+      _flat32s[2] == {"role": "tool", "tool_call_id": "call_1",
+                      "content": "25C"} and _flat32s[5]["role"] == "tool")
+check("产物：assistant.content 为 \"\"（绝不为 null）+ tool_calls 结构齐备",
+      _flat32s[1]["content"] == "" and _flat32s[1]["content"] is not None
+      and _flat32s[1]["tool_calls"][0]["id"] == "call_1"
+      and _flat32s[1]["tool_calls"][0]["type"] == "function"
+      and _flat32s[1]["tool_calls"][0]["function"]["name"] == "get_weather")
+check("产物：arguments 的 dict 形态被归一为 JSON 字符串",
+      _flat32s[1]["tool_calls"][0]["function"]["arguments"] == '{"city": "SZ"}')
+check("产物：结构化模式下不存在 null content",
+      all(m.get("content") is not None for m in _flat32s))
+check("产物：当前轮（末尾 tool）同样走结构化，不与文本混用",
+      _flat32s[5] == {"role": "tool", "tool_call_id": "call_2",
+                      "content": "18C"})
+check("对照：文本化模式仍是 user 降级 + LEAK_MARKER，且无 tool 角色",
+      [m["role"] for m in _flat32t] == ["user", "assistant", "user", "user",
+                                        "assistant", "user"]
+      and _flat32t[1]["content"].endswith("]")
+      and P.TOOL_RESULT_MARKER in _flat32t[2]["content"])
+
+print()
+print("[27.8] 内层错误可观测性（HTTP 200 信封里藏 error）")
+_ERR34 = json.dumps({
+    "error": {"type": "invalid_request_error", "code": "invalid_request_error",
+              "message": "Messages with role 'tool' must be a response to a "
+                         "preceding message with 'tool_calls'"}})
+_ENV34 = ("data: " + json.dumps({"statusCodeValue": 200, "body": _ERR34},
+                                ensure_ascii=False) + "\n\n").encode("utf-8")
+_s0_34 = P.inner_error_snapshot()
+_lines34 = list(P.iter_inner_sse([_ENV34]))
+_s1_34 = P.inner_error_snapshot()
+check("内层 error：被识别并计数；chunk 仍照常透传（行为不变）",
+      _s1_34["total"] == _s0_34["total"] + 1
+      and _s1_34["kinds"].get("invalid_request", 0) >= 1
+      and len(_lines34) == 1)
+check("内层 error：同类重复计数累加、只按类别告警一次",
+      P.note_inner_upstream_error({"error": {"type": "provider_error",
+                                              "message": "provider_error"}},
+                                  status=200) == "invalid_request"
+      and P.note_inner_upstream_error(
+          {"error": {"message": "invalid_request again"}}, status=200)
+      == "invalid_request"
+      and P.inner_error_snapshot()["total"] == _s1_34["total"] + 2
+      and P.inner_error_snapshot()["warned"].count("invalid_request") == 1)
+check("内层 error：正常 chunk 不误判",
+      P.note_inner_upstream_error({"choices": [{"delta": {"content": "hi"}}]})
+      == "" and P.note_inner_upstream_error(None) == ""
+      and P.note_inner_upstream_error({"usage": {"total_tokens": 3}}) == "")
+check("内层 error：分类覆盖 content_policy / rate_limit",
+      P._inner_error_kind("DataInspectionFailed", "inappropriate content")
+      == "content_policy"
+      and P._inner_error_kind("", "usage exceeds frequency limit 10605")
+      == "rate_limit")
+check("内层 error：计数挂到运行信息（/usage/perf 返回含 inner_errors）",
+      "inner_errors" in P._perf_stats_uncached(sample=1)
+      and isinstance(P.inner_error_snapshot(), dict))
+
+
+def _raise34():
+    try:
+        list(P.iter_inner_sse([("data: " + json.dumps(
+            {"statusCodeValue": 418, "body": "boom"}) + "\n\n").encode("utf-8")]))
+        return "no-raise"
+    except P.UpstreamStatus as exc:
+        return "raised:%s" % exc.status
+
+
+check("形态区分：信封非 200 仍抛 UpstreamStatus（既有路径未变）",
+      _raise34() == "raised:418")
+
+print()
 print("[28] 发布前补强：终局验证 §10.7#5 的零覆盖项（防止静默回归）")
 import ast as _ast28
 import re as _re28
@@ -3446,6 +3570,144 @@ try:
         A._runtime_info_warned.update(_orig_warned31)
 finally:
     _sh31.rmtree(_tmp31, ignore_errors=True)
+
+print()
+print("[32] task-32 结构化直传：产物字段形态 / 双路径对照 / 开关三态 / fail-safe")
+
+_MSGS32 = [
+    {"role": "user", "content": "查天气"},
+    {"role": "assistant", "content": None,
+     "tool_calls": [{"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather",
+                                  "arguments": {"city": "SZ"}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "name": "get_weather",
+     "content": "25C"},
+    {"role": "user", "content": "结果呢？"},
+]
+_sys32, _flat_s32, _img32 = P.flatten_messages(_MSGS32, structured=True)
+_tool32 = [m for m in _flat_s32 if m.get("role") == "tool"]
+_asst32 = [m for m in _flat_s32
+           if m.get("role") == "assistant" and m.get("tool_calls")]
+check("结构化产物：tool 消息保留 role + tool_call_id，content 为字符串且保留正文",
+      len(_tool32) == 1 and _tool32[0].get("tool_call_id") == "call_1"
+      and isinstance(_tool32[0].get("content"), str)
+      and "25C" in _tool32[0]["content"],
+      _tool32)
+check("结构化产物：assistant.tool_calls 保留 id/type/function，arguments 归一为 JSON 字符串",
+      len(_asst32) == 1
+      and _asst32[0]["tool_calls"][0].get("id") == "call_1"
+      and _asst32[0]["tool_calls"][0].get("type") == "function"
+      and _asst32[0]["tool_calls"][0].get("function", {}).get("name") == "get_weather"
+      and isinstance(_asst32[0]["tool_calls"][0]["function"].get("arguments"), str)
+      and json.loads(_asst32[0]["tool_calls"][0]["function"]["arguments"])["city"] == "SZ",
+      _asst32)
+check("结构化产物：**不存在 None content**（task-31 实测 null 会被 DeepSeek/Kimi 拒绝）",
+      all(m.get("content") is not None for m in _flat_s32)
+      and all(m.get("content") == "" or isinstance(m.get("content"), str)
+              for m in _flat_s32),
+      [(m.get("role"), m.get("content")) for m in _flat_s32])
+_sys32b, _flat_t32, _img32b = P.flatten_messages(_MSGS32, structured=False)
+check("双路径对照：文本化把 tool 降级为 user+TOOL_RESULT_MARKER，结构化保留 role=tool",
+      any(m.get("role") == "user"
+          and str(m.get("content") or "").startswith(P.TOOL_RESULT_MARKER)
+          for m in _flat_t32)
+      and not any(m.get("role") == "tool" for m in _flat_t32)
+      and any(m.get("role") == "tool" for m in _flat_s32),
+      [m.get("role") for m in _flat_t32])
+check("双路径对照：文本化把 assistant.tool_calls 序列化进 content（LEAK_MARKER），结构化不写正文",
+      any(P.LEAK_MARKER in str(m.get("content") or "")
+          for m in _flat_t32 if m.get("role") == "assistant")
+      and not any("tool_calls" in m for m in _flat_t32)
+      and all("tool_calls" in m for m in _asst32),
+      [str(m.get("content"))[:60] for m in _flat_t32 if m.get("role") == "assistant"])
+
+_orig_env32 = os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+try:
+    _auto_cn_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _MSGS32)
+    _auto_cn_glm = P.structured_tool_history_enabled(
+        "GLM-5.3-Flash", "gm53flash", "cn", _MSGS32)
+    _auto_cn_glm2 = P.structured_tool_history_enabled(
+        "glm-4.6", "glm4x", "cn", _MSGS32)
+    _auto_cn_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "cn", _MSGS32)
+    _auto_cn_kimi = P.structured_tool_history_enabled(
+        "Kimi-K2.8-Preview", "kmodel", "cn", _MSGS32)
+    _auto_intl_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "intl", _MSGS32)
+    _unk_mode = None
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "banana"
+    _unk_mode = P._structured_mode()
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on_cn_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "cn", _MSGS32)
+    _on_intl_ds = P.structured_tool_history_enabled(
+        "DeepSeek-Flash", "dfmodel", "intl", _MSGS32)
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "off"
+    _off_cn_qwen = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _MSGS32)
+finally:
+    if _orig_env32 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
+
+check("开关三态·auto：默认只放行 CN+白名单（Qwen/GLM/gm4 真；DeepSeek/Kimi/INTL 假）",
+      _auto_cn_qwen is True and _auto_cn_glm is True and _auto_cn_glm2 is True
+      and _auto_cn_ds is False and _auto_cn_kimi is False
+      and _auto_intl_qwen is False,
+      (_auto_cn_qwen, _auto_cn_glm, _auto_cn_ds, _auto_cn_kimi, _auto_intl_qwen))
+check("开关三态·on/off：on 强制放行（含 DeepSeek/INTL），off 一律关闭",
+      _on_cn_ds is True and _on_intl_ds is True and _off_cn_qwen is False,
+      (_on_cn_ds, _on_intl_ds, _off_cn_qwen))
+check("开关三态·未知值回落 auto（不误开）；恢复后默认仍是 auto",
+      _unk_mode == "auto" and P._structured_mode() == "auto",
+      (_unk_mode, P._structured_mode()))
+
+_bad_ids32 = [
+    {"role": "user", "content": "x"},
+    {"role": "assistant", "content": "",
+     "tool_calls": [{"id": "", "function": {"name": "f"}}]},
+    {"role": "tool", "tool_call_id": "", "content": "y"},
+]
+check("fail-safe：id 不齐备（tool_call_id / tool_calls.id 空）→ 恒回退文本化",
+      P._tool_ids_ok(_bad_ids32) is False
+      and P.structured_tool_history_enabled(
+          "Qwen3.8-Flash", "qfmodel", "cn", _bad_ids32) is False)
+try:
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on_bad_ids = P.structured_tool_history_enabled(
+        "Qwen3.8-Flash", "qfmodel", "cn", _bad_ids32)
+finally:
+    if _orig_env32 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _orig_env32
+check("fail-safe：即使显式 on，id 不齐备也不放行（宁可少用不发畸形请求）",
+      _on_bad_ids is False, _on_bad_ids)
+
+_r32 = [{"role": "assistant", "content": "x", "reasoning_content": "think",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "f", "arguments": "{}"}}]}]
+_, _flat_r_on32, _ = P.flatten_messages(_r32, keep_reasoning=True, structured=True)
+_, _flat_r_off32, _ = P.flatten_messages(_r32, keep_reasoning=False, structured=True)
+check("结构化产物：reasoning_content 仍按 keep_reasoning 规则保留（与文本化路径一致）",
+      _flat_r_on32[0].get("reasoning_content") == "think"
+      and "reasoning_content" not in _flat_r_off32[0],
+      (_flat_r_on32[0].get("reasoning_content"), _flat_r_off32[0].keys()))
+_args_none32 = P.flatten_messages(
+    [{"role": "assistant", "content": "",
+      "tool_calls": [{"id": "c1", "function": {"name": "f",
+                                               "arguments": None}}]}],
+    structured=True)[1][0]["tool_calls"][0]["function"]["arguments"]
+_args_scalar32 = P.flatten_messages(
+    [{"role": "assistant", "content": "",
+      "tool_calls": [{"id": "c1", "function": {"name": "f",
+                                               "arguments": 42}}]}],
+    structured=True)[1][0]["tool_calls"][0]["function"]["arguments"]
+check("结构化产物：arguments 为 None → 空字符串；非字符串标量 → str()（不产生 null）",
+      _args_none32 == "" and _args_scalar32 == "42",
+      (_args_none32, _args_scalar32))
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
