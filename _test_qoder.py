@@ -3910,9 +3910,131 @@ check("#16·hold 上限：长文本以 '[' 开头且久不闭合 → 内容全�
       (len(_text16(_frLong16)), len(_long16)))
 _frFirst16 = _frames16([_f33(_long16[:500]), _f33("", "stop")])
 _emitFirst16 = _text16(_frFirst16)
-check("#16·hold 上限：首帧即放行（缓冲不超过窗口量级，不把整段压住）",
-      len(_emitFirst16) >= len(_long16[:500]) - (_HOLD_LIMIT16 or 0) - 1,
-      (len(_emitFirst16), len(_long16[:500]), _HOLD_LIMIT16))
+print()
+print("[34] task-37 细致复查：长链/反转/其它截断点/窗口与上限边界/结构化交互")
+
+
+def _run34(chunks, names=None):
+    """返回 (客户端文本, tool_calls 帧数, 末帧 finish_reason)。"""
+    _txt, _tcs, _fin = [], 0, None
+    for _f in P.recover_leaked_tool_calls(iter(chunks), names or _NAMES33):
+        try:
+            _o = json.loads(_f.decode("utf-8")[6:] if isinstance(_f, bytes) else _f[6:])
+        except Exception:
+            continue
+        _d = _o["choices"][0]["delta"]
+        if _d.get("content"):
+            _txt.append(_d["content"])
+        if _d.get("tool_calls"):
+            _tcs += 1
+        if _o["choices"][0].get("finish_reason"):
+            _fin = _o["choices"][0]["finish_reason"]
+    return "".join(_txt), _tcs, _fin
+
+
+_CALLS34 = json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+_LONG34 = _M33 + "\n" + _CALLS34
+_chunks34 = [_f33(_LONG34[i:i + 6]) for i in range(0, len(_LONG34), 6)]
+_t34a, _tc34a, _fin34a = _run34(_chunks34 + [_f33("", "stop")])
+check("#37·长链：marker+JSON 切成 %d 帧 → 恢复为 tool_calls、无泄漏、finish=tool_calls"
+      % len(_chunks34),
+      _tc34a > 0 and _t34a == "" and _fin34a == "tool_calls",
+      (_tc34a, _fin34a, _t34a[:60]))
+
+for _tag, _parts in (
+        ("1b 疑似 marker 后证伪（散文首帧）",
+         ["我先看看目录结构。\n\n", "[assis", "tant 请求调用工具] 这只是一段说明文字"]),
+        ("1c 前缀被打断", ["[assis", "这只是一个普通说明，不是标记。"]),
+        ("1d 完整 marker 但后接散文", ["[assistant 请求调用工具", "]\n这不是数组，是中文说明"])):
+    _want = "".join(_parts)
+    _got, _tc, _fn = _run34([_f33(x) for x in _parts] + [_f33("", "stop")])
+    # 注意：反转=已证伪为普通文本 → 原样补发，**marker 明文出现是正确行为**
+    # （模型确实在讨论该标记）；这里只要求内容守恒且不被误判为工具调用。
+    check("#37·反转（%s）→ 证伪后完整补发（内容逐字节守恒、不误判为 tool_calls）" % _tag,
+          _got == _want and _tc == 0,
+          (len(_got), len(_want), _got[:60]))
+
+for _tag, _payload in (
+        ("2a 代理对半截 \\ud83d",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\ud83d'),
+        ("2b 双重转义 \\\\u63a2",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\\\u63a2'),
+        ("2c \\u63a 与 2 分帧",
+         _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a')):
+    _cut = len(_payload) // 2
+    _t, _tc, _fn = _run34([_f33(_payload[:_cut]), _f33(_payload[_cut:]),
+                           _f33("", "stop")])
+    check("#37·截断点（%s）→ 整段被吞、无标记泄漏、finish=stop" % _tag,
+          _t == "" and _tc == 0 and _fn == "stop", _t[:60])
+
+_HOLDWIN34 = getattr(P, "_MARKER_HOLD_WINDOW", 17)
+for _cut in (_HOLDWIN34 - 1, _HOLDWIN34, _HOLDWIN34 + 1):
+    _pre, _rest = _M33[:_cut], _M33[_cut:] + "\n" + _CALLS34
+    _t, _tc, _fn = _run34([_f33(_pre), _f33(_rest), _f33("", "stop")])
+    check("#37·窗口边界：帧尾恰好 %d 字 marker 前缀 → 仍被识别（恢复 tool_calls、无泄漏）"
+          % _cut, _tc > 0 and _t == "" and _M33 not in _t, (_tc, _t[:40]))
+
+_HOLDMAX34 = getattr(P, "_HOLD_MAX_CHARS", 32768)
+_pad34 = "x" * (_HOLDMAX34 - len(_M33) - 200)
+_under34 = _M33 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"' + _pad34 + '\\"'
+_t, _tc, _fn = _run34([_f33(_under34[:8000]), _f33(_under34[8000:16000]),
+                       _f33(_under34[16000:]), _f33("", "stop")])
+check("#37·上限内（%d 字 < %d）未闭合块 → 仍被拦（吞掉、无泄漏）"
+      % (len(_under34), _HOLDMAX34),
+      _t == "" and _tc == 0, (len(_under34), _t[:40]))
+_blob34 = _M33 + "\n" + json.dumps(
+    [{"name": "terminal", "arguments": json.dumps({"cmd": _pad34}, ensure_ascii=False)}],
+    ensure_ascii=False)
+_c34 = len(_blob34) // 3
+_t, _tc, _fn = _run34([_f33(_blob34[:_c34]), _f33(_blob34[_c34:2 * _c34]),
+                       _f33(_blob34[2 * _c34:]), _f33("", "stop")])
+check("#37·上限内（%d 字）合法完整数组 → 恢复为 tool_calls（大数据块不被误放行）"
+      % len(_blob34),
+      _tc > 0 and _t == "" and _fn == "tool_calls", (_tc, _fn))
+_over34 = _under34 + "y" * (_HOLDMAX34 + 200 - len(_under34))
+_t, _tc, _fn = _run34([_f33(_over34[:_HOLDMAX34 // 2]), _f33(_over34[_HOLDMAX34 // 2:]),
+                       _f33("", "stop")])
+check("#37·超上限（%d 字 > %d）→ fail-open 放行，且**只输出一次**（长度守恒、无重复）"
+      % (len(_over34), _HOLDMAX34),
+      _t == _over34 and _tc == 0, (len(_t), len(_over34), _t == _over34))
+
+_msgs34 = [{"role": "user", "content": "查天气"},
+           {"role": "assistant", "content": "", "tool_calls": [
+               {"id": "c1", "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": "SZ"}'}}]},
+           {"role": "tool", "tool_call_id": "c1", "content": "25C"}]
+_s34, _flat_s34, _ = P.flatten_messages(_msgs34, structured=True)
+_t34x, _flat_t34, _ = P.flatten_messages(_msgs34, structured=False)
+check("#37·结构化交互：结构化产物**不含**回读标记，文本化产物**含**（两者不打架）",
+      _M33 not in json.dumps(_flat_s34, ensure_ascii=False)
+      and P.TOOL_RESULT_MARKER not in json.dumps(_flat_s34, ensure_ascii=False)
+      and _M33 in json.dumps(_flat_t34, ensure_ascii=False),
+      ([m.get("role") for m in _flat_s34], [m.get("role") for m in _flat_t34]))
+_env37 = os.environ.get("QD_STRUCTURED_TOOL_HISTORY")
+try:
+    os.environ["QD_STRUCTURED_TOOL_HISTORY"] = "on"
+    _on37 = P.structured_tool_history_enabled("Qwen3.8-Flash", "qfmodel", "intl", _msgs34)
+finally:
+    if _env37 is None:
+        os.environ.pop("QD_STRUCTURED_TOOL_HISTORY", None)
+    else:
+        os.environ["QD_STRUCTURED_TOOL_HISTORY"] = _env37
+_t, _tc, _fn = _run34([_f33(_LONG34[:10]), _f33(_LONG34[10:]), _f33("", "stop")])
+check("#37·结构化交互：on 模式下回读守卫仍独立生效（同一输入仍恢复 tool_calls）",
+      _on37 is True and _tc > 0 and _M33 not in _t and _fn == "tool_calls",
+      (_on37, _tc, _fn))
+
+# --- Lead 侧补充（task-37 复查）：窗口是**功能性必需**，不是优化项 ---
+# 铁蛋的 V2 变异（把 _MARKER_HOLD_WINDOW 压到 1）没变红，是因为他的用例帧 1 是纯 marker 前缀；
+# 下面这条带散文前缀、且被切处落在窗口内 —— 实测窗口=1 时会真实泄漏，用来守住窗口参数被误改。
+_dd_pre = "我先看看：" + _M33[:9]
+_dd_rest = _M33[9:] + "\n" + _CALLS34
+_t, _tc, _fn = _run34([_f33(_dd_pre), _f33(_dd_rest), _f33("", "stop")])
+check("跨帧补全依赖窗口：散文 + 被切开的 marker → marker 不泄漏且散文保留",
+      _M33 not in _t and _M33[:9] not in _t and "我先看看" in _t,
+      (_tc, _t[:60]))
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
