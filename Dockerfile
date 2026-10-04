@@ -19,6 +19,8 @@ RUN apk add --no-cache ca-certificates && \
 FROM python:3.11-alpine
 
 # Set environment
+# 注：API_KEY 默认为空，只作为 compose / docker run -e 的覆盖入口，不承载任何密钥。
+# （docker build 的 SecretsUsedInArgOrEnv lint 提示来自变量名，而非真实密钥内容。）
 ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     PORT=8790 \
@@ -27,8 +29,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Alpine timezone & certs
-RUN apk add --no-cache tzdata ca-certificates && \
+# Alpine timezone & certs + UMID 组件的 glibc 兼容层（issue #12）：
+#   提取出的 runtime-info 是 glibc 动态链接的 ELF（依赖 libstdc++），alpine 是
+#   musl——缺 /lib64/ld-linux-x86-64.so.2 与 libstdc++.so.6 时 exec 会直接失败
+#   （exit 127，观感像「文件不存在」，实为组件在但跑不起来）。
+#   gcompat 提供 glibc ABI 兼容层，libstdc++/libgcc 补齐 C++ 运行时（约 +3.1MB）。
+RUN apk add --no-cache tzdata ca-certificates gcompat libstdc++ libgcc && \
     cp /usr/share/zoneinfo/${TZ} /etc/localtime && \
     echo "${TZ}" > /etc/timezone
 

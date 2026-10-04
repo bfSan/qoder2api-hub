@@ -234,11 +234,38 @@ def runtime_info_exe(realm):
     return found
 
 
+# ---------------------------------------------------------------------------
+# 原生桥执行失败的一次性提示（issue #12）
+# ---------------------------------------------------------------------------
+# 「组件不存在」（runtime_info_exe 返回空串）是正常降级、保持静默；「组件在但
+# 执行失败」在子进程 exec 阶段才暴露（典型：alpine 缺 glibc loader / libstdc++，
+# 报 FileNotFoundError: /lib64/ld-linux-x86-64.so.2），过去被静默吞掉后只剩
+# 「身份退化为 derived」，最容易被误诊成路径没配好。同类失败同进程只提示一次，
+# 避免批量签到/巡检时刷屏。
+_runtime_info_warned = set()
+
+
+def _runtime_info_warn(category, message):
+    """把原生桥失败按类别提示到 stderr（同一类别进程内只打一次）。"""
+    if category in _runtime_info_warned:
+        return
+    _runtime_info_warned.add(category)
+    try:
+        import sys
+        print("[runtime-info] %s" % message, file=sys.stderr)
+    except Exception:
+        pass
+
+
 def run_runtime_info(realm, account_id=""):
-    """调用官方 runtime-info.exe，返回其 JSON（失败返回 {}）。
+    """调用 runtime-info 原生桥，返回其 JSON（失败返回 {}）。
 
     account 为空串同样可用：机器身份是机器级的，活动平台之外（如虚拟化体检）
     不需要账号上下文。
+
+    失败可见性（issue #12）：「组件不存在」（runtime_info_exe 返回空串）保持
+    静默；「组件在但执行失败」（缺 glibc loader / libstdc++、执行位丢失、输出
+    异常等）会把底层异常打一次到 stderr——两种情况都照旧返回 {} 供上层回退。
     """
     exe = runtime_info_exe(realm)
     if not exe:
@@ -253,8 +280,24 @@ def run_runtime_info(realm, account_id=""):
         out = proc.stdout.decode("utf-8", "replace").strip()
         if out:
             return json.loads(out.split("\n", 1)[0])
-    except Exception:
-        pass
+        _runtime_info_warn(
+            "empty-output",
+            "%s 运行结束但没有输出（exit=%s），身份将退化为 derived"
+            % (exe, proc.returncode))
+    except OSError as exc:
+        # 文件存在但 exec 失败：FileNotFoundError 缺的通常不是组件本身，而是它
+        # 的动态 loader（glibc 的 /lib64/ld-linux-x86-64.so.2，alpine/musl 没有）；
+        # 底层异常必须透出来，否则会被误读成「路径没配好」。
+        _runtime_info_warn(
+            "exec:" + type(exc).__name__,
+            "无法执行 %s：%s: %s（组件存在但跑不起来；Docker/alpine 需要 "
+            "gcompat libstdc++ libgcc 兼容层，见 README 已知限制）"
+            % (exe, type(exc).__name__, exc))
+    except Exception as exc:
+        # 其它失败（超时 / 输出不是 JSON / 非 OSError 异常）
+        _runtime_info_warn(
+            "run:" + type(exc).__name__,
+            "%s 调用失败：%s: %s" % (exe, type(exc).__name__, exc))
     return {}
 
 

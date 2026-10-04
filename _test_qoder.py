@@ -3258,6 +3258,151 @@ check("default_dest_dir()：$QD_UMID_DIR 优先；默认 <repo>/umid（与 gatew
           os.path.dirname(os.path.abspath(U30.__file__)), "umid")
       and _dd_default30 != _dd_env30,
       (_dd_env30, _dd_default30))
+# 真实产物校验（仓库里存在才断言，否则显式 SKIP——绝不静默）：
+# umid/ 已被 .gitignore 忽略，CI/他人机器上通常没有，所以这条按环境降级为 SKIP。
+_umid_real30 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "umid", "runtime-info")
+if os.path.isfile(_umid_real30):
+    with open(_umid_real30, "rb") as _fh30b:
+        _umid_data30 = _fh30b.read()
+    check("真实产物：umid/runtime-info 被识别为 elf-x86_64 且落在体积启发式区间"
+          "（提取链路端到端产物，非合成样本）",
+          U30.identify_blob(_umid_data30) == "elf-x86_64"
+          and U30.verify_component(_umid_data30, "elf-x86_64")
+          and U30.HEURISTIC_SIZE_MIN <= len(_umid_data30) <= U30.HEURISTIC_SIZE_MAX,
+          (len(_umid_data30), U30.identify_blob(_umid_data30)))
+print()
+print("[31] issue #11 工具结果回声 + 标记常量契约 + issue #12 原生桥失败可见性")
+
+# --- 31.1 #11 判据：吞掉 / 不吞（直接调用判据函数，离线） ---
+_TR31 = P.TOOL_RESULT_MARKER          # "[工具结果"（值不含 ]，写入侧拼 name）
+_TC31 = P.TOOL_RESULT_CLOSE           # "[工具结果结束]"（模型自造的闭标记）
+_NAMES31 = {"terminal"}
+_PROD31 = (_TR31 + "]\n" + '{"output":"ok"}' + "\n" + _TC31 + "\n"
+           "<system_warning>x</system_warning>")
+check("#11 判据·吞：生产样本（开标记 + JSON + 自造闭标记 + 夹带 system_warning）",
+      P._tool_echo_droppable(_PROD31, _NAMES31) is True)
+check("#11 判据·吞：截断（无闭标记，body 以 { 开头）",
+      P._tool_echo_droppable(_TR31 + "]\n" + '{"output": "partial', _NAMES31) is True)
+check("#11 判据·吞：只有开标记（退化形态，与 #9 的纯 marker 一致）",
+      P._tool_echo_droppable(_TR31 + "]", _NAMES31) is True)
+check("#11 判据·吞：带 name 的开标记行（写入侧真实形态）",
+      P._tool_echo_droppable(_TR31 + " (terminal)]\n" + '{"a":1}', _NAMES31) is True)
+check("#11 判据·不吞：标记后跟自然语言散文（fail-open）",
+      P._tool_echo_droppable(_TR31 + "] 这段是普通说明", _NAMES31) is False)
+check("#11 判据·不吞：不以标记开头（讨论该标记的普通回复）",
+      P._tool_echo_droppable("网关会写入 " + _TR31 + "] 这样的提示", _NAMES31) is False)
+check("#11 判据·不吞：未声明 tools（allowed_names 为 None / 空集）",
+      P._tool_echo_droppable(_PROD31, None) is False
+      and P._tool_echo_droppable(_PROD31, set()) is False)
+check("#11 判据·不吞：标记行未闭合 / 跨行闭合（不是网关形态）",
+      P._tool_echo_droppable(_TR31 + " 没有右括号", _NAMES31) is False
+      and P._tool_echo_droppable(_TR31 + "\n换行后才]闭合", _NAMES31) is False)
+check("#11 hold-back：标记未打完要压住，证伪（散文）立即放行；统一暂存包含两种回声",
+      P._tool_echo_prefix_hold("[工") is True
+      and P._tool_echo_prefix_hold(_TR31 + "] 散文说明") is False
+      and P._echo_hold_candidate(P.LEAK_MARKER + "\n[") is True
+      and P._echo_hold_candidate(_TR31 + "]") is True)
+
+# --- 31.2 #11 三条链路端到端（复用 [27] 段的帧辅助） ---
+_fr31_drop = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_PROD31[:10]), _raw27(_PROD31[10:]), _raw27("", "stop")]),
+    _NAMES31)]
+_text31_drop = "".join(_f["choices"][0]["delta"].get("content") or ""
+                       for _f in _fr31_drop)
+check("#11 流式：开闭对回声被吞（正文空、无标记泄漏、finish_reason 仍 stop）",
+      _text31_drop == ""
+      and _TR31 not in json.dumps(_fr31_drop, ensure_ascii=False)
+      and _fr31_drop[-1]["choices"][0]["finish_reason"] == "stop",
+      _text31_drop)
+_trunc31 = _TR31 + "]\n" + '{"output": "partial'
+_fr31_tr = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_trunc31[:8]), _raw27(_trunc31[8:]), _raw27("", "stop")]),
+    _NAMES31)]
+_text31_tr = "".join(_f["choices"][0]["delta"].get("content") or ""
+                     for _f in _fr31_tr)
+check("#11 流式：截断回声被吞（正文空）", _text31_tr == "", _text31_tr)
+_fr31_keep = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_TR31 + "] 这是一段解释文字。"), _raw27("", "stop")]), _NAMES31)]
+_text31_keep = "".join(_f["choices"][0]["delta"].get("content") or ""
+                       for _f in _fr31_keep)
+check("#11 流式：散文形态原样透传（fail-open 不吞字）",
+      _TR31 in _text31_keep and "解释文字" in _text31_keep, _text31_keep)
+_obj31 = P.aggregate_stream(
+    _Resp27([_env27(_PROD31[:12]), _env27(_PROD31[12:]), _env27("", "stop")]),
+    "m31", None, allowed_names=_NAMES31)
+_msg31 = _obj31["choices"][0]["message"]
+check("#11 非流式：content 清空、无 tool_calls、finish=stop（与 #9 同语义）",
+      _msg31.get("content") == "" and not _msg31.get("tool_calls")
+      and _obj31["choices"][0]["finish_reason"] == "stop", _msg31)
+_ev31 = "".join(f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_PROD31[:12]), _raw27(_PROD31[12:]), _raw27("", "stop")]),
+    "m31", {"usage": None, "custom_names": set(), "allowed_names": _NAMES31}))
+check("#11 Responses 流式：事件里既无开标记也无闭标记",
+      _TR31 not in _ev31 and _TC31 not in _ev31)
+
+# --- 31.3 标记常量契约：写入侧引用常量 + 写出字节逐字节不变 ---
+_src31 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_proxy.py"), encoding="utf-8").read()
+check("#11 写入侧引用常量（源码里不得再有 [工具结果%s] 裸模板）",
+      'TOOL_RESULT_MARKER + name + "]\\n"' in _src31
+      and '"[工具结果%s]"' not in _src31,
+      [_l.strip() for _l in _src31.splitlines() if "[工具结果" in _l][:3])
+_sys31, _flat31, _img31 = P.flatten_messages([
+    {"role": "tool", "name": "t", "content": "X"},
+    {"role": "tool", "content": "Y"}])
+_flat_set31 = {m["content"] for m in _flat31}
+check("#11 写入格式逐字节不变（常量拼接结果 == 旧字面量模板）",
+      "[工具结果 (t)]\nX" in _flat_set31 and "[工具结果]\nY" in _flat_set31
+      and (_TR31 + " (t)]\nX") in _flat_set31,
+      sorted(_flat_set31))
+
+# --- 31.4 issue #12：原生桥失败的可见性（打桩 scenario，全程离线） ---
+import contextlib as _cl31
+import io as _io31
+import shutil as _sh31
+import tempfile as _tf31
+_tmp31 = _tf31.mkdtemp(prefix="qd-exec31-")
+try:
+    _exe31 = os.path.join(_tmp31, "runtime-info")
+    with open(_exe31, "w", encoding="utf-8") as _fh31:
+        _fh31.write("#!/bin/sh\necho hi\n")        # 存在但不是可执行的原生组件
+    _orig_rie31 = A.runtime_info_exe
+    _orig_warned31 = set(A._runtime_info_warned)
+    try:
+        A._runtime_info_warned.clear()
+        A.runtime_info_exe = lambda realm: ""
+        _err31_missing = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_missing):
+            _res31_missing = A.run_runtime_info("cn", "u31")
+        check("#12 组件不存在：静默降级（返回 {} 且 stderr 无任何提示）",
+              _res31_missing == {} and _err31_missing.getvalue() == "",
+              _err31_missing.getvalue()[:120])
+
+        A._runtime_info_warned.clear()
+        A.runtime_info_exe = lambda realm: _exe31
+        _err31_exec = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_exec):
+            _res31_exec = A.run_runtime_info("cn", "u31")
+        _msg31_exec = _err31_exec.getvalue()
+        check("#12 组件在但执行失败：返回 {} 且 stderr 有可诊断提示"
+              "（[runtime-info] 前缀 + 组件路径 + 修法提示）",
+              _res31_exec == {} and "[runtime-info]" in _msg31_exec
+              and _exe31 in _msg31_exec and "无法执行" in _msg31_exec,
+              _msg31_exec[:200])
+        check("#12 两种情况可区分：'不存在' 完全静默 vs '跑不起来' 有提示",
+              _err31_missing.getvalue() == "" and _msg31_exec != "")
+        _err31_again = _io31.StringIO()
+        with _cl31.redirect_stderr(_err31_again):
+            A.run_runtime_info("cn", "u31")
+        check("#12 同一类失败同进程只提示一次（批量签到不刷屏）",
+              _err31_again.getvalue() == "", _err31_again.getvalue()[:120])
+    finally:
+        A.runtime_info_exe = _orig_rie31
+        A._runtime_info_warned.clear()
+        A._runtime_info_warned.update(_orig_warned31)
+finally:
+    _sh31.rmtree(_tmp31, ignore_errors=True)
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"

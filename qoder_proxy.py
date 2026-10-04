@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2207,6 +2207,15 @@ def parse_dsml_tool_calls(text):
 # 这里补齐回读：在严格守卫下还原成结构化 tool_calls 并从正文移除。
 LEAK_MARKER = "[assistant 请求调用工具]"
 
+# issue #11：tool 角色消息被序列化进 content 时的开标记（写入侧见
+# flatten_messages）。网关只写开标记、不写闭标记；模型常自造一个
+# 「[工具结果结束]」闭标记，甚至夹带自造的 <system_warning> 残片。
+# 更根本的修法是不把 tool 结果序列化进 content（issue #11 作者建议），
+# 那属于协议层重构（需要 tool_call_id 配对与结构化 message 透传），
+# 本轮不做，只在回读侧兜住已被放大到正文里的回声块。
+TOOL_RESULT_MARKER = "[工具结果"
+TOOL_RESULT_CLOSE = "[工具结果结束]"
+
 
 def parse_leaked_tool_calls(text, allowed_names=None):
     """把模型复述的「marker + JSON 数组」还原成结构化 tool_calls。
@@ -2395,6 +2404,69 @@ def _leaked_partial_droppable(text, allowed_names=None):
         return True
 
 
+def _tool_echo_head(text):
+    """切分「[工具结果<name>]」开标记行 → (body, ok)；ok=False 表示不是合法开标记。"""
+    t = (text or "").strip()
+    if not t.startswith(TOOL_RESULT_MARKER):
+        return None, False
+    rest = t[len(TOOL_RESULT_MARKER):]
+    close = rest.find("]")
+    if close == -1 or "\n" in rest[:close]:
+        return None, False          # 标记行未闭合 / 换行后才有 ]：非本网关形态
+    return rest[close + 1:], True
+
+
+def _tool_echo_droppable(text, allowed_names=None):
+    """issue #11：正文是「[工具结果...]」回声块时吞掉整段（与 issue #9 同形态）。
+
+    三个条件同时成立才吞：
+      1) strip 后是合法开标记行（TOOL_RESULT_MARKER + 可选 name + ]）；
+      2) 本次请求声明了 tools（allowed_names 非空）——与既有回读同一前置；
+      3) 形态自洽：出现模型自造的闭标记 TOOL_RESULT_CLOSE，或标记之后（忽略空白）
+         以 JSON/标签起始字符开头（含被截断、永不闭合的块）。
+
+    为什么吞掉而不是还原成 tool 消息：还原需要把回声与历史上的 tool_call_id
+    配对（网关现在压平进 content 时并未保留 call_id），本轮不引入该复杂度，
+    只做「不把内部协议文本交给终端用户」。
+
+    不吞（fail-open）：不以标记开头；标记后跟自然语言散文；未声明 tools。
+    """
+    if not text or not allowed_names:
+        return False
+    body, ok = _tool_echo_head(text)
+    if not ok:
+        return False
+    if TOOL_RESULT_CLOSE in body:
+        return True
+    rest = body.lstrip()
+    if not rest:
+        return True                 # 只有开标记：退化形态（与 #9 的纯 marker 一致）
+    return rest[0] in "{[\"<"
+
+
+def _tool_echo_prefix_hold(text):
+    """流式 hold-back：这段缓冲仍可能是 issue #11 的回声块吗？（宽松版判据）"""
+    t = (text or "").lstrip()
+    if not t:
+        return True
+    if TOOL_RESULT_MARKER.startswith(t):
+        return True                 # 标记本身还没打完
+    body, ok = _tool_echo_head(t)
+    if not ok:
+        return False                # 不是标记形态 -> 证伪，立即放行
+    if TOOL_RESULT_CLOSE in body:
+        return True
+    rest = body.lstrip()
+    if not rest:
+        return True
+    return rest[0] in "{[\"<"
+
+
+def _echo_hold_candidate(text):
+    """统一暂存判定：仍可能是 #8 数组回声或 #11 工具结果回声？"""
+    return _still_leak_candidate(text) or _tool_echo_prefix_hold(text)
+
+
 def _leak_chunk_frame(meta, delta, finish_reason=None):
     """按流式 chat.completion.chunk 形态合成一帧（沿用上游的 id/model）。"""
     payload = {
@@ -2478,7 +2550,7 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
             continue
         if hold is not None:
             hold += piece
-            if _still_leak_candidate(hold):
+            if _echo_hold_candidate(hold):
                 if fin:
                     finished = (payload, fin)
                 elif (delta.get("tool_calls")
@@ -2498,7 +2570,8 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
         if fin and not piece:
             finished = (payload, fin)
             continue
-        if piece and _leak_prefix_hold(piece):
+        if piece and (_leak_prefix_hold(piece)
+                      or _tool_echo_prefix_hold(piece)):
             hold = piece
             if fin:
                 finished = (payload, fin)
@@ -2528,6 +2601,11 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
             # issue #9：截断的 marker+JSON 回声无法还原成结构化调用，吞掉整段，
             # 绝不把网关内部协议文本透传给终端用户。
             log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
+                % len(hold), level="WARN", tag="chat")
+        elif _tool_echo_droppable(hold, allowed_names):
+            # issue #11：模型把 [工具结果...] 回声块当正文吐出（自造闭标记或
+            # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
+            log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(hold), level="WARN", tag="chat")
         else:
             yield _leak_chunk_frame(meta, {"content": hold})
@@ -2609,7 +2687,9 @@ def flatten_messages(messages, keep_reasoning=False):
             if tc:
                 name = " (%s)" % tc
             flat.append({"role": "user",
-                         "content": "[工具结果%s]\n%s" % (name, text or "")})
+                         # 字节与旧实现完全一致（" [工具结果" + name + "]\n" + text）
+                         "content": TOOL_RESULT_MARKER + name + "]\n"
+                         + (text or "")})
             continue
         if role == "assistant" and m.get("tool_calls"):
             calls = []
@@ -3541,6 +3621,11 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
             log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
                 % len(message["content"]), level="WARN", tag="chat")
             message["content"] = ""
+        elif _tool_echo_droppable(message["content"], allowed_names):
+            # issue #11：工具结果回声块同样不还原、不透传。
+            log("dropped leaked tool-result echo (%d chars) — issue #11"
+                % len(message["content"]), level="WARN", tag="chat")
+            message["content"] = ""
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -4186,8 +4271,9 @@ def stream_responses_events(inner_lines, model, holder):
                 text_buffer += piece
                 # 泄漏回读（issue #8）：正文还一个字没吐、缓冲仍是
                 # 「marker + JSON 数组」候选时先压住，流末统一判定。
-                _leak_defer = not any(text_parts) and _leak_prefix_hold(
-                    text_buffer)
+                _leak_defer = not any(text_parts) and (
+                    _leak_prefix_hold(text_buffer)
+                    or _tool_echo_prefix_hold(text_buffer))
                 while text_buffer and not _leak_defer:
                     idx = text_buffer.find("<")
                     if idx == -1:
@@ -4299,12 +4385,16 @@ def stream_responses_events(inner_lines, model, holder):
     if text_buffer:
         leak_calls, leak_clean = (None, text_buffer)
         dropped_leak = False
+        dropped_tool_echo = False
         if not any(text_parts):
             leak_calls, leak_clean = parse_leaked_tool_calls(
                 text_buffer, holder.get("allowed_names"))
             if leak_calls is None and _leaked_partial_droppable(
                     text_buffer, holder.get("allowed_names")):
                 dropped_leak = True
+            elif leak_calls is None and _tool_echo_droppable(
+                    text_buffer, holder.get("allowed_names")):
+                dropped_tool_echo = True
         if leak_calls:
             dsml_tool_calls.extend(
                 {"id": c.get("id"),
@@ -4315,6 +4405,11 @@ def stream_responses_events(inner_lines, model, holder):
         elif dropped_leak:
             # issue #9：截断的 marker+JSON 回声 -> 不输出文本、不走 DSML 回退。
             log("dropped truncated leaked tool-call echo (%d chars) — issue #9"
+                % len(text_buffer), level="WARN", tag="chat")
+            calls_rem, clean_rem = None, None
+        elif dropped_tool_echo:
+            # issue #11：工具结果回声块 -> 同样吞掉，不走 DSML 回退。
+            log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(text_buffer), level="WARN", tag="chat")
             calls_rem, clean_rem = None, None
         else:
