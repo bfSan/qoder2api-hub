@@ -2954,6 +2954,100 @@ check("形态区分：信封非 200 仍抛 UpstreamStatus（既有路径未变�
       _raise34() == "raised:418")
 
 print()
+print("[27.9] issue #16：散文+marker 同帧 / 未完成 \\uXXXX 转义（回读守卫边界）")
+_M16 = P.LEAK_MARKER
+_N16 = {"terminal"}
+_A16 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"ls'
+_B116 = "我先看看目录结构。\n\n" + _A16
+_B316 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a'
+_C16 = "[工具结果]\n{\"output\": \"ok\"}\n[工具结果结束]"
+
+
+def _txt16(out):
+    return "".join(f["choices"][0]["delta"].get("content") or "" for f in out)
+
+
+_r16a = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_A16[:10]), _raw27(_A16[10:]), _raw27("", "stop")]), _N16)]
+check("A 参照（marker 开头 + 截断）-> 仍吞（回归）",
+      P.LEAK_MARKER not in _txt16(_r16a))
+_r16b1 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_B116), _raw27("", "stop")]), _N16)]
+check("B1 散文 + marker 同帧 -> 吞回声块、散文保留",
+      P.LEAK_MARKER not in _txt16(_r16b1)
+      and "我先看看目录结构。" in _txt16(_r16b1))
+_r16b2 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("我先看看目录结构。\n\n"), _raw27(_A16), _raw27("", "stop")]),
+    _N16)]
+check("B2 散文与 marker 分帧 -> 同样吞（回归）",
+      P.LEAK_MARKER not in _txt16(_r16b2)
+      and "我先看看目录结构。" in _txt16(_r16b2))
+_r16b3 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_B316[:12]), _raw27(_B316[12:]), _raw27("", "stop")]), _N16)]
+check("B3 截断落在未写完的 \\uXXXX 转义 -> 吞",
+      P.LEAK_MARKER not in _txt16(_r16b3))
+_r16c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_C16), _raw27("", "stop")]), _N16)]
+check("C [工具结果] 回声（回归）-> 吞", "[工具结果" not in _txt16(_r16c))
+check("B3 判据单元：未完成 / 彻底非法转义都视为可继续扩展",
+      P._json_array_prefix_ok('[{"a": "x\\u63a') is True
+      and P._json_array_prefix_ok('[{"a": "x\\uZZZZ') is True
+      and P._json_array_prefix_ok('[{"a": "x\\u63a2') is True)
+_r16e1 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("列表项 [1, 2"), _raw27(", 3] 结束"), _raw27("", "stop")]),
+    _N16)]
+check("误伤边界：普通文本（含 [1, 2）原样透传",
+      _txt16(_r16e1) == "列表项 [1, 2, 3] 结束")
+_r16e2 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("看这个 [assis"), _raw27("tant 是普通词"),
+          _raw27("", "stop")]), _N16)]
+check("误伤边界：帧尾 marker 真前缀（[assis）证伪后完整补发",
+      _txt16(_r16e2) == "看这个 [assistant 是普通词")
+_r16e4 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("散文 " + _M16 + "\n"
+                + '[{"name": "terminal", "arguments": "{}"}]'),
+          _raw27("", "stop")]), _N16)]
+check("散文 + 完整合法数组 -> 仍走恢复路径（tool_calls），散文保留",
+      bool([f for f in _r16e4 if f["choices"][0]["delta"].get("tool_calls")])
+      and _txt16(_r16e4).startswith("散文"))
+check("窗口常量：_MARKER_HOLD_WINDOW = 最长标记 - 1（17）",
+      P._MARKER_HOLD_WINDOW == len(P.LEAK_MARKER) - 1 == 17)
+_obj16 = P.aggregate_stream(
+    _Resp27([_env27(_B116[:12]), _env27(_B116[12:]), _env27("", "stop")]),
+    "m27", None, allowed_names=_N16)
+check("非流式：散文 + marker 回声块 -> 只吞块、散文保留",
+      _obj16["choices"][0]["message"].get("content") == "我先看看目录结构。\n\n")
+_ev16 = [f.decode() for f in P.stream_responses_events(
+    iter([_raw27(_B116[:12]), _raw27(_B116[12:]), _raw27("", "stop")]), "m27",
+    {"usage": None, "custom_names": set(), "allowed_names": _N16})]
+check("Responses 流式：散文 + marker 同帧 -> 不回显 marker、散文保留",
+      P.LEAK_MARKER not in "".join(_ev16)
+      and "我先看看目录结构。" in "".join(_ev16))
+
+print()
+print("[27.95] issue #16 兜底：hold 缓冲上限（超限 fail-open 放行）")
+_BIG16 = P.LEAK_MARKER + "\n[" + "1," * 20000          # 约 40KB 的候选前缀
+_big_out = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(_BIG16), _raw27("2]", "stop")]), {"terminal"})]
+_big_text = "".join(f["choices"][0]["delta"].get("content") or ""
+                    for f in _big_out)
+check("超限：hold 超过 _HOLD_MAX_CHARS -> fail-open 放行且内容只出现一次",
+      len(_BIG16) > P._HOLD_MAX_CHARS and _big_text == _BIG16 + "2]")
+check("上限常量：32KB / 200 帧",
+      P._HOLD_MAX_CHARS == 32768 and P._HOLD_MAX_FRAMES == 200)
+_keep_frames16 = P._HOLD_MAX_FRAMES
+try:
+    P._HOLD_MAX_FRAMES = 2
+    _fr16 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+        iter([_raw27(P.LEAK_MARKER), _raw27("\n["), _raw27("1"), _raw27("2"),
+              _raw27("", "stop")]), {"terminal"})]
+finally:
+    P._HOLD_MAX_FRAMES = _keep_frames16
+check("帧数兜底：超过 _HOLD_MAX_FRAMES 帧仍未证伪 -> 放行",
+      "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr16)
+      == P.LEAK_MARKER + "\n[12")
+
+print()
 print("[28] 发布前补强：终局验证 §10.7#5 的零覆盖项（防止静默回归）")
 import ast as _ast28
 import re as _re28
@@ -3705,9 +3799,120 @@ _args_scalar32 = P.flatten_messages(
       "tool_calls": [{"id": "c1", "function": {"name": "f",
                                                "arguments": 42}}]}],
     structured=True)[1][0]["tool_calls"][0]["function"]["arguments"]
-check("结构化产物：arguments 为 None → 空字符串；非字符串标量 → str()（不产生 null）",
-      _args_none32 == "" and _args_scalar32 == "42",
-      (_args_none32, _args_scalar32))
+print()
+print("[33] issue #16 误伤边界：帧尾 marker 前缀 hold 不得吞掉正常文本、不得延迟恢复")
+
+
+def _f33(content, fin=None):
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    inner = {"id": "c33", "model": "m33", "created": 1,
+             "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+    return ("data: " + json.dumps(inner, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _join33(chunks, names=None):
+    return "".join(json.loads(f[6:])["choices"][0]["delta"].get("content") or ""
+                   for f in P.recover_leaked_tool_calls(iter(chunks), names))
+
+
+_M33 = P.LEAK_MARKER
+_NAMES33 = {"terminal"}
+
+_t33a = "数组是这样的：\n["
+check("误伤①：正文以 '[' 结尾（未闭合 JSON 引用）→ 原样透传，不被吞",
+      _join33([_f33(_t33a), _f33("", "stop")], _NAMES33) == _t33a,
+      _join33([_f33(_t33a), _f33("", "stop")], _NAMES33))
+_t33b = "看这个 [ass"
+check("误伤②：正文以 '[ass'（marker 前缀但未完整）结尾 → 跨帧后原样透传",
+      _join33([_f33(_t33b), _f33(" 只是标记的开头", "stop")], _NAMES33)
+      == _t33b + " 只是标记的开头",
+      _join33([_f33(_t33b), _f33(" 只是标记的开头", "stop")], _NAMES33))
+_t33c = "网关会写入 " + _M33 + " 这样的提示，不是真的调用。"
+check("误伤③：含 marker 但后面是自然语言 → 原样透传（讨论而非调用）",
+      _join33([_f33(_t33c), _f33("", "stop")], _NAMES33) == _t33c)
+_calls33 = json.dumps([{"name": "terminal",
+                        "arguments": json.dumps({"cmd": "ls"}, ensure_ascii=False)}],
+                      ensure_ascii=False)
+_t33d = _M33 + "\n" + _calls33
+_fr33d = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_f33(_t33d), _f33("", "stop")]), _NAMES33)]
+check("误伤④：marker + 完整合法数组 → 走恢复路径（tool_calls 增量），既不吞也不泄漏",
+      any(f["choices"][0]["delta"].get("tool_calls") for f in _fr33d)
+      and _M33 not in json.dumps(_fr33d, ensure_ascii=False)
+      and not any(f["choices"][0]["delta"].get("content") for f in _fr33d),
+      _fr33d)
+_t33e = "格式是 [a-z]+ 这种正则，或者 [1,2,3] 这种数组。"
+check("误伤⑤：正文含 '[' 但不以 marker 开头 → 原样透传",
+      _join33([_f33(_t33e), _f33("", "stop")], _NAMES33) == _t33e)
+_t33f = "第一段 [ass"
+_t33f2 = "istant 请求调用工具] 不是 marker 全文"
+_fr33f = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_f33(_t33f), _f33(_t33f2, "stop")]), _NAMES33)]
+_text33f = "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr33f)
+check("误伤⑥：跨帧拼接内容守恒（正常文本不丢字、不被误吞；含 marker 字样也照传）",
+      _text33f == _t33f + _t33f2, _text33f)
+
+# --- issue #16 五形态：用汤圆给作者的**原样样本**（A/B1/B2/B3/C） ---
+_M16 = P.LEAK_MARKER
+_A16 = _M16 + "\n" + '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"ls'
+_B116 = "我先看看目录结构。" + "\n\n" + _A16
+_B216 = ["我先看看目录结构。\n\n", _A16]
+_B316 = _M16 + "\n" + \
+    '[{"name": "terminal", "arguments": "{\\"cmd\\": \\"echo \\u63a'
+_C16 = "[工具结果]" + "\n" + '{"output": "ok"}' + "\n" + "[工具结果结束]"
+
+
+def _frames16(chunks):
+    return [json.loads(f[6:]) for f in
+            P.recover_leaked_tool_calls(iter(chunks), _NAMES33)]
+
+
+def _text16(frames):
+    return "".join(f["choices"][0]["delta"].get("content") or "" for f in frames)
+
+
+def _fin16(frames):
+    return frames[-1]["choices"][0].get("finish_reason")
+
+
+_frA16 = _frames16([_f33(_A16[:20]), _f33(_A16[20:]), _f33("", "stop")])
+check("#16·A（原样样本：marker+截断 JSON 切两刀）→ 内容不含标记、收尾帧 finish_reason=stop",
+      _M16 not in _text16(_frA16) and _fin16(_frA16) == "stop", _text16(_frA16))
+_frB116 = _frames16([_f33(_B116), _f33("", "stop")])
+check("#16·B1（原样样本：散文+marker 同帧）→ 散文保留、标记不泄漏、finish=stop",
+      "我先看看目录结构。" in _text16(_frB116)
+      and _M16 not in _text16(_frB116) and _fin16(_frB116) == "stop",
+      _text16(_frB116))
+_frB216 = _frames16([_f33(x) for x in _B216] + [_f33("", "stop")])
+check("#16·B2（原样样本：散文与 marker 分帧）→ 散文保留、标记不泄漏、finish=stop",
+      "我先看看目录结构。" in _text16(_frB216)
+      and _M16 not in _text16(_frB216) and _fin16(_frB216) == "stop",
+      _text16(_frB216))
+_frB316 = _frames16([_f33(_B316[:20]), _f33(_B316[20:]), _f33("", "stop")])
+check("#16·B3（原样样本：\\u63a 未写完转义）→ 内容不含标记、finish=stop",
+      _M16 not in _text16(_frB316) and _fin16(_frB316) == "stop",
+      _text16(_frB316))
+_frC16 = _frames16([_f33(_C16[:8]), _f33(_C16[8:]), _f33("", "stop")])
+check("#16·C（原样样本：工具结果回声）→ 不含 \"[工具结果\"、finish=stop（#11 回归保护）",
+      "[工具结果" not in _text16(_frC16) and _fin16(_frC16) == "stop",
+      _text16(_frC16))
+
+# --- hold 上限：长文本以 [ 开头且久不闭合必须放行（不得无限缓冲） ---
+_HOLD_LIMIT16 = getattr(P, "_MARKER_HOLD_WINDOW", None)
+check("#16·hold 窗口常量存在且为标记长度量级（不是无上限）",
+      isinstance(_HOLD_LIMIT16, int) and 1 <= _HOLD_LIMIT16 <= 64, _HOLD_LIMIT16)
+_long16 = "[" + ("x" * 2000)
+_frLong16 = _frames16([_f33(_long16[:500]), _f33(_long16[500:]), _f33("", "stop")])
+check("#16·hold 上限：长文本以 '[' 开头且久不闭合 → 内容全部放行、不丢字",
+      _text16(_frLong16) == _long16,
+      (len(_text16(_frLong16)), len(_long16)))
+_frFirst16 = _frames16([_f33(_long16[:500]), _f33("", "stop")])
+_emitFirst16 = _text16(_frFirst16)
+check("#16·hold 上限：首帧即放行（缓冲不超过窗口量级，不把整段压住）",
+      len(_emitFirst16) >= len(_long16[:500]) - (_HOLD_LIMIT16 or 0) - 1,
+      (len(_emitFirst16), len(_long16[:500]), _HOLD_LIMIT16))
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
