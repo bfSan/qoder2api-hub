@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2655,6 +2655,92 @@ def _flatten_content_text(content):
     return "\n".join(t for t in texts if t), images
 
 
+# ---------------------------------------------------------------------------
+# 写入侧暴露面削减（评估报告路线 3：历史工具结果首尾保留 + 中间省略）
+# ---------------------------------------------------------------------------
+# 动机（issue #8/#11）：长会话里工具结果被全文回灌、且每轮全量重放，模型反复
+# 看到同一套「信封 + 长正文」样本 -> 复述概率升高，token 成本也随轮数线性增长。
+# 这里只削减**历史**（当前轮的 tool 结果必须完整保留）：信封前缀
+# （TOOL_RESULT_MARKER + name + "]\n"）逐字节不变，只动正文。
+TOOL_RESULT_KEEP_DEFAULT = 2000        # 单侧保留字符数（默认值，可由环境覆盖）
+_TOOL_RESULT_SHRINK_MARGIN = 200       # 削后至少要省这么多字符，才值得加省略标记
+
+
+def _tool_result_keep_chars():
+    """单侧保留字符数；返回 0 表示**完全关闭**削减（回退全文回灌）。
+
+    环境变量 QD_TOOL_RESULT_KEEP：正整数 = 单侧保留字符数；
+    0 / off / none / false / no / disable[d] = 关闭；非法值 = 用默认值。
+    每次调用都读环境变量，便于运行期调整与离线测试。
+    """
+    raw = (os.environ.get("QD_TOOL_RESULT_KEEP") or "").strip().lower()
+    if not raw:
+        return TOOL_RESULT_KEEP_DEFAULT
+    if raw in ("0", "off", "none", "false", "no", "disable", "disabled"):
+        return 0
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return TOOL_RESULT_KEEP_DEFAULT
+    return val if val > 0 else 0
+
+
+def _is_complete_json(text):
+    s = (text or "").strip()
+    if not s or s[0] not in "{[":
+        return False
+    try:
+        json.loads(s)
+        return True
+    except Exception:
+        return False
+
+
+def _shrink_tool_result(text, keep):
+    """历史工具结果：首尾各保留 keep 字符，中间换成明确的省略标记。
+
+    为什么首尾保留：工具输出的信息密度两端最高——头部是命令回显/首个错误/
+    文件起始，尾部是错误堆栈结尾、退出状态、diff 末尾；中间通常是重复的滚动
+    日志。按换行边界对齐，避免切出半行。
+    完整 JSON 额外宽限到 2*keep：结构化数据被截断即失去可解析性。
+    返回原文本表示「不值得削或不能削」。
+    """
+    if not isinstance(text, str) or keep <= 0:
+        return text
+    if len(text) <= keep * 2 + _TOOL_RESULT_SHRINK_MARGIN:
+        return text                       # 本来就不长：原样保留
+    if _is_complete_json(text) and len(text) <= keep * 4:
+        return text                       # 完整 JSON 给双倍预算，保住可解析性
+    head = text[:keep]
+    nl = head.rfind("\n")
+    if nl > keep // 2:                    # 尽量切在行边界（且别把头部砍太多）
+        head = head[:nl]
+    tail = text[-keep:]
+    nl2 = tail.find("\n")
+    if nl2 != -1 and nl2 < keep // 2:
+        tail = tail[nl2 + 1:]
+    omitted = len(text) - len(head) - len(tail)
+    marker = ("\n[[qoder-proxy: 已省略 %d 字符历史工具结果；"
+              "需要完整内容请重新执行该命令]]\n" % omitted)
+    return head + marker + tail
+
+
+def _current_turn_start(messages):
+    """返回「当前轮」起始下标（索引 >= 它的 tool 结果不削减）。
+
+    判定：从末尾往前找最后一条 user/system/developer 消息——它开启当前回合，
+    其后的一切（assistant 工具调用 + tool 结果）都属于当前轮。找不到则返回 0
+    （全部视为当前轮：宁可不削，也不误削模型正在用的结果）。
+    """
+    msgs = messages or []
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        if isinstance(m, dict) and m.get("role") in ("user", "system",
+                                                    "developer"):
+            return i + 1
+    return 0
+
+
 def flatten_messages(messages, keep_reasoning=False):
     """把客户端会话压平成 Qoder 上游可接受的 {role, content} 序列。
 
@@ -2670,7 +2756,10 @@ def flatten_messages(messages, keep_reasoning=False):
     """
     system_text = None
     flat, images = [], []
-    for m in messages or []:
+    # 暴露面削减只作用于历史（当前轮的 tool 结果必须完整保留）。
+    _keep = _tool_result_keep_chars()
+    _cur_start = _current_turn_start(messages) if _keep else len(messages or [])
+    for _idx, m in enumerate(messages or []):
         if not isinstance(m, dict):
             continue
         role = m.get("role")
@@ -2686,10 +2775,13 @@ def flatten_messages(messages, keep_reasoning=False):
             tc = m.get("name") or ""
             if tc:
                 name = " (%s)" % tc
+            body = text or ""
+            if _keep and _idx < _cur_start:
+                body = _shrink_tool_result(body, _keep)
             flat.append({"role": "user",
-                         # 字节与旧实现完全一致（" [工具结果" + name + "]\n" + text）
-                         "content": TOOL_RESULT_MARKER + name + "]\n"
-                         + (text or "")})
+                         # 前缀逐字节不变（TOOL_RESULT_MARKER + name + "]\n"）；
+                         # 削减只发生在正文部分。
+                         "content": TOOL_RESULT_MARKER + name + "]\n" + body})
             continue
         if role == "assistant" and m.get("tool_calls"):
             calls = []

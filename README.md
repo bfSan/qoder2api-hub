@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.4-2496ED?style=flat-square" alt="Version 1.2.4">
+  <img src="https://img.shields.io/badge/Release-v1.2.5-2496ED?style=flat-square" alt="Version 1.2.5">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -380,6 +380,21 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
+### v1.2.5
+
+**新增：历史工具结果削减（降低模型复述内部信封的概率 + 大幅省 token）**
+
+- **背景**：issue #8 / #11 的根因是「模型会模仿它在上下文里反复看到的格式」。协议层评估的结论是——换信封**不能根治**（旧信封仍会随历史重放，换一次只多一层守卫），真正的对策是「不再文本化」或「大幅减少暴露」。本版本做后者。
+- **行为**：历史里的工具结果（`[工具结果<name>]…`）在进入上游上下文前做**首尾保留 + 中间省略**：
+  - **只削历史**：最后一条 user/system 消息之后（即当前轮）的工具结果**全文保留**——模型正在用的内容不受影响；
+  - **信封前缀逐字节不变**（`[工具结果<name>]\n`），因此既有回读守卫与历史兼容性不受影响；
+  - ≤4.2 KB 的结果**不削**（绝大多数 `ls` / `cat` / `grep` 输出都在此列）；完整 JSON ≤8 KB 也不削（保可解析）；
+  - 省略处插入明确标记（含「需要完整内容请重新执行该命令」的行动指引），避免模型把截断处当成残缺数据去揣测。
+- **开关**：`QD_TOOL_RESULT_KEEP` —— 正数 = 单侧保留字符数；`0` / `off` / `false` = 完全关闭（回退旧行为）；非法值走默认 **2000**。
+- **实测收益**：15 条 8 KB 工具结果 → 117 KB 降到 59 KB（**-49%**）；30 条 20 KB → 585 KB 降到 118 KB（**-80%**）。
+- **已知代价**：diff 的中间 hunk、>8 KB JSON 的中段会被省略（靠省略标记 + JSON 双倍预算缓解）。
+- 新增 10 条断言（削减逻辑 / 首尾保留 / 前缀不变 / 当前轮不削 / 短结果 / JSON / 开关三态 / 默认值）。当前基线：**513 checks, 510 passed, 0 failed, 3 skipped, exit 0**。
+
 ### v1.2.4
 
 **修复 issue #12：Docker 里提取出的 UMID 组件跑不起来（alpine 缺 glibc 兼容层）**
@@ -399,7 +414,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **修复**：新增 `TOOL_RESULT_MARKER` / `TOOL_RESULT_CLOSE` 常量（写入侧改为引用常量，**写出的字节逐字节不变**），并按 issue #9 的同形态守卫补上回读——覆盖两种回声形态：网关原格式与**模型自造的开闭对**（`[工具结果] … [工具结果结束]`）。三条 finalize 路径全覆盖；截断 / 只有开标记同样吞掉；讨论该标记的散文、未声明 tools 一律不吞（fail-open 保持）。
 - **取舍**：吞掉（空 content + `finish_reason=stop`），**不**还原成 tool 消息——后者需要 `tool_call_id` 配对，属协议层重构，注释里已记下这条更根本的方向。
 
-**测试与验证**：`python _test_qoder.py` → **503 checks, 500 passed, 0 failed, 3 skipped, exit 0**（新增 [31] 段 21 条 + 3 条变异反证）；**Docker 实测**：3 次构建 + 容器内验证，含「容器内直接执行组件拿到真实身份」与「同容器稳定 / 新容器换身份」的对照。
+**测试与验证**：`python _test_qoder.py` → **513 checks, 500 passed, 0 failed, 3 skipped, exit 0**（新增 [31] 段 21 条 + 3 条变异反证）；**Docker 实测**：3 次构建 + 容器内验证，含「容器内直接执行组件拿到真实身份」与「同容器稳定 / 新容器换身份」的对照。
 
 ### v1.2.3
 
@@ -639,7 +654,7 @@ python _install_umid.py          # 从官方 npm 包提取内嵌的原生 UMID �
 
 ### 3. 真实上游链路未经端到端验证
 
-本轮发布的改动经过：离线确定性测试（503 断言）、模块级 `py_compile`、静态核对与变异反证；**Docker 构建与容器内 UMID 组件执行**已在 Docker Desktop 29.7.2 实测（issue #12：`docker build` 成功 → 容器内 `/app/umid/runtime-info` 可执行并返回真实身份字段）。**真实上游端到端**仍未在发布环境实跑，请以你自己的部署环境验证为准。
+本轮发布的改动经过：离线确定性测试（513 断言）、模块级 `py_compile`、静态核对与变异反证；**Docker 构建与容器内 UMID 组件执行**已在 Docker Desktop 29.7.2 实测（issue #12：`docker build` 成功 → 容器内 `/app/umid/runtime-info` 可执行并返回真实身份字段）。**真实上游端到端**仍未在发布环境实跑，请以你自己的部署环境验证为准。
 
 ---
 

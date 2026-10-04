@@ -2787,6 +2787,49 @@ check("流式：证伪（marker 后接散文）-> 仍 fail-open 补发原文",
       _M27 in _text_falsify and "解释文字" in _text_falsify, _text_falsify)
 
 print()
+print("[27.6] 写入侧暴露面削减（历史工具结果首尾保留 + 中间省略）")
+_LONG29 = "".join("log line %05d %s\n" % (i, "y" * 60) for i in range(150))
+_MSGS29 = [
+    {"role": "user", "content": "run"},
+    {"role": "tool", "name": "terminal", "content": _LONG29},   # 历史 -> 削
+    {"role": "user", "content": "again"},
+    {"role": "tool", "name": "terminal", "content": _LONG29},   # 当前轮 -> 不削
+    {"role": "tool", "name": "cat", "content": "ok: 3 passed"},
+]
+_flat29 = P.flatten_messages(_MSGS29)[1]
+_hist29, _cur29, _short29 = (_flat29[1]["content"], _flat29[3]["content"],
+                             _flat29[4]["content"])
+_PREF29 = P.TOOL_RESULT_MARKER + " (terminal)]\n"
+_body29 = _hist29.split("\n", 1)[1]     # 剥掉 "[工具结果 (terminal)]" 前缀行
+check("削减：历史工具结果被截断（首尾保留 + 省略标记）",
+      len(_hist29) < len(_LONG29) and "已省略" in _hist29
+      and _body29.startswith(_LONG29[:20]) and _body29.endswith(_LONG29[-40:]),
+      (len(_LONG29), len(_hist29)))
+check("削减：信封前缀逐字节不变（历史与当前轮都是）",
+      _hist29.startswith(_PREF29) and _cur29.startswith(_PREF29)
+      and _short29.startswith(P.TOOL_RESULT_MARKER + " (cat)]\n"))
+check("削减：当前轮的 tool 结果全文保留", _cur29 == _PREF29 + _LONG29)
+check("削减：短结果不动", _short29.endswith("ok: 3 passed"))
+check("削减：完整 JSON 不削且仍可解析",
+      isinstance(json.loads(P._shrink_tool_result(
+          json.dumps({"a": [1, 2, 3] * 20}), 2000)), dict))
+check("削减：无 user 的会话 -> 全部视为当前轮（不削）",
+      P.flatten_messages([{"role": "system", "content": "s"},
+                          {"role": "tool", "name": "t",
+                           "content": _LONG29}])[1][0]["content"]
+      == P.TOOL_RESULT_MARKER + " (t)]\n" + _LONG29)
+os.environ["QD_TOOL_RESULT_KEEP"] = "0"
+check("开关：QD_TOOL_RESULT_KEEP=0 完全回退旧行为（全文回灌）",
+      P.flatten_messages(_MSGS29)[1][1]["content"] == _PREF29 + _LONG29)
+os.environ["QD_TOOL_RESULT_KEEP"] = "off"
+check("开关：off -> 关闭", P._tool_result_keep_chars() == 0)
+os.environ["QD_TOOL_RESULT_KEEP"] = "abc"
+check("开关：非法值回落默认", P._tool_result_keep_chars() == 2000)
+del os.environ["QD_TOOL_RESULT_KEEP"]
+check("开关：默认值 = 2000（保守）",
+      P._tool_result_keep_chars() == P.TOOL_RESULT_KEEP_DEFAULT == 2000)
+
+print()
 print("[28] 发布前补强：终局验证 §10.7#5 的零覆盖项（防止静默回归）")
 import ast as _ast28
 import re as _re28
