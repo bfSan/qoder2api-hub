@@ -67,7 +67,18 @@ VOLUME ["/app/accounts", "/app/usage"]
 
 EXPOSE 8790
 
+# 健康探针（wb 同款）：/ping 永远 200 且不查账号池、不需要任何密钥；URL 跟随
+# PORT，容器重映射端口后仍能正确报告健康状态。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/ping' % os.environ.get('PORT','8790'), timeout=3)" || exit 1
+
 # 监听参数由上面的 ENV HOST/PORT 提供（qoder_proxy.py 的 argparse 默认值直接
 # 读环境变量），所以 docker run -e PORT=9000 与 compose 的 environment 真的生效；
 # 需要附带其它命令行参数时用 compose 的 command: 覆盖本 CMD。
-CMD ["python", "qoder_proxy.py"]
+#
+# --lan 是有意的（wb 修过的真实事故：端口发布到宿主网络而 Key 校验默认关闭，
+# 等于把上游额度向全网段裸奔）：--lan 监听全部网卡并**强制**生成随机 Key——
+# 首次写入 ./accounts/settings.json 并打印在启动日志（docker logs 里 grep -i
+# "api key" 可查）。显式传了 API_KEY 环境变量时仍以它为准（--api-key 默认读
+# 环境变量，argparse 的显式值优先级最高）。
+CMD ["python", "qoder_proxy.py", "--lan"]

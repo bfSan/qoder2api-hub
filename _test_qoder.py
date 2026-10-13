@@ -3741,8 +3741,10 @@ _DASH36 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.ht
 _JS36 = r"""
 const fs = require('fs');
 const html = fs.readFileSync(process.env.DASH36, 'utf-8');
-const mm = html.match(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/);
-const script = mm ? mm[1] : '';
+// 页面现在有多个 <script> 块（head 主题脚本 + body 主脚本）——只取第一个会
+// 抽到主题脚本而拿不到 fmtNextCheckin（#52 曾因此误报 missing）。取全部块拼接。
+const blocks = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+const script = blocks.join('\n');
 const s = script.indexOf('function fmtNextCheckin(x){');
 const e = script.indexOf('async function doCheckin(btn){');
 let pure = (s >= 0 && e > s) ? script.slice(s, e) : '';
