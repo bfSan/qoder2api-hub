@@ -376,7 +376,9 @@ a:hover{text-decoration:underline}
         <span class="badge warn" style="font-size:10px">A → B</span> 归一化时被挪档 ·
         <span class="badge bad" style="font-size:10px">→ 未下发</span> 请求了但被丢弃（模型无档位表）；
         <span style="color:var(--dim)">—</span> 表示该行没有档位字段（旧行 / 客户端未请求）</span>
-      <span><b>Key</b>＝仅显示标识（面板备注名 / 内置来源），不涉明文；<span style="color:var(--dim)">无 Key / 面板会话</span> 表示该行不带 Key（聚合时归入 (no-key) 桶）</span>
+      <span><b>Key</b>＝仅显示标识（面板备注名 / 内置来源），不涉明文；<span style="color:var(--dim)">无 Key / 面板会话</span> 表示该行不带 Key（聚合时归入「无 Key」桶）</span>
+      <span><b>区域</b>＝这条请求**实际走了哪个区**（usage 行逐请求落盘，确定值）。上方网关卡片里那条「最近一次对话的出口」
+        与本列**同源**（都读 usage 行），只是它只看最近一条并给出换区原因；逐条历史看这一列</span>
     </div>
     <div id="recentPagination" style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;padding-top:12px;border-top:1px solid var(--line);font-size:12px;color:var(--dim);flex-wrap:wrap;gap:8px">
       <div id="recentPageInfo">第 1 / 1 页 · 共 0 条记录</div>
@@ -938,28 +940,42 @@ function realmModeOf(state){
   if(s.auto_enabled) return 'auto';
   return (s.current === 'cn') ? 'cn' : 'intl';
 }
-// 实际出口文案：**有头 = 这次被自动换区**；**无头 = 没换**（按默认出口显示，绝不假造一个「当前区」指示）
-function realmActualNote(seen, state, accounts){
-  const s = state || {};
-  const cur = s.current || 'intl';
+// 卡片「最近一次对话的出口」：数据源＝最近请求表的 **usage 行**（持久化、可查历史）。
+// 响应头那条数据源已按契约切断（管理端点永不返回 X-Qoder-Realm），这里不再读任何响应头。
+// 三态严格区分——**不把「不知道」与「没发生」混为一谈**：
+//   realm_reason 键不存在 → 字段上线前的旧行（不知道） ／ "" → 没换区（没发生） ／ 其余 → 换区 + 确定性原因
+function realmActualNote(rows, state){
+  const list = Array.isArray(rows) ? rows : [];
   const nameOf = r => (r === 'cn' ? '国内版' : (r === 'intl' ? '国际版' : (r || '未知')));
-  if(!seen || !seen.realm){
-    return { switched: false, head: '本次实际出口：未观察到换区',
-             detail: '按默认出口「' + nameOf(cur) + '」；后端只在真的带区时才回 X-Qoder-Realm 头，没有该头就是没换' };
+  // 每个原因都带上「我能做什么」——比只说「在哪推走的」有用（natie 的建议）
+  const WHY = { model_missing: '当前区官方清单里没有这个模型：它天生只在另一区提供，加账号也改变不了；想固定用它就把默认出口切到那一区',
+                no_account: '模型在当前区本来有（或无法判断），是账号可用性把它推走的：给默认出口那一区加一个可用账号即可，不加则会一直走自动路由' };
+  const stamp = r => (r && r.iso) ? String(r.iso).replace('T', ' ').slice(5) : '';
+  if(!list.length){
+    return { tone: 'dim', head: '最近一次对话的出口：还不确定',
+             detail: '还没有可读的 usage 行；拿不到「最近一次对话」时不显示默认值（那是假指示）' };
   }
-  const to = seen.realm;
-  if(to === cur){
-    return { switched: false, head: '本次实际出口：' + nameOf(to) + '（与默认出口一致）', detail: '' };
+  // 最近请求表第 1 页时间倒序：取**最近一条非 error 的行**（失败行可能没有真实出账区，不该拿它当结论）
+  const newest = list.find(r => !r.error) || list[0];
+  const at = stamp(newest);
+  const hasKey = Object.prototype.hasOwnProperty.call(newest, 'realm_reason');
+  const knownCount = list.filter(r => Object.prototype.hasOwnProperty.call(r, 'realm_reason')).length;
+  const switchedCount = list.filter(r => r.realm_reason === 'model_missing' || r.realm_reason === 'no_account').length;
+  const scope = '（样本：最近请求表当前页 ' + list.length + ' 条）';
+  if(!hasKey){
+    return { tone: 'dim', head: '最近一次对话的出口：未知（旧记录）',
+             detail: '这一行没有 realm_reason 字段：它产生于该字段上线之前' + scope + '，据此判断不了换没换区（不猜，也不显示成「没换区」）' };
   }
-  // 为什么会换：面板侧只有两类证据可判——账号可用性（本机能查）与模型可用性（本机查不到别区清单）
-  const list = Array.isArray(accounts) ? accounts : [];
-  const fromEnabled = list.filter(a => (a.realm || 'intl') === cur && a.enabled).length;
-  let why;
-  if(!list.length) why = '原因待定（账号列表尚未加载）';
-  else if(fromEnabled === 0) why = '原因：' + nameOf(cur) + ' 没有可用账号（启用 0 个）';
-  else why = '原因：' + nameOf(cur) + ' 没有该模型（面板侧看不到别区模型清单，无法进一步细分）';
-  return { switched: true, head: '本次实际出口：' + nameOf(to) + '（自动换区）',
-           detail: '默认出口是 ' + nameOf(cur) + '，本次被自动改走；' + why };
+  if(newest.realm_reason){
+    const why = WHY[newest.realm_reason] || ('后端原因码 ' + newest.realm_reason);
+    return { tone: 'warn', head: '最近一次对话（' + at + '）走了 ' + nameOf(newest.realm) + '：被自动换区',
+             detail: '原因：' + why + '；' + scope };
+  }
+  const never = (switchedCount === 0 && knownCount === list.length);
+  return { tone: 'dim', head: '最近一次对话（' + at + '）走了 ' + nameOf(newest.realm) + '：未换区',
+           detail: (never
+             ? '本页 ' + list.length + ' 条样本里没有出现过自动换区（「从没换过」的完整历史要看 usage 行累计，这里只代表当前样本）'
+             : '本页样本里有 ' + switchedCount + ' 条被自动换过区，最近这一条没有') + '；' + scope };
 }
 function renderRealmMode(){
   const st = window.REALM_STATE || {};
@@ -979,9 +995,9 @@ function renderRealmMode(){
 function renderRealmActual(){
   const el = document.getElementById('realmActual');
   if(!el) return;
-  const note = realmActualNote(window.LAST_REALM_SEEN, window.REALM_STATE, window.ACCOUNTS);
+  const note = realmActualNote((RECENT_SNAPSHOT || {}).rows, window.REALM_STATE);
   el.innerHTML = '<b>' + esc(note.head) + '</b>' + (note.detail ? '<br>' + esc(note.detail) : '');
-  el.style.color = note.switched ? 'var(--warn)' : 'var(--dim)';
+  el.style.color = (note.tone === 'warn') ? 'var(--warn)' : 'var(--dim)';
 }
 async function setGatewayRealm(realm){
   try {
@@ -1342,7 +1358,14 @@ function renderAvailableModels(){
     }
 
     // 5. 模型 ID：官方模型名（唯一填写值）+ 未开通套餐的官方原因 + 官方介绍
-    const idLines = ['<div><b>' + esc(m.id) + '</b></div>'];
+    // #26 步4：单区独有的模型才给这个字段（双区都有的不给，避免把「都能用」误标成独占）
+    const excl = (m.realm_exclusive === 'intl' || m.realm_exclusive === 'cn') ? m.realm_exclusive : null;
+    const exclBadge = excl
+      ? ' <span class="' + (excl === 'intl' ? 'realm-badge-intl' : 'realm-badge-cn') + '" style="font-size:10px" title="'
+        + esc('该模型只在' + (excl === 'intl' ? '国际版' : '国内版') + '提供：默认出口在另一区时会被自动路由改走（未开自动路由则该请求不可用）')
+        + '">仅' + (excl === 'intl' ? '国际版' : '国内版') + '</span>'
+      : '';
+    const idLines = ['<div><b>' + esc(m.id) + '</b>' + exclBadge + '</div>'];
     if(m.enabled === false){
       const reason = m.disabled_reason || '需要升级或购买千问官方套餐开放';
       idLines.push('<div style="margin-top:3px"><span class="badge warn" title="' + esc(reason)
@@ -1888,11 +1911,8 @@ async function getJSON(url){
   const r = await fetch(url, {cache:'no-store', headers: authHeaders()});
   await throwPanelAuthError(r);
   if(!r.ok) throw new Error(r.status);
-  // #26：顺手抓「本次实际出口」。后端只在真的带区时才回这个头，没有 = 本次未换区（绝不假造）
-  try {
-    const rz = (r.headers && r.headers.get) ? r.headers.get('X-Qoder-Realm') : null;
-    if(rz){ window.LAST_REALM_SEEN = { realm: rz, url: url, at: Date.now() }; renderRealmActual(); }
-  } catch(e) {}
+  // #26 契约冻结：出口相关的响应头只在 chat 类请求且自动换区时出现，管理端点永不带（读到只会是旧进程残留），
+  // 因此这里**不再读任何响应头**；面板改从 usage 行读「最近一次对话的出口」（realm + realm_reason）。
   return r.json();
 }
 async function postJSON(url, body){
@@ -2570,6 +2590,13 @@ function keyDisplay(id){
   }
   return { label: esc(hit.name || '未命名'), sub: esc(short), cls: '', title: 'Key 标识 ' + esc(raw) };
 }
+// usage 行的区域：**确定值**（落盘时就写了，不是推断）。这一列逐请求、来自 usage 行；
+// 网关卡片那条「最近一次对话的出口」与本列**同源**（也读 usage 行）——响应头那条数据源已按契约切断。
+function realmBadgeOf(realm){
+  if(realm === 'intl') return '<span class="realm-badge-intl" style="font-size:10px">国际版</span>';
+  if(realm === 'cn') return '<span class="realm-badge-cn" style="font-size:10px">国内版</span>';
+  return '<span style="color:var(--dim)" title="该行没有记录区域（旧行或未落盘）">—</span>';
+}
 function keyCell(r){
   const d = keyDisplay(r.key_id);
   if(d.cls) return '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>';
@@ -2779,13 +2806,14 @@ async function refreshInner(){
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
   document.getElementById('recent').innerHTML = rows.length ?
-    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
+    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model) + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
         + '<td style="text-align:left;white-space:nowrap">' + effortCell(r) + '</td>'
+        + '<td style="text-align:center;white-space:nowrap">' + realmBadgeOf(r.realm) + '</td>'
         + '<td><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td>' + (r.error ? '<span class="badge bad">失败</span>' : (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—')) + '</td>'
         + '<td>' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
@@ -2798,6 +2826,7 @@ async function refreshInner(){
       + '</tr>').join('') + '</tbody></table>'
     : '<div class="empty">还没有请求记录</div>';
   renderEffortByKey();   // 样本变了就重算档位分布
+  renderRealmActual();   // #26：卡片「最近一次对话的出口」也读这批 usage 行（不再依赖响应头）
 }
 
 (async function initDashboard(){

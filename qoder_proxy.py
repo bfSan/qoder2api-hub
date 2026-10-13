@@ -54,7 +54,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.3.6"
+VERSION = "1.3.7"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -514,7 +514,7 @@ def row_matches_realm(row, realm):
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
                  gen_ms=None, fp=None, account=None, effort=None,
-                 effort_requested=None, key_id=None):
+                 effort_requested=None, key_id=None, realm_reason=None):
     """Accumulate stats, append a JSONL row, and persist the summary.
 
     P1-3（推理档位审计 + key 归属）：后三个参数都是**可选**的，旧调用路径不传
@@ -554,6 +554,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     if key_id:
         # 只记 key 的**标识**（panel 分配的 id / legacy / launcher），绝无明文 key。
         row["key_id"] = str(key_id)
+    if realm_reason is not None:
+        # #26：本次是否**自动换区**及原因（持久化，面板不依赖响应头即可读到）。
+        #   "model_missing" 当前区官方清单里没有这个模型（独占表 / 清单驱动）
+        #   "no_account"    模型本区有（或无法判断），是账号可用性把它推走的
+        #   ""（空串）      本次**没有换区**（正常路径）
+        #   键不存在        该行产生于本字段上线前（旧行）—— 与「没换区」明确区分
+        row["realm_reason"] = str(realm_reason)
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
     if gen_ms and gen_ms > 0:
@@ -5991,6 +5998,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # #26：每个请求入口清空「本次实际出口」标注。self 在 keep-alive 连接上是
+        # **复用**的，不清空的话后续非 chat 端点（/v1/models、/usage/*、/realm）
+        # 会带回上一次 chat 的残留值 —— 那会让面板把「上一次的出口」当成「本次的」。
+        self.realm_used = ""
+        self.realm_reason = ""
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -6986,7 +6998,8 @@ class Handler(BaseHTTPRequestHandler):
                                  fp=fp, account=account.uid,
                                  effort=usage_ctx.get("effort"),
                                  effort_requested=usage_ctx.get("effort_requested"),
-                                 key_id=self._key_id_for_usage())
+                                 key_id=self._key_id_for_usage(),
+                                 realm_reason=usage_ctx.get("realm_reason", ""))
                     return
                 except UpstreamStatus as exc:
                     # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
@@ -7010,7 +7023,8 @@ class Handler(BaseHTTPRequestHandler):
                              fp=fp, account=account.uid,
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             realm_reason=usage_ctx.get("realm_reason", ""))
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
@@ -7033,7 +7047,8 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         realm_reason=usage_ctx.get("realm_reason", ""))
             return self._json(200, result)
 
     def _handle_responses(self, payload):
@@ -7130,7 +7145,8 @@ class Handler(BaseHTTPRequestHandler):
                                          fp=fp, account=account.uid,
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
-                                         key_id=self._key_id_for_usage())
+                                         key_id=self._key_id_for_usage(),
+                                         realm_reason=usage_ctx.get("realm_reason", ""))
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -7198,7 +7214,8 @@ class Handler(BaseHTTPRequestHandler):
                              fp=fp, account=account.uid,
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             realm_reason=usage_ctx.get("realm_reason", ""))
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
@@ -7221,10 +7238,15 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         realm_reason=usage_ctx.get("realm_reason", ""))
             return self._json(200, result)
 
     def do_POST(self):
+        # #26：同 do_GET —— 每次请求入口清空，避免 keep-alive 复用实例时把上一次
+        # chat 的出口/原因带到别的响应上。
+        self.realm_used = ""
+        self.realm_reason = ""
         path = self.path.split("?")[0]
         if path == "/settings/save":
             if not self._panel_ok():
@@ -7360,7 +7382,8 @@ class Handler(BaseHTTPRequestHandler):
                                          fp=fp, account=account.uid,
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
-                                         key_id=self._key_id_for_usage())
+                                         key_id=self._key_id_for_usage(),
+                                         realm_reason=usage_ctx.get("realm_reason", ""))
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -7428,7 +7451,8 @@ class Handler(BaseHTTPRequestHandler):
                              fp=fp, account=account.uid,
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
-                             key_id=self._key_id_for_usage())
+                             key_id=self._key_id_for_usage(),
+                             realm_reason=usage_ctx.get("realm_reason", ""))
                 return
             try:
                 result, account = aggregate_with_envelope_retry(
@@ -7460,7 +7484,8 @@ class Handler(BaseHTTPRequestHandler):
                          fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
-                         key_id=self._key_id_for_usage())
+                         key_id=self._key_id_for_usage(),
+                         realm_reason=usage_ctx.get("realm_reason", ""))
             return self._json(200, result)
 
 
