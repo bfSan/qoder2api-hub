@@ -308,6 +308,12 @@ a:hover{text-decoration:underline}
         <span id="gatewayDot" class="dot" style="width:9px;height:9px"></span>
         <span id="activeGatewayName" style="font-size:20px;font-weight:700;color:var(--accent);letter-spacing:-.4px">国际版 (Global)</span>
       </div>
+      <div id="realmModeBar" style="display:flex;gap:4px;margin:4px 0 8px;flex-wrap:wrap">
+        <button class="range-btn" id="realmModeAuto" onclick="setRealmMode('auto')">自动</button>
+        <button class="range-btn" id="realmModeCn" onclick="setRealmMode('cn')">锁定国内</button>
+        <button class="range-btn" id="realmModeIntl" onclick="setRealmMode('intl')">锁定国际</button>
+      </div>
+      <div id="realmActual" style="font-size:11px;color:var(--dim);margin:0 0 8px;line-height:1.5">本次实际出口：—</div>
       <div style="margin-top:auto">
         <button class="toggle-realm-btn" id="btnToggleRealm" onclick="toggleActiveGatewayRealm()" style="cursor:pointer;width:100%;padding:7px 12px;font-size:12px">
           ⇄ 切换默认出口为【国内版】
@@ -924,6 +930,83 @@ window.VIEW_REALM = "intl";
 window.MODELS_DATA = [];
 window.ACCOUNTS = [];
 
+/* ---- #26 自动路由：三态开关 + 本次实际出口 ----
+   隐式行为必须可见：自动换区是后台替用户做的决定，所以必须显示出来（响应头 X-Qoder-Realm → 界面）。
+   三态：auto（由环境变量控制，只能展示、不能在线改）/ cn / intl（显式锁定默认出口）。 */
+function realmModeOf(state){
+  const s = state || {};
+  if(s.auto_enabled) return 'auto';
+  return (s.current === 'cn') ? 'cn' : 'intl';
+}
+// 实际出口文案：**有头 = 这次被自动换区**；**无头 = 没换**（按默认出口显示，绝不假造一个「当前区」指示）
+function realmActualNote(seen, state, accounts){
+  const s = state || {};
+  const cur = s.current || 'intl';
+  const nameOf = r => (r === 'cn' ? '国内版' : (r === 'intl' ? '国际版' : (r || '未知')));
+  if(!seen || !seen.realm){
+    return { switched: false, head: '本次实际出口：未观察到换区',
+             detail: '按默认出口「' + nameOf(cur) + '」；后端只在真的带区时才回 X-Qoder-Realm 头，没有该头就是没换' };
+  }
+  const to = seen.realm;
+  if(to === cur){
+    return { switched: false, head: '本次实际出口：' + nameOf(to) + '（与默认出口一致）', detail: '' };
+  }
+  // 为什么会换：面板侧只有两类证据可判——账号可用性（本机能查）与模型可用性（本机查不到别区清单）
+  const list = Array.isArray(accounts) ? accounts : [];
+  const fromEnabled = list.filter(a => (a.realm || 'intl') === cur && a.enabled).length;
+  let why;
+  if(!list.length) why = '原因待定（账号列表尚未加载）';
+  else if(fromEnabled === 0) why = '原因：' + nameOf(cur) + ' 没有可用账号（启用 0 个）';
+  else why = '原因：' + nameOf(cur) + ' 没有该模型（面板侧看不到别区模型清单，无法进一步细分）';
+  return { switched: true, head: '本次实际出口：' + nameOf(to) + '（自动换区）',
+           detail: '默认出口是 ' + nameOf(cur) + '，本次被自动改走；' + why };
+}
+function renderRealmMode(){
+  const st = window.REALM_STATE || {};
+  const mode = realmModeOf(st);
+  [['auto', 'realmModeAuto'], ['cn', 'realmModeCn'], ['intl', 'realmModeIntl']].forEach(pair => {
+    const el = document.getElementById(pair[1]);
+    if(el) el.classList.toggle('active', pair[0] === mode);
+  });
+  const bar = document.getElementById('realmModeBar');
+  if(bar){
+    const env = st.auto_env || 'QD_AUTO_REALM';
+    bar.title = st.auto_enabled
+      ? ('自动路由已开启（环境变量 ' + env + '）：当前区缺模型或没有可用账号时会自动换区；改这个开关要重启网关，面板只展示状态')
+      : ('未开启自动路由：恒用锁定出口；要开启需设置环境变量 ' + env + ' 并重启网关');
+  }
+}
+function renderRealmActual(){
+  const el = document.getElementById('realmActual');
+  if(!el) return;
+  const note = realmActualNote(window.LAST_REALM_SEEN, window.REALM_STATE, window.ACCOUNTS);
+  el.innerHTML = '<b>' + esc(note.head) + '</b>' + (note.detail ? '<br>' + esc(note.detail) : '');
+  el.style.color = note.switched ? 'var(--warn)' : 'var(--dim)';
+}
+async function setGatewayRealm(realm){
+  try {
+    const res = await postJSON('/realm', {realm: realm});
+    window.ACTIVE_GATEWAY_REALM = res.current || realm;
+    window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
+    toast('默认出口已设为: ' + (window.ACTIVE_GATEWAY_REALM === 'intl' ? '国际版' : '国内版'));
+    window.updateUI();
+    await loadAccounts();
+    await loadModels();
+    await refresh();
+  } catch(e) {
+    toast('切换失败: ' + e.message, 'bad');
+  }
+}
+function setRealmMode(mode){
+  const st = window.REALM_STATE || {};
+  if(mode === 'auto'){
+    toast('自动路由由环境变量 ' + (st.auto_env || 'QD_AUTO_REALM') + ' 控制，改动需要重启网关；面板只展示当前状态', 'warn');
+    return;
+  }
+  if(st.auto_enabled) toast('自动路由已开启：锁定只改默认出口，当前区缺模型/无可用账号时仍会自动换区', 'warn');
+  setGatewayRealm(mode);
+}
+
 function updateUI(){
   const isIntlView = (window.VIEW_REALM === "intl");
   const tIntl = document.getElementById("tabIntl");
@@ -999,6 +1082,8 @@ function updateUI(){
   if(elCnCred) elCnCred.textContent = hasCnCred ? fmt(cnCred) : "—";
   const elCnAcct = document.getElementById("tabCnAccts");
   if(elCnAcct) elCnAcct.textContent = cnAccts.length;
+  renderRealmMode();      // #26：自动 / 锁定国内 / 锁定国际 三态
+  renderRealmActual();    // #26：本次实际出口（有头=换过，无头=没换）
 };
 
 // —— 项目新版本检测（运行信息卡片；自动检查一次 + 手动「立即检查」）——
@@ -1075,25 +1160,18 @@ async function switchViewRealm(r){
 };
 
 async function toggleActiveGatewayRealm(){
-  const next = (window.ACTIVE_GATEWAY_REALM === "intl" ? "cn" : "intl");
-  try {
-    const res = await postJSON("/realm", {realm: next});
-    window.ACTIVE_GATEWAY_REALM = res.current || next;
-    toast("网关默认上游已切换并永久保存为: " + (window.ACTIVE_GATEWAY_REALM === "intl" ? "国际版" : "国内版"));
-    window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
-    window.updateUI();
-    await loadAccounts();
-    await loadModels();
-    await refresh();
-  }catch(e){
-    toast("切换失败: " + e.message, "bad");
-  }
+  // 保留原按钮：仍是对调两区（实现委托给 setGatewayRealm，避免两份切换逻辑）
+  return setGatewayRealm(window.ACTIVE_GATEWAY_REALM === "intl" ? "cn" : "intl");
 };
 
 async function initRealm(preserveView){
   try{
     const r = await getJSON("/realm");
     if(r && r.current) window.ACTIVE_GATEWAY_REALM = r.current;
+    // #26：auto_enabled 来自环境变量（只读展示）；current 是锁定生效值
+    window.REALM_STATE = { current: (r && r.current) || window.ACTIVE_GATEWAY_REALM,
+                           auto_enabled: !!(r && r.auto_enabled),
+                           auto_env: (r && r.auto_env) || "QD_AUTO_REALM" };
   } catch(e){}
   // preserveView=true：只同步"网关默认出口"，**不动用户当前正在看的视图**
   // （此前 doCheckin 等动作后会调用本函数，导致视图被重置回网关默认区，
@@ -1810,6 +1888,11 @@ async function getJSON(url){
   const r = await fetch(url, {cache:'no-store', headers: authHeaders()});
   await throwPanelAuthError(r);
   if(!r.ok) throw new Error(r.status);
+  // #26：顺手抓「本次实际出口」。后端只在真的带区时才回这个头，没有 = 本次未换区（绝不假造）
+  try {
+    const rz = (r.headers && r.headers.get) ? r.headers.get('X-Qoder-Realm') : null;
+    if(rz){ window.LAST_REALM_SEEN = { realm: rz, url: url, at: Date.now() }; renderRealmActual(); }
+  } catch(e) {}
   return r.json();
 }
 async function postJSON(url, body){

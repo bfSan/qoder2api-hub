@@ -54,7 +54,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -162,14 +162,79 @@ def validate_public_http_url(url, allow_local=False):
     return url
 
 
+# 双区自动路由（#26 步1/步2）：默认开启。**显式指定永远优先** —— 本开关只作用于
+# 「用户没指定区域」时的兜底路径（?realm= / Key 绑定 / X-Realm 任一存在时都不会走到这里）。
+AUTO_REALM_ENABLED = os.environ.get("QD_AUTO_REALM", "1").lower() not in (
+    "0", "false", "no", "off")
+
+
 def detect_model_realm(model_id):
-    """模型 -> 出口区域。区域独占模型强制路由到其归属出口，其余跟随全局开关。"""
+    """模型 -> 出口区域（**纯数据判断，不查账号可用性**）。
+
+    优先级：区域独占硬表 > 清单驱动自动路由（步1）> 全局开关。
+    清单驱动只在「该模型只在一个区域存在」时换区；双区都有的模型维持当前区
+    （判不出就不猜 —— 双区同名模型物理上无法靠名字区分，见评估 §2）。
+    账号可用性不在这里判（那会污染 row_matches_realm 等纯统计路径），
+    由 fallback_realm_by_accounts() 在选号前单独做（步2）。
+    """
     owner = exclusive_realm(model_id)
     if owner:
         return owner
     if not model_id:
         return CURRENT_REALM
+    if AUTO_REALM_ENABLED:
+        realm, reason = qoder_catalog.auto_realm_for_model(model_id, CURRENT_REALM)
+        if realm:
+            log("auto realm switch: %s (model=%r, current=%s -> %s)"
+                % (reason, model_id, CURRENT_REALM, realm), tag="realm")
+            return realm
     return CURRENT_REALM
+
+
+def auto_realm_reason(model, realm):
+    """本次自动换区的**确定性**原因（给面板显示结论，不让它自己推断）。
+
+      model_missing  当前区的官方清单里没有这个模型（独占表与清单驱动都归此类）
+      no_account     模型本身在当前区有（或无法判断），是账号可用性把我们推过去的
+    用同一份数据源复算（catalog 的 auto_realm_for_model），与 detect_model_realm
+    同源，不做二次猜测。
+    """
+    try:
+        hint, _why = qoder_catalog.auto_realm_for_model(model, CURRENT_REALM)
+        if hint == realm:
+            return "model_missing"
+    except Exception:
+        pass
+    return "no_account"
+
+
+def fallback_realm_by_accounts(realm, model):
+    """步2：当前区**一个可用账号都没有**时回退另一区（判不出就维持现状）。
+
+    只在未显式指定区域时被调用（open_upstream 内）。判据三段：
+      当前区 count_ready > 0        -> 不动
+      当前区 == 0 且 另一区 > 0     -> 换区（打日志）
+      两区都是 0 / 异常 / 无池      -> 不动（交给既有错误路径，不猜）
+    """
+    if not AUTO_REALM_ENABLED or POOL is None:
+        return realm
+    if realm != CURRENT_REALM:
+        # **模型归属优先于账号可用性**：realm 已被模型规则（独占表/清单驱动）推走，
+        # 说明当前区根本没有这个模型；此时再按账号把请求换回去，只会打到
+        # 「没有这个模型」的上游。停在目标区、由选号给出「无可用账号」的明确错误
+        # 才是正确行为。
+        return realm
+    try:
+        if POOL.count_ready(realm, model=model or None) > 0:
+            return realm
+        other = "intl" if realm == "cn" else "cn"
+        if POOL.count_ready(other, model=model or None) > 0:
+            log("auto realm switch (no ready account): realm %s has no usable "
+                "account for %r -> %s" % (realm, model or "?", other), tag="realm")
+            return other
+    except Exception as exc:
+        log("auto realm fallback skipped: %s" % exc, level="WARN")
+    return realm
 
 
 # 目前双区模型清单不同（源自官方 catalog 快照差集），独占表给区域特供模型。
@@ -1920,6 +1985,24 @@ def fetch_models(realm=None):
     return entries
 
 
+def fetch_models_merged():
+    """#26 步4：两区并集，逐条附区域标注。返回 [(mid, meta, realm)]。
+
+    同一上游 key 在两区都有的**只保留一条**（当前区优先），避免客户端看到
+    重复 id；顺序为「当前区在前 + 各自清单顺序」。
+    """
+    out = []
+    seen = set()
+    cur = CURRENT_REALM if CURRENT_REALM in ("cn", "intl") else "cn"
+    for r in (cur, "intl" if cur == "cn" else "cn"):
+        for mid, meta in fetch_models(realm=r):
+            if mid in seen:
+                continue
+            seen.add(mid)
+            out.append((mid, meta, r))
+    return out
+
+
 def read_dynamic_models(realm=None):
     """COSY 签名拉取 /algo/api/v2/model/list（chat scene）。失败返回 []。
 
@@ -2014,7 +2097,7 @@ def off_peak_active_now(window_start, window_end, tz=None, now=None):
     return cur >= s or cur < e      # 跨午夜窗口（22:00-08:00）
 
 
-def model_entry(mid, meta):
+def model_entry(mid, meta, realm=None):
     """Build a rich /v1/models entry.
 
     - `id` = **官方模型名 display_name**（如 `Qwen3.8-Max`）——客户端唯一需要
@@ -2041,6 +2124,17 @@ def model_entry(mid, meta):
         "enabled": meta.get("enable", True) is not False,
     }
     item["name"] = display_name
+    if realm:
+        # #26 步4：该条来自哪个区域（默认单区视图也带，便于面板/客户端标注）
+        item["realm"] = realm
+        try:
+            _span = qoder_catalog.key_realm_span(mid)
+            if len(_span) == 1:
+                # 只在**一个**区域存在（如仅 intl 的 Sonus）—— 面板据此打「仅国际版」角标；
+                # 双区都有的不给该字段（避免把「都能用」误标成独占）。
+                item["realm_exclusive"] = _span[0]
+        except Exception:
+            pass
     # 描述：来源自带动态/本地 description，否则取官方桌面版文案
     desc = meta.get("description") or ""
     if not desc:
@@ -4110,8 +4204,18 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
       - 其他 4xx（含客户端参数错）-> 快速失败，冷却换号，不重试
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
-    realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
+    realm = target_realm or detect_model_realm(model) or CURRENT_REALM
+    if not target_realm:
+        # 步2：只在**用户没显式指定**时，按账号可用性兜底换区
+        realm = fallback_realm_by_accounts(realm, model)
+        if realm != CURRENT_REALM:
+            # #26：换区可见（覆盖所有自动路径：独占表 / 清单驱动 / 账号回退）
+            log("request routed to realm %s (default=%s, model=%r)"
+                % (realm, CURRENT_REALM, model), tag="realm")
+            if usage_ctx is not None:
+                # 确定性原因 → 面板直接显示，不必自己推断
+                usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
     model_key = qoder_catalog.resolve_upstream_key(model, realm=realm)
 
     representative = POOL.pick(realm=realm) if POOL else None
@@ -4122,6 +4226,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         usage_ctx["effort_requested"] = requested_effort(payload)
         usage_ctx["effort"] = (body_obj.get("parameters") or {}).get(
             "reasoning_effort")
+        # #26：本次实际出口（自动路由后可能与请求开始时不同）—— 调用方据此
+        # 在响应头/日志里对用户可见，也让 usage 行与真实出账区一致。
+        usage_ctx["realm"] = realm
     encoded = qoder_encode(json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
 
     if not session_key:
@@ -5624,6 +5731,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Transfer-Encoding", "chunked")
+        realm_used = getattr(self, "realm_used", "") or ""
+        if realm_used:
+            # #26：流式响应同样标注实际出口 + 原因
+            self.send_header("X-Qoder-Realm", realm_used)
+            realm_reason = getattr(self, "realm_reason", "") or ""
+            if realm_reason:
+                self.send_header("X-Qoder-Realm-Reason", realm_reason)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -5659,6 +5773,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        realm_used = getattr(self, "realm_used", "") or ""
+        if realm_used:
+            # #26：本次**实际出口**（自动路由后可能与请求开始时不同）
+            self.send_header("X-Qoder-Realm", realm_used)
+            realm_reason = getattr(self, "realm_reason", "") or ""
+            if realm_reason:
+                self.send_header("X-Qoder-Realm-Reason", realm_reason)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -5941,8 +6062,12 @@ class Handler(BaseHTTPRequestHandler):
                 })
             return self._json(200, info)
         if path == "/realm":
+            # #26：面板需要知道「自动路由是否开着」——mode 由 auto_enabled + current
+            # 推导：自动开 = 未显式指定时会按模型/账号可用性兜底换区；否则恒用 current。
             return self._json(200, {"current": CURRENT_REALM,
-                                    "options": ["intl", "cn"]})
+                                    "options": ["intl", "cn"],
+                                    "auto_enabled": bool(AUTO_REALM_ENABLED),
+                                    "auto_env": "QD_AUTO_REALM"})
         if path in ("/v1/models", "/models"):
             if not self._authorized():
                 return
@@ -5951,7 +6076,19 @@ class Handler(BaseHTTPRequestHandler):
                 entries = fetch_models(realm=req_realm)
             except Exception as exc:
                 return self._error(502, str(exc))
-            data = [model_entry(mid, meta) for mid, meta in entries]
+            merge = str((query.get("merge_realms") or [""])[0]).lower() in (
+                "1", "true", "yes", "on")
+            if merge:
+                # #26 步4：两区并集（**opt-in**）。默认必须保持单区视图 ——
+                # 否则 _verify_models 与既有客户端会看到「多出来的」别区模型。
+                merged = fetch_models_merged()
+                data = [model_entry(mid, meta, realm=r)
+                        for mid, meta, r in merged]
+                return self._json(200, {"object": "list", "data": data,
+                                        "realm": "all", "merged": True,
+                                        "realms": ["cn", "intl"]})
+            data = [model_entry(mid, meta, realm=req_realm)
+                    for mid, meta in entries]
             try:
                 catalog_source = qoder_catalog.snapshot_source(req_realm)
             except Exception as exc:   # 只读探针：失败也不能拖垮模型列表
@@ -6793,6 +6930,9 @@ class Handler(BaseHTTPRequestHandler):
             upstream, account, _ = open_upstream(
                 chat_req, session_key=session_key, target_realm=req_realm,
                 usage_ctx=usage_ctx)
+            # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))
@@ -6920,6 +7060,9 @@ class Handler(BaseHTTPRequestHandler):
             upstream, account, _ = open_upstream(
                 chat_req, session_key=session_key, target_realm=req_realm,
                 usage_ctx=usage_ctx)
+            # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             t = time.time() - t_start
             record_error(model, 429, exc.detail[:200],
@@ -7153,6 +7296,9 @@ class Handler(BaseHTTPRequestHandler):
             upstream, account, _ = open_upstream(payload, session_key=session_key,
                                                  target_realm=req_realm,
                                                  usage_ctx=usage_ctx)
+            # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
                          elapsed_ms=int((time.time() - t_start) * 1000))

@@ -1787,6 +1787,74 @@ def official_local_name(key):
 # 对外接线示例（一行，由 qoder_proxy 侧负责；本模块不反向依赖它）：
 #   resp["catalog_source"] = qoder_catalog.snapshot_source(req_realm)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 双区自动路由的数据判断（步1 · 纯数据、无账号依赖、无网络）
+#
+# 供 qoder_proxy.detect_model_realm 调用：**只在能明确判断时**给出目标区域。
+# 判不出的情况一律返回 None —— 双区同名的模型物理上无法靠名字区分（评估 §2），
+# 猜错比不猜更糟。
+# ---------------------------------------------------------------------------
+_AUTO_REALM_INDEX = {}      # realm -> {key: meta}（清单随加载期快照固定，惰性建一次）
+
+
+def _realm_index(realm):
+    idx = _AUTO_REALM_INDEX.get(realm)
+    if idx is None:
+        idx = {}
+        for m in models_for_realm(realm):
+            k = m.get("key")
+            if k:
+                idx[k] = m
+        _AUTO_REALM_INDEX[realm] = idx
+    return idx
+
+
+def realm_keys(realm):
+    """该区域官方清单的 key 集合（只读，带惰性缓存）。"""
+    return set(_realm_index(realm))
+
+
+def key_realm_span(key):
+    """该上游 key 出现在哪些区域，如 ('cn',) / ('intl',) / ('cn', 'intl')。"""
+    return tuple(r for r in ("cn", "intl") if key in _realm_index(r))
+
+
+def auto_realm_for_model(model_id, current_realm):
+    """步1：模型只在一个区域存在时，给出该区域。返回 (realm|None, reason)。
+
+    规则（**判得出才动**）：
+      1) 解析成上游 key 后，key 只在一个区域存在 -> 用那个区域；
+      2) key 在两个区域都存在，但两区的官方 display_name **不同**
+         （同 key 不同型号，例如 mmodel：cn=MiniMax-M2.7 / intl=MiniMax-M3）
+         -> **不猜**，返回 None（这类模型名字无法表达区域，误导比不路由更糟）；
+      3) 其余（双区同名同型号、解析不出 key）-> None，维持现状。
+    """
+    if not model_id:
+        return None, ""
+    try:
+        key = resolve_upstream_key(model_id)
+    except Exception:
+        return None, ""
+    if not key:
+        return None, ""
+    span = key_realm_span(key)
+    cur = current_realm if current_realm in ("cn", "intl") else "cn"
+    if len(span) == 1:
+        only = span[0]
+        if only != cur:
+            return only, "model key '%s' exists only in %s" % (key, only)
+        return None, ""
+    if len(span) == 2:
+        names = {(_realm_index(r)[key].get("display_name") or "") for r in span}
+        if len(names) > 1:
+            return None, ("same key '%s' maps to different models per realm "
+                          "(cn=%s / intl=%s) - not guessing"
+                          % (key,
+                             _realm_index("cn").get(key, {}).get("display_name"),
+                             _realm_index("intl").get(key, {}).get("display_name")))
+    return None, ""
+
+
 def snapshot_source(realm):
     """该区域快照的**实际**来源（只读）。
 

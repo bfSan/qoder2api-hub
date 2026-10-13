@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.5-2496ED?style=flat-square" alt="Version 1.3.5">
+  <img src="https://img.shields.io/badge/Release-v1.3.6-2496ED?style=flat-square" alt="Version 1.3.6">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -451,6 +451,39 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.3.6
+
+**✨ 新增功能**
+
+**① 双区自动路由（#26）** —— 不用再手动切面板：
+- **模型独占时自动试另一区**：某模型只在一个区有的（7 个 —— `gm51model` / `q37fmodel` 仅国内，`cmodel` / `efficient` / `performance` / `smodel` / `ultimate` 仅国际）会自动改用那个区；
+- **无可用账号时回退另一区**；
+- **面板三态开关**：自动 / 锁定国内 / 锁定国际（「自动」由 `QD_AUTO_REALM` 控制、改它需重启；锁定走既有的区域切换）；
+- **本次实际出口可见**：换区时响应带 `X-Qoder-Realm` 与原因 `X-Qoder-Realm-Reason: model_missing | no_account`，面板据此显示「这次实际走了哪个区、为什么」；
+- **`/v1/models?merge_realms=1`**：两区并集视图（含区域标注与 `realm_exclusive`），**opt-in** —— 默认仍是单区视图。
+
+**边界与原则（重要）**
+- **显式优先**：`?realm=` / Key 绑定 / `X-Realm` **永远优先于自动路由**，自动只在用户没指定时兜底；
+- **判得出才动**：只在「模型独占」或「当前区无可用账号」时换区，判不出就维持现状；
+- **MiniMax 那两个是数据驱动排除**（同 key 两区型号不同即不猜），**不是硬编码黑名单** —— 未来同类模型自动覆盖；
+- **跨区会断会话亲和** —— 这是**接受的**：那两种情形下当前区本来就没有可用的亲和目标，解绑的是一条已失效绑定；
+- **不违反限额护栏**：护栏是账号级的，换区即换到另一个账号，它自己的阈值照常生效。
+
+**🐛 问题修复**
+- **路由规则叠加时的优先级错误**（本轮自查发现）：账号回退逻辑只看账号数，会把「**模型规则已经推走的区**」按账号**换回原区** —— 全局在 cn、请求仅 intl 有的模型、而 intl 恰好没号时，请求会被送回 cn，打到「没有这个模型」的上游，**用户看到的是语义错误而不是「没号」**。已修：**模型归属优先于账号可用性**。
+
+**🎨 体验优化**
+- **看板：自动换区与原因可见**（三态开关 + 「本次实际出口」），并严守一条原则：**只在真的抓到响应头时才说「自动换区」**；没抓到显示「未观察到换区」；有头但与默认出口一致时显示「（与默认出口一致）」—— **不给假指示**。
+
+**⚠️ 其他变更**
+- **`tests/_tools/` 进仓**：`dash_extract.js`（锚点缺失即抛 + 按函数做纯度检查）、`dep_scan.py`（迁移依赖扫描）+ 两个自测 —— 后来人可直接复用这些判断；
+- **`tests/README.md` 新增「基线数字（提交前核对用）」**：28 suites / 989 checks / 前端 89 / legacy 630，附提交前三步 —— 其中一条是「**用 `git add -A`，不要只用具体文件名**」（新增套件会被静默漏掉，表现是**全绿但总数变小**）。
+
+**验证**
+- **双入口全绿**：`python tests/run_all.py` → **28 suites / 989 checks / 0 failed**；`python _test_qoder.py` → **630 checks / 626 passed / 0 failed**；
+- **自动路由逐条实测**：7 个独占模型 **7/7** 正确、双区都有的 12 个 **12/12 保持当前区**、显式优先级**六条全对**、换区可见（日志 + 响应头）、并集 **19 条**去重正确；
+- **能红证据**：改动前那 7 个模型在当前区不可用（输出已留存）。
 
 ### v1.3.5
 
