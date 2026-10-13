@@ -2422,6 +2422,21 @@ def supported_efforts(meta):
     return [e for e in EFFORT_RANK if e in efforts]
 
 
+def catalog_meta_for(model_key, realm=None):
+    """按上游 key 取该模型在官方目录里的元数据（找不到返回 {}）。
+
+    Anthropic 入口在调用 qoder_anthropic.messages_to_chat 时需要一个 meta，
+    否则 effort_from_anthropic 取不到 supported 档位表 -> 思考档位被静默丢弃。
+    """
+    for m in qoder_catalog.models_for_realm(realm or CURRENT_REALM):
+        if m.get("key") == model_key:
+            return m
+    for m in qoder_catalog.STATIC_INTL_MODELS + qoder_catalog.STATIC_CN_MODELS:
+        if m.get("key") == model_key:
+            return m
+    return {}
+
+
 def default_effort(meta):
     """该模型的默认思考档位（is_default 标注项），无则取支持表中间档。"""
     tc = (meta or {}).get("thinking_config") or {}
@@ -6679,14 +6694,18 @@ class Handler(BaseHTTPRequestHandler):
         ok, problem = qoder_anthropic.validate_request(payload)
         if not ok:
             return self._error(400, problem, "invalid_request_error")
-        chat_req = qoder_anthropic.messages_to_chat(payload)
+        req_realm = self._request_realm() or CURRENT_REALM
+        model_hint = payload.get("model") or "auto"
+        model_key = qoder_catalog.resolve_upstream_key(model_hint, realm=req_realm)
+        # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
+        meta = catalog_meta_for(model_key, req_realm)
+        chat_req = qoder_anthropic.messages_to_chat(
+            payload, catalog_meta=meta, supported=supported_efforts(meta))
         model = chat_req.get("model") or payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
         fp = prompt_fingerprint(chat_req.get("messages"))
         t_start = time.time()
-        req_realm = self._request_realm() or CURRENT_REALM
-        model_key = qoder_catalog.resolve_upstream_key(model, realm=req_realm)
         # ---- 形态决策单点：在这里算唯一一次，随 chat_req 下传 ----
         chat_req["_qd_structured"] = structured_tool_history_enabled(
             model=model, model_key=model_key, realm=req_realm,
