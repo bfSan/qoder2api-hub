@@ -113,9 +113,12 @@ const authApi = new Function('fetch', 'authHeaders', 'panelNeedsLogin',
   check('读不到现有配置时**不发请求**（防止一次盲存把已有阈值覆盖成 0）',
     env.st.posted.length === 0 && env.st.btn.disabled === true);
 
+  // 指纹两行：**被测文件**与**套件自身**，各带 as-of（UTC）——并发编辑下先比时间戳，再谈要不要重跑
+  console.log('SUITE: ' + path.basename(__filename) + ' md5=' + require('crypto').createHash('md5').update(require('fs').readFileSync(__filename)).digest('hex'));
   console.log('FILE: ' + path.basename(path.join(ROOT, 'dashboard.html'))
     + ' md5=' + require('crypto').createHash('md5').update(html).digest('hex')
-    + ' bytes=' + html.length);
+    + ' bytes=' + Buffer.byteLength(html, 'utf8') + ' codeunits=' + html.length
+    + ' as-of=' + new Date().toISOString());
   console.log('');
   console.log('SUMMARY: TOTAL ' + (PASS + FAIL) + ' checks, ' + PASS + ' passed, ' + FAIL + ' failed');
   console.log('RESULT: ' + (FAIL ? 'RED' : 'GREEN') + ' (exit ' + (FAIL ? 1 : 0) + ')');

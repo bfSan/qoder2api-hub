@@ -98,10 +98,12 @@ check('恢复无过滤 → 从缓冲区重建出全部行（恰好一次重建�
 env.api.clear(); env.api.renderLogs();
 check('清空日志 → 回到空态占位', env.body.lines.length === 0 && env.body.empty === true);
 
-// 被测文件的指纹随日志一起打印：让「我跑的是哪一份」变成产物自带的证据（不靠人记）
+// 指纹两行：**被测文件**与**套件自身**，各带 as-of（UTC）——并发编辑下先比时间戳，再谈要不要重跑
+console.log('SUITE: ' + path.basename(__filename) + ' md5=' + require('crypto').createHash('md5').update(require('fs').readFileSync(__filename)).digest('hex'));
 console.log('FILE: ' + path.basename(path.join(ROOT, 'dashboard.html'))
   + ' md5=' + require('crypto').createHash('md5').update(html).digest('hex')
-  + ' bytes=' + html.length);
+  + ' bytes=' + Buffer.byteLength(html, 'utf8') + ' codeunits=' + html.length
+  + ' as-of=' + new Date().toISOString());
 console.log('');
 console.log('SUMMARY: TOTAL ' + (PASS + FAIL) + ' checks, ' + PASS + ' passed, ' + FAIL + ' failed');
 console.log('RESULT: ' + (FAIL ? 'RED' : 'GREEN') + ' (exit ' + (FAIL ? 1 : 0) + ')');
