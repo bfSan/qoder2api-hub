@@ -113,6 +113,9 @@ const authApi = new Function('fetch', 'authHeaders', 'panelNeedsLogin',
   check('读不到现有配置时**不发请求**（防止一次盲存把已有阈值覆盖成 0）',
     env.st.posted.length === 0 && env.st.btn.disabled === true);
 
+  console.log('FILE: ' + path.basename(path.join(ROOT, 'dashboard.html'))
+    + ' md5=' + require('crypto').createHash('md5').update(html).digest('hex')
+    + ' bytes=' + html.length);
   console.log('');
   console.log('SUMMARY: TOTAL ' + (PASS + FAIL) + ' checks, ' + PASS + ' passed, ' + FAIL + ' failed');
   console.log('RESULT: ' + (FAIL ? 'RED' : 'GREEN') + ' (exit ' + (FAIL ? 1 : 0) + ')');

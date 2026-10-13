@@ -84,6 +84,10 @@ const th = (RENDER.match(/<th[ >]/g) || []).length;
 const td = (RENDER.match(/<td[ >]/g) || []).length;
 check('档位分布表：表头列数 == 行内单元格列数（' + th + ' == ' + td + '）', th > 0 && th === td);
 
+// 被测文件的指纹随日志一起打印：让「我跑的是哪一份」变成产物自带的证据（不靠人记）
+console.log('FILE: ' + path.basename(path.join(ROOT, 'dashboard.html'))
+  + ' md5=' + require('crypto').createHash('md5').update(html).digest('hex')
+  + ' bytes=' + html.length);
 console.log('');
 console.log('SUMMARY: TOTAL ' + (PASS + FAIL) + ' checks, ' + PASS + ' passed, ' + FAIL + ' failed');
 console.log('RESULT: ' + (FAIL ? 'RED' : 'GREEN') + ' (exit ' + (FAIL ? 1 : 0) + ')');

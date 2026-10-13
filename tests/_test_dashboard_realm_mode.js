@@ -141,6 +141,10 @@ posted.length = 0;
 env.api.setRealmMode('cn');
 check('点「锁定国内」→ POST /realm {realm:"cn"}', posted.length === 1 && posted[0].url === '/realm' && posted[0].body.realm === 'cn');
 
+// 被测文件的指纹随日志一起打印：让「我跑的是哪一份」变成产物自带的证据（不靠人记）
+console.log('FILE: ' + path.basename(path.join(ROOT, 'dashboard.html'))
+  + ' md5=' + require('crypto').createHash('md5').update(html).digest('hex')
+  + ' bytes=' + html.length);
 console.log('');
 console.log('SUMMARY: TOTAL ' + (PASS + FAIL) + ' checks, ' + PASS + ' passed, ' + FAIL + ' failed');
 console.log('RESULT: ' + (FAIL ? 'RED' : 'GREEN') + ' (exit ' + (FAIL ? 1 : 0) + ')');

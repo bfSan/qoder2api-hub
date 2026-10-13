@@ -65,6 +65,10 @@ e = run({ mode: 'uid', energy: 0 });
 check('旧后端兼容：缺 credits_unknown 且 non-null → 走数字路径（不误判未知）',
   e.nrgBalance.textContent === '0' && !/未知/.test(e.nrgLabel.textContent));
 
+// 被测文件的指纹随日志一起打印：让「我跑的是哪一份」变成产物自带的证据（不靠人记）
+console.log('FILE: ' + path.basename(path.join(ROOT, 'dashboard.html'))
+  + ' md5=' + require('crypto').createHash('md5').update(html).digest('hex')
+  + ' bytes=' + html.length);
 console.log('');
 console.log('SUMMARY: TOTAL ' + (PASS + FAIL) + ' checks, ' + PASS + ' passed, ' + FAIL + ' failed');
 console.log('RESULT: ' + (FAIL ? 'RED' : 'GREEN') + ' (exit ' + (FAIL ? 1 : 0) + ')');
