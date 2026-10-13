@@ -49,6 +49,33 @@ def set_logger(fn):
 
 
 # ---------------------------------------------------------------------------
+# 账本健全性（#25）：把「未知」和「0」分开
+# ---------------------------------------------------------------------------
+# 上游对失效/无权益凭证会回一个退化 quota body：userQuota/addOnQuota 全 0（甚至缺键）
+# + isQuotaExceeded=true + expiresAt=CN 永不过期占位 253402214400。它**不是**「余额 0」，
+# 而是「这次没拿到可信余额」。本判定只做两件事：
+#   ① 防止把「未知」当成 0 参与任何计算（否则会误触发限额护栏、误拦账号）；
+#   ② 在看板/日志里如实标注未知，等下一次成功刷新再恢复。
+# 真正的「不覆盖健康快照」由 qoder_accounts.fetch_credits 侧守卫（见 #25 报告），
+# 本层**不做回写**，避免掩盖上游真实状态。
+LEDGER_NEVER_EPOCH = 253402214400
+
+
+def ledger_is_unknown(credits):
+    """True = 该账本是「未知」而非「0」（判定口径见上方注释，仅用于避免误用）。"""
+    if not isinstance(credits, dict):
+        return False
+    if credits.get("remain") or credits.get("size"):
+        return False
+    if not credits.get("exceeded"):
+        return False
+    try:
+        return int(credits.get("expires_at") or 0) >= LEDGER_NEVER_EPOCH
+    except (TypeError, ValueError):
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 单账号：状态聚合
 # ---------------------------------------------------------------------------
 def fetch_task_view(account):
@@ -138,7 +165,12 @@ def fetch_task_view(account):
         })
 
     # --- 额度卡片（energy -> 积分余额；travel -> 福利包状态） ---
-    if account.credits:
+    # #25：退化账本是「未知」而非 0 —— 不当作额度值展示，也不参与任何计算。
+    if ledger_is_unknown(account.credits):
+        summary["credits_unknown"] = True
+        summary["energy"] = None
+        summary["energy_note"] = "余额未知（上次刷新返回退化响应，等待下次成功刷新）"
+    elif account.credits:
         summary["energy"] = account.credits.get("remain", 0)
     elif credits_res.get("ok"):
         summary["energy"] = (account.credits or {}).get("remain", 0)
@@ -247,6 +279,9 @@ def _campaign_task_row(account, camp, summary):
               "id": c["campaign_id"],
               "action_type": c.get("action_type", ""),
               "claim_status": c.get("claim_status", ""),
+              # #25：行里必须带上奖励类型 —— 否则下游「Credits 类」判定永远看到
+              # 空串，会把券类活动也算进每日签到行（券类另有独立行）。
+              "benefit_kind": str((c.get("benefit") or {}).get("kind") or ""),
               "benefit_amount": (c.get("benefit") or {}).get("amount", 0),
               "start_at": c["start_at"],
               "end_at": c["end_at"]} for c in camp.get("campaigns") or []]
@@ -269,15 +304,43 @@ def _campaign_task_row(account, camp, summary):
             "reward_credit": 0,
             "reward_energy": 0,
         }
-    # 每日签到行只统计"可领取的 Credits 类"活动：券类由独立行呈现，
-    # VIEW_DETAILS（无奖励的详情活动，如首月翻倍）不算"签到奖励"
-    def _is_daily(c):
-        return (c.get("action_type") in ("", "CLAIM_BENEFIT")
-                and str((c.get("benefit") or {}).get("kind") or "").upper()
-                in ("", "CREDITS"))
+    # 每日签到行只统计 Credits 类活动：券类由独立行呈现。
+    # #25 起把「归类」与「领取」拆开（原实现把两者混在一个 action_type 过滤里）：
+    # 已领取后官方可能把该活动的 actionType 换成 VIEW_DETAILS，若在归类阶段就按
+    # action_type 过滤，已领事实会被丢掉，文案误报「暂无可领取」。
+    def _is_daily_reward(c):
+        """Credits 类**有奖励**的活动（归类用，不看 action_type）。
 
-    daily_items = [c for c in items if _is_daily(c)]
-    claimable = [c for c in daily_items if c["claim_status"] == "CLAIMABLE"]
+        纳入条件 = kind ∈ ("", "CREDITS") 且满足下面任一条：
+          · benefit_amount > 0 —— 有实际奖励；
+          · action_type ∈ ("", "CLAIM_BENEFIT") —— 旧口径，保持既有行为零变化。
+        为什么不用 action_type 单独判：#25 实测 intl 在已领取后会把该活动的
+        actionType 换成 VIEW_DETAILS；而真正的「详情类活动」特征是没有奖励
+        （amount == 0，见 _test_qoder.py:1546 的 act-detail 夹具）。用「金额 +
+        旧口径」的并集两头都对：已领后降级的 Credits 活动仍算「今日已领取」，
+        纯详情活动仍不进每日行，不带 action_type 的旧场景也不回退。
+        行内字段是 benefit_kind/benefit_amount（items 已扁平化）；喂原始活动
+        dict 的调用方回退读 benefit.kind。
+        """
+        kind = c.get("benefit_kind")
+        if kind is None:
+            kind = (c.get("benefit") or {}).get("kind")
+        if str(kind or "").upper() not in ("", "CREDITS"):
+            return False
+        try:
+            amount = float(c.get("benefit_amount") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        return amount > 0 or str(c.get("action_type") or "") in ("", "CLAIM_BENEFIT")
+
+    def _is_claimable_now(c):
+        """本轮能否真的领取：还要求 action_type ∈ ("", "CLAIM_BENEFIT")。"""
+        return (str(c.get("action_type") or "") in ("", "CLAIM_BENEFIT")
+                and _is_daily_reward(c))
+
+    daily_items = [c for c in items if _is_daily_reward(c)]
+    claimable = [c for c in daily_items
+                 if c["claim_status"] == "CLAIMABLE" and _is_claimable_now(c)]
     claimed = [c for c in daily_items if c["claim_status"] == "CLAIMED"]
     # 成就门控活动（如 CN 新人「奶茶免单卡」需先完成 sites_first_use）：
     # 服务端状态 ACHIEVEMENT_NOT_COMPLETED —— 显示成就要求，不能直接领取
@@ -593,7 +656,11 @@ def fetch_tasks_view(pool, realm=None, uid=None):
         # 批量领取仍由 run_batch_checkin 逐账号判断（只对服务端判定可领的账号发起）
         tasks, codes = aggregate_campaign_rows(eligible)
         energy = 0
+        unknown_uids = []
         for a in eligible:
+            if ledger_is_unknown(getattr(a, "credits", None)):
+                unknown_uids.append(a.uid)   # 未知不并入合计（不当作 0 累加）
+                continue
             try:
                 energy += int(((a.credits or {}).get("remain")) or 0)
             except Exception:
@@ -603,6 +670,9 @@ def fetch_tasks_view(pool, realm=None, uid=None):
                    "streak_days": 0, "travel": {"state": "unknown"},
                    "plan": "全部账号", "codes": codes,
                    "credits": {"remain": energy}}
+        if unknown_uids:
+            # 只在真的出现未知时追加（健康路径的载荷保持原样）
+            summary["credits_unknown_accounts"] = unknown_uids
         return {"tasks": tasks, "summary": summary, "account": None,
                 "accounts": acct_list, "mode": "all"}
     acc = None
@@ -854,9 +924,13 @@ def run_batch_pro_claim(targets, gap=1.0, inter_gap=1.5):
 def run_keepalive(pool, force=False, threshold_seconds=4 * 3600):
     """刷新凭证：force=True 刷新全部；否则只刷新剩余寿命不足阈值的账号。
 
-    返回 {refreshed, failed, logs}。
+    返回 {refreshed, failed, failed_uids, logs}。
+    failed_uids（#25 a）：本轮刷新失败的账号 uid —— 调度器据此把**同轮后续步骤**
+    （签到 / 额度快照）里这些账号整体排除；否则会拿刚失效的 token 继续打上游，
+    上游回的退化 body 会被写进账本，把健康余额覆盖成 0。
     """
     logs, refreshed, failed = [], 0, 0
+    failed_uids = []
     now = time.time()
     for acc in list(pool.accounts if pool else []):
         if not acc.enabled or not acc.access_token:
@@ -872,13 +946,15 @@ def run_keepalive(pool, force=False, threshold_seconds=4 * 3600):
                 logs.append(f"✓ 账号 [{nick}] Token 保活刷新成功（{_fmt_eta((acc.expires_at or 0) - time.time())}）")
             else:
                 failed += 1
+                failed_uids.append(acc.uid)
                 logs.append(f"! 账号 [{nick}] Token 保活刷新失败: {acc.last_error}")
             time.sleep(1.0)
     if not logs:
         logs.append("所有账号 Token 均未临近过期，无需刷新")
     for line in logs:
         _log(line)
-    return {"refreshed": refreshed, "failed": failed, "logs": logs}
+    return {"refreshed": refreshed, "failed": failed,
+            "failed_uids": failed_uids, "logs": logs}
 
 
 def _fmt_eta(seconds):

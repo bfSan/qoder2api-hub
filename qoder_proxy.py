@@ -3693,13 +3693,36 @@ class RateLimited(Exception):
 ERROR_COOLDOWN_WAIT_MAX = 10.0
 
 
-def _short_error_cooldown_wait(realm, model, exclude=None):
-    """账号级（错误/传输）短冷却的最短剩余秒数；不适用则返回 0。
+def _realm_ready_total(realm, model=None):
+    """本区域当前可轮换的就绪账号数 —— **唯一口径**（#29 的成因就是两处口径分叉）。
 
-    - 只看 cooldown_until（错误冷却）；若该模型正被上游频控
-      （model_cooldowns）则返回 0，交给429路径处理——两者语义严格分开。
-    - exclude（本请求已试过的账号）中的冷却账号**不算**：等它冷却好了也
-      不会再被本请求使用，纯属浪费。
+    冷却函数曾用 len(POOL.accounts)（全局），open_upstream 用 count_ready(realm)。
+    双区池（1 cn + 1 intl）下前者是 2、后者是 1，于是「本区域唯一账号」被当成
+    多号池，single_account 判定反了 -> 冷却不再压到 3s。两处都必须走这里。
+    """
+    if not POOL or not realm:
+        # 无池、或调用方给不出 realm（例如仅实现部分接口的测试桩对象）-> 保守 1
+        # （= 单号池语义：冷却压短）。绝不因为「判不出区域」而误判成多号池。
+        return 1
+    try:
+        return max(1, POOL.count_ready(realm, model=model))
+    except Exception:
+        return 1
+
+
+def _short_error_cooldown_wait(realm, model, exclude=None):
+    """账号级短冷却（含**预算内**的模型级频控窗）的最短剩余秒数；不适用返回 0。
+
+    两条冷却来源**一起收集、取最小值**（#29 起）：
+      · cooldown_until：账号级错误/传输冷却（原有语义）；
+      · model_cooldowns[model]：**仅当剩余 <= ERROR_COOLDOWN_WAIT_MAX(10s)** 时纳入；
+        超出预算的长频控仍交回 429 路径（客户端退避），不在这里吞掉。
+    为什么不再短路：旧实现「遇到任一 model_cooldowns > now 就 return 0」，会让
+    「号 A 长频控」连带把「号 B 只有 3s 可自愈」一起放弃（#29 的次生坑）。
+    本函数**只决定等不等、不写任何冷却字段**，退避写者语义不变。
+    已登记的语义变化：真 429 窗口 <=10s 时会被「等待 + 重试」，客户端收到
+    延迟后的成功而不是 429（>10s 的行为不变）。
+    - exclude（本请求已试过的账号）**不算**：等它冷却好了也不会再被本请求使用。
     """
     if not POOL:
         return 0.0
@@ -3711,8 +3734,11 @@ def _short_error_cooldown_wait(realm, model, exclude=None):
             continue
         if a.uid in exclude:
             continue
-        if a.model_cooldowns.get(model, 0.0) > now:
-            return 0.0          # 上游频控生效中 -> 正当429，不等待
+        m_remain = a.model_cooldowns.get(model, 0.0) - now
+        if m_remain > 0:
+            if m_remain <= ERROR_COOLDOWN_WAIT_MAX:
+                waits.append(m_remain)      # 预算内的频控窗：值得等它过去
+            continue                        # 超预算：跳过该号（别的号仍可纳入）
         remain = a.cooldown_until - now
         if 0 < remain <= ERROR_COOLDOWN_WAIT_MAX:
             waits.append(remain)
@@ -3878,7 +3904,9 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             POOL.affinity.unbind(session_key)
         except Exception:
             pass
-    total = len(POOL.accounts) if POOL else 1
+    # #29：口径必须与 open_upstream 一致 —— 用**本区域**就绪数，而不是全局账号数，
+    # 否则双区池里本区域唯一账号会被当成多号池，冷却不压 3s。
+    total = _realm_ready_total(getattr(account, "realm", "") or "", model)
     # 针对 10605 / retryAfterSeconds 解析冷却时长
     retry_secs = 30
     m = re.search(r'retryAfterSeconds\D+(\d+)', detail)
@@ -3888,19 +3916,25 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         except Exception:
             pass
     if status_int == 429:
-        account.note_error("envelope 429", model=model, cooldown=retry_secs)
-        log("account %s throttled via envelope (429), cooling for %ds"
-            % (account.uid[:8], retry_secs), level="WARN", tag="chat")
+        actual = account.note_error("envelope 429", model=model,
+                                    cooldown=retry_secs)
+        log("account %s throttled via envelope (429), cooling for %.0fs "
+            "(requested %ds, realm_ready=%d)"
+            % (account.uid[:8], float(actual or 0), retry_secs, total),
+            level="WARN", tag="chat")
     elif status_int in (401, 403):
         dead = qoder_accounts.session_dead(detail)
         # 10605 排队冷却为模型级或账号级
         is_queue = "10605" in detail or "isQueued" in detail
         cd = 300 if dead else (retry_secs if is_queue else 60)
-        account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
-                           cooldown=cd, single_account=(total <= 1),
-                           model=model if is_queue else None)
-        log("account %s rejected via envelope (HTTP %s, queue=%s), cooling for %ds and rotating"
-            % (account.uid[:8], status_int, is_queue, cd), level="WARN", tag="chat")
+        actual = account.note_error("envelope HTTP %s: %s"
+                                    % (status_int, detail[:80]),
+                                    cooldown=cd, single_account=(total <= 1),
+                                    model=model if is_queue else None)
+        log("account %s rejected via envelope (HTTP %s, queue=%s), cooling for "
+            "%.0fs (requested %ds, realm_ready=%d) and rotating"
+            % (account.uid[:8], status_int, is_queue, float(actual or 0), cd,
+               total), level="WARN", tag="chat")
         if dead:
             account.enabled = False
             account.save(ACCOUNTS_DIR) if account.path else None
@@ -4039,7 +4073,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(body_obj.get("messages") or [])))
 
-    total = max(1, POOL.count_ready(realm, model=model)) if POOL else 1
+    total = _realm_ready_total(realm, model)   # #29：与冷却函数共用同一口径
     tried = set()
     last_error = None
     last_429 = None

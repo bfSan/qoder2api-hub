@@ -1100,6 +1100,57 @@ def _retryable(exc):
     return False
 
 
+# ---------------------------------------------------------------------------
+# 出站代理策略（#27）：**只看环境变量，忽略 Windows 注册表；每请求现读、不固化**。
+# ---------------------------------------------------------------------------
+# 背景（Windows 实测根因）：urllib 的 getproxies() 在环境变量缺失时会回退读
+# WinINET 注册表（Internet Settings 的 ProxyEnable/ProxyServer）；而**默认
+# opener 在进程首次请求时就固化了当时的代理配置**。后果：网关启动时系统代理
+# 开着（如 Clash 127.0.0.1:7897），之后用户关掉代理工具 -> 长驻进程仍去连那个
+# 已无人监听的端口（WinError 10061），token 刷新与全部模型调用全挂到重启。
+#
+# 本仓策略（一句话）：显式设置了 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY（任一
+# 大小写）-> 走该代理；**没设 -> 直连**（不回退注册表）。每请求现读环境变量、
+# 现建 opener——没有「首次请求固化」，用户中途开关代理立即生效。
+#
+# 依赖系统代理才能上网的用户：设 HTTPS_PROXY=http://127.0.0.1:7897 即可恢复
+# （README「系统代理（Windows）」节有完整说明）；TUN / fake-ip 型代理（Clash
+# 等）在网络层透明转发，无需任何设置。
+_PROXY_SCHEMES = (("https", ("HTTPS_PROXY", "https_proxy")),
+                  ("http", ("HTTP_PROXY", "http_proxy")),
+                  ("all", ("ALL_PROXY", "all_proxy")))
+
+
+def _proxy_map_from_env():
+    """只从环境变量收集代理映射（http/https；ALL_PROXY 落到两者）。
+
+    刻意**不调用** urllib.getproxies()——它在 Windows 上会回退读注册表，
+    那正是 #27 的根因路径。没有环境变量 -> {}（直连）。
+    """
+    out = {}
+    for scheme, keys in _PROXY_SCHEMES:
+        for key in keys:
+            value = (os.environ.get(key) or "").strip()
+            if value:
+                out[scheme] = value
+                break
+    all_proxy = out.pop("all", "")
+    if all_proxy:
+        out.setdefault("https", all_proxy)
+        out.setdefault("http", all_proxy)
+    return out
+
+
+def _opener_for_request():
+    """每请求现建 opener：代理 = 当前环境变量（空 = 直连）。
+
+    「现建」是对 #27 固化行为的修复——默认 opener（urllib.request.urlopen）
+    首次使用时缓存代理配置；本函数让每次请求看到的环境变化立即生效。
+    """
+    proxies = _proxy_map_from_env()
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
 def http_json(url, data=None, method=None, headers=None, timeout=30,
               retries=3, backoff=1.0, log=None):
     """urlopen + json decode with retries. 所有 openapi 调用统一走这里。"""
@@ -1114,7 +1165,7 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
             headers=headers or {},
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _opener_for_request().open(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             last = exc
@@ -1154,6 +1205,9 @@ class Account(object):
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
         self.model_cooldowns = {}
         self.credits = data.get("credits") or None
+        # #25-d：最近一次「不可信 quota 响应」的记录（含截断 raw 摘要）——
+        # 供事后区分「上游真说超额」与「解析失败」（报告者最贵的教训）。
+        self.last_quota_anomaly = data.get("lastQuotaAnomaly") or None
         # ---- task-61：账号级预算护栏状态（默认全关；计数 None = 未知 -> fail-open）----
         self.reserve_credits = 0            # G1 余额地板（<=0 关）
         self.daily_token_limit = 0          # G2 当日 token 总额（<=0 关）
@@ -1217,6 +1271,7 @@ class Account(object):
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
+            "lastQuotaAnomaly": self.last_quota_anomaly,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
             "campaignCodes": self.campaign_codes,
@@ -1529,14 +1584,21 @@ class Account(object):
         return True
 
     def note_error(self, message, cooldown=60, single_account=False, model=None, until=None):
+        """记录一次错误并设置冷却；**返回实际生效的冷却秒数**（#29）。
+
+        日志要打真值：单号池（single_account）会被压到 3s，照请求值打会把
+        3s 显示成 60s，误导 429/503 的排查。返回值对既有调用方零影响
+        （它们都是语句式调用、忽略返回值）。
+        """
         self.last_error = str(message)[:200]
         if model:
             wait = max(1.0, float(until) - time.time()) if until else (
                 3.0 if single_account else float(cooldown))
             self.model_cooldowns[model] = time.time() + wait
-            return
+            return wait
         actual_cooldown = 3 if single_account else cooldown
         self.cooldown_until = time.time() + actual_cooldown
+        return actual_cooldown
 
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
@@ -1826,8 +1888,7 @@ class Account(object):
             return False
         if not self.last_checkin:
             return True
-        today_str = time.strftime("%Y-%m-%d")
-        return not str(self.last_checkin).startswith(today_str)
+        return not self._checkin_stamped_today()
 
     def checkin_status(self):
         """GET daily-check-in/status -> (ok, summary|error)。
@@ -1897,6 +1958,10 @@ class Account(object):
                                % st.get("http")}
             return {"ok": False, "error": st.get("error") or str(st)}
         if st["today_checked_in"]:
+            # #25-e：上游已领 -> 本地同步盖章（否则 lastCheckin 恒 null，
+            # can_checkin 恒 True，调度器每轮重走该号——naonao 实测）。
+            if not self._checkin_stamped_today():
+                self._stamp_checkin()
             return {"ok": True, "already": True, "msg": "今日已签到",
                     "streak_days": st["streak_days"], "reward_credits": st["reward_credits"]}
         if not st["active"]:
@@ -2211,6 +2276,8 @@ class Account(object):
                     views.append(c)      # 详情类活动：没有奖励可领，不算"已领取"
                 else:
                     already.append(c)
+                    # #25-e：已领 = 今日签到已完成——循环后统一盖章（见下），
+                    # 不在循环内 save（多活动时不重复写盘）。
                 if self.campaign_codes.get(cid):
                     codes.append({"campaign": label, "code": self.campaign_codes[cid]})
                 continue
@@ -2260,6 +2327,9 @@ class Account(object):
             # 每个 claim 请求之后统一等待一次：成功/被挡/失败都刚打过上游，
             # 相邻请求间隔由 gap 保证（默认 CLAIM_GAP_DEFAULT，防风控）。
             time.sleep(claim_gap)
+        if already and not self._checkin_stamped_today():
+            # #25-e：已有 CLAIMED 的签到类活动 = 今日已领 -> 本地盖章一次。
+            self._stamp_checkin()
         if claimed:
             msg = "活动领取成功 +%d Credits（%s）" % (
                 earned, "、".join(self.campaign_label(c) for c in claimed))
@@ -2308,6 +2378,34 @@ class Account(object):
                 "next_available_note": next_note}
 
 
+    def _checkin_stamped_today(self):
+        """#25-e：本地今天是否已盖章（防重复写盘的短路判据）。"""
+        return str(self.last_checkin or "").startswith(time.strftime("%Y-%m-%d"))
+
+    def _note_quota_anomaly(self, raw, reason):
+        """#25-d：记录一次「不可信的 quota 响应」并**保留旧快照**。
+
+        落盘 lastQuotaAnomaly（含截断 raw 摘要）——下次能把「上游真说
+        超额」与「解析失败」一眼分开（报告者最贵的教训：没有原始响应，
+        那次写入至今无法回溯）。返回 ok=False 的调用方语义。
+        """
+        try:
+            if isinstance(raw, (str, bytes)):
+                raw_digest = str(raw)[:400]
+            else:
+                raw_digest = json.dumps(raw, ensure_ascii=False)[:400]
+        except Exception:
+            raw_digest = repr(raw)[:400]
+        anomaly = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "reason": reason, "raw": raw_digest}
+        self.last_quota_anomaly = anomaly
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+        return {"ok": False,
+                "error": "degenerate quota body (%s); kept previous snapshot"
+                         % reason,
+                "anomaly": anomaly}
+
     def _stamp_checkin(self):
         self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
         if self.path and os.path.exists(os.path.dirname(self.path)):
@@ -2321,6 +2419,10 @@ class Account(object):
             q = http_json(url, method="GET", headers=self.headers(), timeout=30)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        # #25-d：非 dict 响应（解析失败形态）直接走退化路径——旧实现会在这里
+        # 抛 AttributeError，且不留任何现场。
+        if not isinstance(q, dict):
+            return self._note_quota_anomaly(q, "non-dict response")
         uq = q.get("userQuota") or {}
         aq = q.get("addOnQuota") or {}
 
@@ -2360,6 +2462,22 @@ class Account(object):
         remain = int(_num(uq, "remaining") + _num(aq, "remaining"))
         used = int(_num(uq, "used") + _num(aq, "used"))
         size = int(_num(uq, "total") + _num(aq, "total"))
+        # ---- #25-d：退化 body 合理性守卫（保守）--------------------------
+        # 形态（naonao 实测）：isQuotaExceeded=true + 两个 quota 全 0/缺键。
+        # 判定**不依赖** expiresAt=253402214400——那是 CN 号「永不过期」的
+        # 正常占位，健康号同样返回它，拿它当判据会误伤。
+        # 判据：exceeded=true 且 remain 合计=0 且 size 合计=0（「从没有过
+        # 额度」；真·耗尽的特征是 size>0 而 remain=0，会被放行）；或两个
+        # quota 键都缺失（解析不了 -> 拒绝写入比写 0 诚实）。
+        # 保守性：任一信号单独出现都放行——真·余额归零与新号不受影响。
+        both_missing = (not isinstance(q.get("userQuota"), dict)
+                        and not isinstance(q.get("addOnQuota"), dict))
+        degenerate = both_missing or (bool(q.get("isQuotaExceeded"))
+                                      and remain == 0 and size == 0)
+        if degenerate:
+            return self._note_quota_anomaly(
+                q, "both quota objects missing" if both_missing
+                else "exceeded=true with zero size/remain")
         self.credits = {
             "remain": remain,
             "used": used,
@@ -2378,6 +2496,7 @@ class Account(object):
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        self.last_quota_anomaly = None    # 正常体：清掉上次异常标记
         # task-61：余额刷新是 402 停放的**唯一**解封路径（remain > 0 才解）。
         self.revive_balance_cooldown()
         if self.path and os.path.exists(os.path.dirname(self.path)):
@@ -3158,7 +3277,7 @@ class AccountPool(object):
             "User-Agent": "QoderWork",
         })
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _opener_for_request().open(req, timeout=20) as resp:
                 raw = resp.read().decode("utf-8")
                 status = resp.status
         except urllib.error.HTTPError as exc:

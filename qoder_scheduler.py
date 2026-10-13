@@ -235,10 +235,26 @@ class Scheduler(object):
             if line.startswith("!"):
                 self.log(line)
 
+        # #25 a：本轮失效凭证的账号**整体排除**在后续步骤之外。
+        # 理由：跳过只是"不再打上游"，但一轮里若已用失效 token 拿到过退化响应，
+        # 那次响应会被写进账本（把健康余额覆盖成 0）；所以这里在**源头**把这些
+        # 账号从签到与额度快照里去掉 —— 它们的余额等下一次成功刷新再恢复。
+        # 两类来源：① 刚才保活明确失败的 uid；② token 已过期（含没被保活覆盖的）。
+        stale_uids = set(ka.get("failed_uids") or [])
+        now_ts = time.time()
+        for a in (self.pool.accounts if self.pool else []):
+            exp = getattr(a, "expires_at", 0) or 0
+            if a.access_token and exp and exp <= now_ts:
+                stale_uids.add(a.uid)
+        if stale_uids:
+            self.log("跳过 %d 个失效凭证账号（本轮不签到、不刷额度）：%s"
+                     % (len(stale_uids),
+                        "、".join(sorted(str(u)[:8] for u in stale_uids))))
+
         # 2. 每日签到：整点签到窗口内执行；其余巡检只补签未签账号
         #    （能力运行时探测：接口不存在的区域由 run_checkin 给出原因并跳过）
         targets = [a for a in self.pool.accounts
-                   if a.enabled and a.access_token]
+                   if a.enabled and a.access_token and a.uid not in stale_uids]
         if checkin_due:
             pending = targets          # 09:00 / 21:00 窗口不受启动闸门影响
         elif allow_complement:

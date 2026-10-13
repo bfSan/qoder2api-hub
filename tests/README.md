@@ -148,3 +148,28 @@ shutil/struct/sys/tarfile/tempfile/time`）全部模块级 import 并放进 `__a
 `dep_scan.py --leaf-only` 当前**没有输出** —— 跑完 55 个段后，**没有一个段是纯叶子**：
 段与段之间共享大量全局（`time`/`base64`/`payload`/`url` 等是显式共享，`_A`/`_orig_sleep2`
 这类是隐式继承）。这与第三批的回滚现象完全一致，也直接支持「legacy 作终态」的结论。
+
+---
+
+## 夹具纪律：**所有出站函数默认桩住**（2026-10-13，由一次真实踩坑立规）
+
+**事故**：写 #25 的「文案矩阵」探针时只桩了 `Account.campaigns()`，漏桩 `Account.claim_campaign()`。
+夹具里那条 `CLAIMABLE` 活动于是走了真实 `claim_campaign` —— 探针**真的向 qoder.sh 打了一次
+claim POST**（用的是假 token，回 401 `TOKEN_EXPIRE`，无状态改变，但性质是"离线夹具出网了"）。
+
+**为什么危险**：这类探针通常带着**真实账号的 token**（或仓库里的 accounts/*.json），漏桩就不是
+"打一次 401"，而是真的领取/刷新/写账本 —— 夹具本该零副作用。
+
+**规矩**：
+
+1. 夹具**开头**统一把所有出站函数桩掉，再写用例；宁可多桩一行，不要赌"这条路径不会走到"：
+   - `qoder_accounts.http_json`（**唯一真正的网络出口**，拦它最划算）；
+   - `Account.campaigns` / `claim_campaign` / `checkin` / `campaign_checkin` /
+     `fetch_credits` / `fetch_plan` / `refresh` / `native_machine_identity`；
+   - `Account.save` / `_stamp_checkin`（防写盘）；
+   - 调度器侧 `run_keepalive` / `run_batch_checkin` / `time.sleep`（防真等）。
+2. 环境隔离：`ACCOUNTS_DIR` / `QD_PROXY_USAGE_DIR` 指向 `tempfile.mkdtemp()`，
+   `QD_NATIVE_IDENTITY=0`（不拉起官方原生桥）。
+3. **自证**：夹具跑完打印一条"出网计数"（例如 `http_json` 的调用次数）—— 期望 0；
+   非 0 就是漏桩，直接判红。
+4. 变异/能红证据只在**副本**上做（见上文 reserve_blocked 的示范），原文件不留痕。
