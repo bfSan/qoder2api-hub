@@ -236,6 +236,22 @@ def install_console_close_handler():
         return None
 
 
+# Launcher names differ per platform; the messages below are read by whoever
+# is staring at the terminal, so point at the file that actually exists there.
+IS_WINDOWS = os.name == "nt"
+START_SCRIPT = "start-qoder-proxy.bat" if IS_WINDOWS \
+    else "start-qoder-proxy.sh"
+FIREWALL_SCRIPT = "allow-firewall.bat" if IS_WINDOWS else "allow-firewall.sh"
+
+
+def port_owner_hint(port):
+    """One-liner(s) the user can paste to see which process holds a port."""
+    cmds = ["netstat -ano | findstr :%d" % port] if IS_WINDOWS else \
+        ["ss -ltnp | grep :%d" % port,
+         "lsof -iTCP:%d -sTCP:LISTEN" % port]
+    return cmds
+
+
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
              "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
 MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
@@ -2201,6 +2217,8 @@ def clean_chunk(raw):
         obj = json.loads(raw)
     except Exception:
         return raw
+    if not isinstance(obj, dict):
+        return raw
     changed = False
     for choice in obj.get("choices") or []:
         delta = choice.get("delta")
@@ -2404,6 +2422,21 @@ def supported_efforts(meta):
     enabled = tc.get("enabled") if isinstance(tc.get("enabled"), dict) else {}
     efforts = enabled.get("efforts") if isinstance(enabled.get("efforts"), dict) else {}
     return [e for e in EFFORT_RANK if e in efforts]
+
+
+def catalog_meta_for(model_key, realm=None):
+    """按上游 key 取该模型在官方目录里的元数据（找不到返回 {}）。
+
+    Anthropic 入口在调用 qoder_anthropic.messages_to_chat 时需要一个 meta，
+    否则 effort_from_anthropic 取不到 supported 档位表 -> 思考档位被静默丢弃。
+    """
+    for m in qoder_catalog.models_for_realm(realm or CURRENT_REALM):
+        if m.get("key") == model_key:
+            return m
+    for m in qoder_catalog.STATIC_INTL_MODELS + qoder_catalog.STATIC_CN_MODELS:
+        if m.get("key") == model_key:
+            return m
+    return {}
 
 
 def default_effort(meta):
@@ -4441,8 +4474,9 @@ def iter_inner_sse(resp, holder=None):
         if isinstance(inner, dict):
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
             note_inner_upstream_error(inner, status=status)
-        if holder is not None and inner.get("usage") and not holder.get("usage"):
-            holder["usage"] = inner["usage"]
+            if holder is not None and inner.get("usage") \
+                    and not holder.get("usage"):
+                holder["usage"] = inner["usage"]
         cleaned = clean_chunk(body)
         if not cleaned:
             continue
@@ -4469,6 +4503,8 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         try:
             chunk = json.loads(data)
         except Exception:
+            continue
+        if not isinstance(chunk, dict):
             continue
         if first_chunk_at is None:
             first_chunk_at = time.time()
@@ -6663,14 +6699,18 @@ class Handler(BaseHTTPRequestHandler):
         ok, problem = qoder_anthropic.validate_request(payload)
         if not ok:
             return self._error(400, problem, "invalid_request_error")
-        chat_req = qoder_anthropic.messages_to_chat(payload)
+        req_realm = self._request_realm() or CURRENT_REALM
+        model_hint = payload.get("model") or "auto"
+        model_key = qoder_catalog.resolve_upstream_key(model_hint, realm=req_realm)
+        # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
+        meta = catalog_meta_for(model_key, req_realm)
+        chat_req = qoder_anthropic.messages_to_chat(
+            payload, catalog_meta=meta, supported=supported_efforts(meta))
         model = chat_req.get("model") or payload.get("model") or "auto"
         want_stream = bool(payload.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
         fp = prompt_fingerprint(chat_req.get("messages"))
         t_start = time.time()
-        req_realm = self._request_realm() or CURRENT_REALM
-        model_key = qoder_catalog.resolve_upstream_key(model, realm=req_realm)
         # ---- 形态决策单点：在这里算唯一一次，随 chat_req 下传 ----
         chat_req["_qd_structured"] = structured_tool_history_enabled(
             model=model, model_key=model_key, realm=req_realm,
@@ -7283,11 +7323,11 @@ def main():
                   "started.")
             print()
             print("  Fix: start qoder-proxy on a different port, e.g.")
-            print("          start-qoder-proxy.bat %d" % (args.port + 1))
+            print("          %s %d" % (START_SCRIPT, args.port + 1))
             print("          python qoder_proxy.py --port %d" % (args.port + 1))
             print()
-            print("  Check who owns the port:  netstat -ano | findstr :%d"
-                  % args.port)
+            for cmd in port_owner_hint(args.port):
+                print("  Check who owns the port:  %s" % cmd)
             print()
             raise SystemExit(1)
         print()
@@ -7401,8 +7441,12 @@ def main():
         print("    Clients: Base URL = the API address above, then paste "
               "the key.")
         print()
-        print("    If nothing can connect, allow python through the")
-        print("    firewall: run allow-firewall.bat once as administrator.")
+        if IS_WINDOWS:
+            print("    If nothing can connect, allow python through the")
+            print("    firewall: run %s once as administrator." % FIREWALL_SCRIPT)
+        else:
+            print("    If nothing can connect, open the port in the firewall")
+            print("    once:  sudo ./%s %d" % (FIREWALL_SCRIPT, args.port))
         print("  " + "=" * 62)
         print()
         sys.stdout.flush()
@@ -7433,8 +7477,9 @@ def main():
         print()
         print("  Fix: stop the program holding the port, or pick another "
               "port:")
-        print("          netstat -ano | findstr :%d" % args.port)
-        print("          start-qoder-proxy.bat %d" % (args.port + 1))
+        for cmd in port_owner_hint(args.port):
+            print("          %s" % cmd)
+        print("          %s %d" % (START_SCRIPT, args.port + 1))
         print()
         raise SystemExit(1)
     log("listening  : http://%s:%d/v1  (api key: %s)"

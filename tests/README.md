@@ -84,6 +84,25 @@
 
    这三条都只动**备份副本**（`%TEMP%` 下先备份、跑完立即还原），原文件不留痕。
 
+## 第三步：上游异常形状 + Anthropic 档位接线（本轮）
+
+| 套件 | 类型 | 覆盖 |
+|---|---|---|
+| `_test_stream_guards.py` | 守卫（离线纯函数） | 上游信封 body **不保证是 JSON object**（实测有裸数组/标量）。三处守卫 `clean_chunk` / `iter_inner_sse` / `aggregate_stream` 遇非 dict 帧：① 不抛异常；② 不吞后续帧（异常帧夹在中间时正文仍完整）；③ 既有语义不回退（噪声清洗、usage 首个优先、正文折叠）；④ 集成一条：异常帧走完整 Anthropic 流式管线 |
+| `_test_anthropic_wiring_meta.py` | 接线（HTTP 层 + 端到端） | `/v1/messages` 的 `thinking.budget_tokens` 要经 `catalog_meta` 才能映射成 `reasoning_effort`。断言拦在 `open_upstream` **唯一出站口**（不是「`messages_to_chat` 被调用过」）：实际交给上游的 `chat_req` 必须带档位、且档位在该模型官方档位表内；另加端到端「档位真的写进上游 `parameters`」与两条静态钉住 |
+
+### 能红自证（本轮两条）
+
+1. **stream_guards**：删掉 `qoder_proxy.py` 里三处 `isinstance(..., dict)` 守卫（回到改动前形状）
+   → 6 条 `[FAIL] ... AttributeError: 'list' object has no attribute 'get'` → RED exit 1；恢复后 GREEN 20/20。
+2. **anthropic_wiring_meta**：把 `_handle_anthropic` 的 `catalog_meta_for(...)` 下传改回
+   `messages_to_chat(payload)` → `[FAIL] model=qmodel_38max：chat_req.reasoning_effort 非空` 等 6 条 → RED exit 1；恢复后 GREEN 16/16。
+
+   同样只动备份副本；跑完 `git diff --stat` 与本轮改动一致，原文件无变异痕迹。
+
+> 两个套件都把自己的 `QD_PROXY_USAGE_DIR` 指到 `tempfile.mkdtemp()`：被桩中止的请求
+> 也会走 `record_error` 落盘，不能写进仓库的 `usage/`（并发编排下是跨进程共享路径）。
+
 ## 迁移期纪律（每批迁移后都要过一遍）
 
 ### 1. 路径：一律基于 `__file__`，绝不用 cwd

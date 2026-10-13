@@ -107,12 +107,19 @@ def print_virtualization_status(realm="cn"):
 
 
 def identity_report(realm, account_id):
+    # POSIX 下组件是提取出来的 ELF/Mach-O（无 .exe 后缀），提示里要给出
+    # 对应的补装命令，否则用户会照着 Windows 的说法去找一个不存在的文件。
     exe = A.runtime_info_exe(realm)
+    if os.name == "nt":
+        comp, fix = "runtime-info.exe", "（桌面客户端自带）"
+    else:
+        comp, fix = "runtime-info", "（先跑 python _install_umid.py 提取）"
     if not exe:
-        return "机器身份=派生回退（未找到官方 runtime-info.exe；设备定向活动可能被过滤）"
+        return "机器身份=派生回退（未找到官方 %s%s；设备定向活动可能被过滤）" % (
+            comp, fix)
     ident = A.native_machine_identity(realm, account_id)
     if not ident:
-        return "机器身份=派生回退（runtime-info.exe 调用失败）"
+        return "机器身份=派生回退（%s 调用失败）" % comp
     return "机器身份=官方原生桥 runtime-info（真实身份，来源可信）"
 
 
