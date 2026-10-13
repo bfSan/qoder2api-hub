@@ -236,6 +236,22 @@ def install_console_close_handler():
         return None
 
 
+# Launcher names differ per platform; the messages below are read by whoever
+# is staring at the terminal, so point at the file that actually exists there.
+IS_WINDOWS = os.name == "nt"
+START_SCRIPT = "start-qoder-proxy.bat" if IS_WINDOWS \
+    else "start-qoder-proxy.sh"
+FIREWALL_SCRIPT = "allow-firewall.bat" if IS_WINDOWS else "allow-firewall.sh"
+
+
+def port_owner_hint(port):
+    """One-liner(s) the user can paste to see which process holds a port."""
+    cmds = ["netstat -ano | findstr :%d" % port] if IS_WINDOWS else \
+        ["ss -ltnp | grep :%d" % port,
+         "lsof -iTCP:%d -sTCP:LISTEN" % port]
+    return cmds
+
+
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
              "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
 MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
@@ -7283,11 +7299,11 @@ def main():
                   "started.")
             print()
             print("  Fix: start qoder-proxy on a different port, e.g.")
-            print("          start-qoder-proxy.bat %d" % (args.port + 1))
+            print("          %s %d" % (START_SCRIPT, args.port + 1))
             print("          python qoder_proxy.py --port %d" % (args.port + 1))
             print()
-            print("  Check who owns the port:  netstat -ano | findstr :%d"
-                  % args.port)
+            for cmd in port_owner_hint(args.port):
+                print("  Check who owns the port:  %s" % cmd)
             print()
             raise SystemExit(1)
         print()
@@ -7401,8 +7417,12 @@ def main():
         print("    Clients: Base URL = the API address above, then paste "
               "the key.")
         print()
-        print("    If nothing can connect, allow python through the")
-        print("    firewall: run allow-firewall.bat once as administrator.")
+        if IS_WINDOWS:
+            print("    If nothing can connect, allow python through the")
+            print("    firewall: run %s once as administrator." % FIREWALL_SCRIPT)
+        else:
+            print("    If nothing can connect, open the port in the firewall")
+            print("    once:  sudo ./%s %d" % (FIREWALL_SCRIPT, args.port))
         print("  " + "=" * 62)
         print()
         sys.stdout.flush()
@@ -7433,8 +7453,9 @@ def main():
         print()
         print("  Fix: stop the program holding the port, or pick another "
               "port:")
-        print("          netstat -ano | findstr :%d" % args.port)
-        print("          start-qoder-proxy.bat %d" % (args.port + 1))
+        for cmd in port_owner_hint(args.port):
+            print("          %s" % cmd)
+        print("          %s %d" % (START_SCRIPT, args.port + 1))
         print()
         raise SystemExit(1)
     log("listening  : http://%s:%d/v1  (api key: %s)"

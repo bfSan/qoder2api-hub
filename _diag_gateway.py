@@ -107,8 +107,10 @@ def main():
         print(OK, "端口可连接（%s）" % where)
     else:
         print(BAD, "端口无人响应（%s）——网关进程没在跑" % where)
-        print("       -> 双击 start-qoder-proxy.bat（窗口必须保持开启）")
-        print("       -> 或双击 start-qoder-proxy-bg.bat（后台常驻+崩溃自拉起）")
+        if os.name == "nt":
+            print("       -> 双击 start-qoder-proxy.bat（窗口必须保持开启）")
+        else:
+            print("       -> 运行 ./start-qoder-proxy.sh（终端必须保持开启）")
         print("       -> harness 会表现为“一直工作中但不吐字”，正是本项失败")
         failures.append("port")
 

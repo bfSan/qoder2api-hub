@@ -8,5 +8,9 @@
 #       写回行尾一致，从此刷新不会产生行尾噪声；git 清洗后 blob 等价（见验证命令）。
 # 范围：只声明 *.py 与 *.json 两类（模型快照即 JSON），HTML/其它文件不受影响，
 #       属最小侵入；不写 text=auto，避免影响未声明类型的既有行为。
+# 追加 *.sh（同上原因为「别签入 CRLF」的硬性要求）：CRLF 的 shebang 会让
+#       Linux/macOS 报 "bad interpreter: /usr/bin/env bash^M"，脚本根本跑不起来；
+#       且 Windows 侧编辑后 autocrlf 会把 LF 还原成 CRLF，必须在这里钉死。
 *.py text eol=lf
 *.json text eol=lf
+*.sh text eol=lf
