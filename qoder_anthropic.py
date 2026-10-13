@@ -206,7 +206,9 @@ def effort_from_anthropic(payload, catalog_meta=None, supported=None):
                 break
     if not target:
         return None
-    allowed = supported if supported else _efforts_from_meta(catalog_meta)
+    # 注意用 `is not None`：调用方**明确传空表**（= 该模型没有可用档位）时，
+    # 不应该被 fallback 覆盖掉（falsy 判断会把 [] 当成"没传"）。
+    allowed = supported if supported is not None else _efforts_from_meta(catalog_meta)
     if not allowed:
         return None                     # 无档位表 -> 不下发
     allowed = [str(x).strip().lower() for x in allowed
@@ -224,17 +226,22 @@ def effort_from_anthropic(payload, catalog_meta=None, supported=None):
 
 
 def _efforts_from_meta(meta):
-    """从 catalog 元数据读档位（fallback；接线时应显式传 supported 以避免双实现）。"""
+    """从 catalog 元数据读档位（fallback；接线时应显式传 supported 以避免双实现）。
+
+    ⚠️ 实测修正：本仓目录里的形状是 **dict**（"efforts": {"low": {...}, "high": {...}}），
+    早期实现只认 list，导致这条 fallback 恒返回空（形同虚设）。两种形状都接受。
+    """
     if not isinstance(meta, dict):
         return []
     tc = meta.get("thinking_config")
     if not isinstance(tc, dict):
         return []
-    en = tc.get("enabled")
-    if isinstance(en, dict) and isinstance(en.get("efforts"), list):
-        return en["efforts"]
-    if isinstance(tc.get("efforts"), list):
-        return tc["efforts"]
+    en = tc.get("enabled") if isinstance(tc.get("enabled"), dict) else {}
+    for src in (en.get("efforts"), tc.get("efforts")):
+        if isinstance(src, dict):
+            return list(src)
+        if isinstance(src, list):
+            return src
     return []
 
 # ---------------------------------------------------------------------------

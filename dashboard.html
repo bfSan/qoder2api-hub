@@ -1424,7 +1424,11 @@ function renderGrowthTasks(r){
     const sum = r.summary || {};
     const accts = r.accounts || [];
     const streak = sum.streak_days || 0;
-    const energy = sum.energy || 0;
+    // #25：退化账本是「未知」而不是 0 —— 显示 0 会让用户以为额度耗尽（issue 报告者正是被这点误导）。
+    // 判据：后端 credits_unknown=True（单账号）或显式 energy=null；energy===0 才是真·归零，要照实显示 0。
+    const unknownUids = Array.isArray(sum.credits_unknown_accounts) ? sum.credits_unknown_accounts : [];
+    const energyUnknown = (sum.credits_unknown === true) || (sum.energy === null);
+    const energy = energyUnknown ? null : (sum.energy || 0);
     const tr = sum.travel || {};
 
     // 全部账号（批量）视图：卡片改成合计口径，活动行已按活动聚合并标注每账号资格
@@ -1432,7 +1436,15 @@ function renderGrowthTasks(r){
     const lblStk = document.getElementById('stkLabel');
     const lblNrg = document.getElementById('nrgLabel');
     if(lblStk) lblStk.textContent = isAll ? '连续签到（批量视图）' : '连续签到天数';
-    if(lblNrg) lblNrg.textContent = isAll ? '合计积分余额（全部账号）' : '积分额度余额';
+    if(lblNrg){
+      // 合计视图必须点名「已排除 N 个未知账号」：否则用户拿这个合计去和账号卡片对账，会以为少算了
+      lblNrg.textContent = isAll
+        ? (unknownUids.length ? ('合计积分余额（已排除 ' + unknownUids.length + ' 个未知账号）') : '合计积分余额（全部账号）')
+        : (energyUnknown ? '积分额度余额（未知）' : '积分额度余额');
+      lblNrg.title = unknownUids.length
+        ? ('未知账号（账本退化响应，未并入合计、也不当作 0）：' + unknownUids.map(u => String(u).slice(0, 8)).join('、'))
+        : (energyUnknown ? (sum.energy_note || '余额未知（等待下次成功刷新）') : '');
+    }
     renderCodePanel(sum);
 
     const sel = document.getElementById("growthAcctSelect");
@@ -1446,7 +1458,14 @@ function renderGrowthTasks(r){
     const elStk = document.getElementById("stkDays");
     if(elStk) elStk.textContent = streak + ' 天';
     const elNrg = document.getElementById("nrgBalance");
-    if(elNrg) elNrg.textContent = energy;
+    if(elNrg){
+      if(energyUnknown){
+        elNrg.innerHTML = '<span style="color:var(--warn);font-size:16px" title="'
+          + esc(sum.energy_note || '余额未知（等待下次成功刷新）') + '">未知</span>';
+      } else {
+        elNrg.textContent = energy;   // 含 0：真·耗尽显示 0，与「未知」严格区分
+      }
+    }
 
     const elCat = document.getElementById("catState");
     const elCatDesc = document.getElementById("catDesc");

@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.4-2496ED?style=flat-square" alt="Version 1.3.4">
+  <img src="https://img.shields.io/badge/Release-v1.3.5-2496ED?style=flat-square" alt="Version 1.3.5">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -451,6 +451,33 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.3.5
+
+**✨ 新增功能**
+- **Linux / macOS 启动脚本**（社区贡献 @jk-uzi）：`start-qoder-proxy.sh` / `start-qoder-proxy-lan.sh` / `allow-firewall.sh`，与 Windows 的 `.bat` 一一对应；运行时探测链相同、要求 Python 3.9+、用 `exec` 让终端生命周期等于进程生命周期；`allow-firewall.sh` 检测 ufw/firewalld/nftables/iptables、用 `-C` 保持幂等并打印回滚命令。
+
+**🐛 问题修复**
+- **Anthropic 入口的 thinking 档位被静默丢弃**（@jk-uzi）：`/v1/messages` 收下 `thinking.budget_tokens` 却没有把档位表传下去 → 每个请求都静默跑默认档位。**这是我们在接线时漏掉的一步**（桥接设计文档里写过）。已补 `catalog_meta_for()` 并把 meta 传进转换层。
+- **非对象上游帧会让流崩溃**（@jk-uzi）：信封 `body` 可能是数组或标量，三处直接 `.get()` 就抛 `AttributeError` → 流式中途崩、聚合整单失败。现在按类型分流（放行 / 丢弃 / 不动 inner）。
+- **双区账号池下冷却判断用错口径**（#29 @ismodo）：冷却函数问「全局有几个账号」，选号循环问「本区域有几个可用」——双区池里两数不等，本区域唯一的账号被当成多号池，于是上游请求的 30/60s 冷却原样生效、超出等待预算，**一次本可 3 秒自愈的排队变成中断**。两处现在共用同一个 helper；等待逻辑改为**收集候选取最小值**（不再因某个号的长频控而放弃其它号的短冷却）。
+- **Windows 下网关会因系统代理开关而全挂**（#27 @mengmengma0104）：`urllib` 在 Windows 会**回退读 WinINET 注册表**，且默认 opener 在**首次请求时固化**代理配置 → 代理工具关闭后网关仍去连已无人监听的端口，直到重启。现在自建 opener、**只从环境变量取代理**：设了 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 就走它，没设就直连（不回退注册表），且**每请求现读、无固化**。
+- **intl 账号账本被写全 0 / 活动文案误报 / `lastCheckin` 恒空**（#25 @xiarunjie）：
+  - 账本写入此前**无任何合理性守卫** —— 一个退化响应（exceeded + 两个 quota 全 0 + CN 的永不过期占位）会把健康的 399 覆盖成 0，**而且不记录原始响应**，事后无法回溯。现在：保守判定（**真·余额归零照常覆盖**）、拒绝覆盖时**落盘截断的原始摘要**、调度器**排除本轮凭证失效的账号**（不再用失效 token 打上游）；
+  - 看板与一键签到把**已领取**的奖励报成「暂无可领取」—— 因为过滤发生在归类之前，而 intl 那条活动的 `actionType` 不是 `CLAIM_BENEFIT`。现在**先归类再决定是否参与领取**；`lastCheckin` 也改成**已领取时同样盖章**（此前只在「我们自己去领」时盖章 → `can_checkin` 恒真 → 调度器每轮重走同一个号）。
+- **批量刷新路由对账号集合没有守卫**：`/accounts/credits`（GET/POST）、`/accounts/refresh` 会**对禁用号与坏凭证号也发请求** → 它们的账本被反复零化。现在统一走 `_refreshable_accounts()`，被跳过的号以 `{uid, reason}` 出现在响应的 `skipped` 里（**不静默少项**）。
+
+**🎨 体验优化**
+- **看板区分「未知」与「0」**：此前 `energy || 0` 让 `None` 与 `0` 塌成同一个显示 —— **这正是 #25 报告者被误导的界面症结**。现在三态分明（正常数字 / **未知**（warn 色 + 原因）/ 真 0）；批量视图的合计会标注「**已排除 N 个未知账号**」并列出是哪些。
+
+**⚠️ 其他变更**
+- ⚠️ **一条语义变化（#29 的连带）**：频控窗口 **≤10s** 时，网关会**等待并重试**，客户端收到的是**延迟后的成功**而不是 429。这是自愈（比中断好），但与旧行为不同；**>10s 的长频控不受影响**，仍返回 429。
+- **测试**：编排总数到 **974 条**；`tests/README.md` 增补「**桩的保真度**」纪律（元素桩照 DOM 语义做、兄弟函数显式注入空桩、锚点缺失即抛、按函数而非区间做纯度检查）。
+
+**验证**
+- **双入口全绿**：`python tests/run_all.py` → **27 suites / 974 checks / 0 failed**；`python _test_qoder.py` → **630 checks / 626 passed / 0 failed**；
+- **每条修复都带能红证据**：冷却四组数字（30→3 / wait 0→3 / 长窗保持 0 / 多号坑 0→3）· 账本污染前后（`ZEROED: ['u-disabled','u-no-cred']` → `[]`，且断言 `calls == 0`）· 文案矩阵三档一致 · **CN 对照组逐字 SAME（8/8）** · 非对象帧的 8 条 FAIL 自证；
+- **一条流程留痕**：`VIEW_DETAILS` 该不该「算已领」出现过新旧断言冲突，最终判定**不该把显示与盖章分开**（分开会重现 `lastCheckin` 恒空那条链），并把原断言拆成 E3a/E3b 各自钉住新语义与「防过度」的界。
 
 ### v1.3.4
 

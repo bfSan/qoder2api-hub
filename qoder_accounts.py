@@ -2265,21 +2265,33 @@ class Account(object):
                 kind = str((c.get("benefit") or {}).get("kind") or "").upper()
                 if kind not in only_kinds:
                     continue      # 只要"每日签到领积分"时跳过券类/其它奖励
-                if str(c.get("action_type") or "") not in ("", "CLAIM_BENEFIT"):
-                    continue      # 详情类（VIEW_DETAILS）无奖励，不算签到
             cid = c["campaign_id"]
             cname = c["campaign_key"] or cid
             label = self.campaign_label(c)
             reason = str(c.get("unavailable_reason") or "").upper()
+            action_type = str(c.get("action_type") or "")
+            try:
+                amount = int((c.get("benefit") or {}).get("amount") or 0)
+            except (TypeError, ValueError):
+                amount = 0
             if c["claim_status"] == "CLAIMED":
-                if str(c.get("action_type") or "") == "VIEW_DETAILS":
-                    views.append(c)      # 详情类活动：没有奖励可领，不算"已领取"
-                else:
+                # #25 遗留：**归类先于 action_type 过滤**——官方在领取后会把
+                # actionType 降级成 VIEW_DETAILS（intl 实测），若先按 action_type
+                # 过滤会把「已领」事实丢掉，兜底成「当前账号暂无可领取的官方
+                # 活动」（报告者看到的那句日志）。归类判据与 tasks 侧同源：
+                # 有奖励（amount>0）或 action_type 仍是可领类 -> 已领取；
+                # 真·详情类（无奖励）才算 views。
+                if amount > 0 or action_type in ("", "CLAIM_BENEFIT"):
                     already.append(c)
                     # #25-e：已领 = 今日签到已完成——循环后统一盖章（见下），
                     # 不在循环内 save（多活动时不重复写盘）。
+                else:
+                    views.append(c)      # 详情类活动：没有奖励可领，不算"已领取"
                 if self.campaign_codes.get(cid):
                     codes.append({"campaign": label, "code": self.campaign_codes[cid]})
+                continue
+            # 以下只针对"还没领"的活动：详情类无奖励，不参与领取/归类
+            if action_type not in ("", "CLAIM_BENEFIT"):
                 continue
             if c["claim_status"] != "CLAIMABLE":
                 # 不可领取但并非"与我们无关"：名额发完 / 成就未完成要如实报出来

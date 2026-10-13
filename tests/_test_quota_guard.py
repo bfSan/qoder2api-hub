@@ -133,12 +133,12 @@ def _status_stub(today_checked_in=True):
     return fake_status
 
 
-def _camps_stub(action_type=""):
+def _camps_stub(action_type="", amount=10):
     def fake_camps(self, force=False):
         return {"ok": True, "campaigns": [{
             "campaign_id": "c1", "campaign_key": "k1",
             "claim_status": "CLAIMED", "action_type": action_type,
-            "benefit": {"kind": "CREDITS", "amount": 10},
+            "benefit": {"kind": "CREDITS", "amount": amount},
             "unavailable_reason": "", "achievement_completed": True,
             "start_at": 0, "end_at": 0, "placements": [],
         }], "show_campaign": True, "claimable": False, "campaign_url": "",
@@ -181,8 +181,22 @@ try:
 finally:
     A.Account.campaigns = _orig_camps
     A.native_machine_identity = _orig_ident
-check("E3 防过度：VIEW_DETAILS 的 CLAIMED 不算已领（不盖章）",
-      e3.last_checkin is None, (camp3.get("views"), e3.last_checkin))
+check("E3a #25 遗留新语义：VIEW_DETAILS 但 amount>0（降级的已领）-> 算已领、盖章",
+      bool(camp3.get("already")) and e3.last_checkin is not None,
+      (camp3.get("already"), camp3.get("views"), e3.last_checkin))
+
+e3b = _mk("e3b")
+A.native_machine_identity = lambda *a, **k: {}
+A.Account.campaigns = _camps_stub("VIEW_DETAILS", amount=0)
+try:
+    camp3b = e3b.campaign_checkin(only_kinds=("", "CREDITS"))
+finally:
+    A.Account.campaigns = _orig_camps
+    A.native_machine_identity = _orig_ident
+check("E3b 防过度：纯详情（amount=0）不算已领（不盖章，归 views）",
+      not camp3b.get("already") and e3b.last_checkin is None
+      and [c["campaign_key"] for c in camp3b.get("views") or []] == ["k1"],
+      (camp3b.get("views"), e3b.last_checkin))
 
 e4 = _mk("e4")
 e4.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")

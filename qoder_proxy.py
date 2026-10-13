@@ -54,7 +54,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1043,6 +1043,30 @@ def save_persisted_realm(realm):
 
 API_KEY = None
 SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+
+
+def _refreshable_accounts(accounts):
+    """从账号集合里挑出**可以安全打上游**的号（#25 遗留其二）。
+
+    判据与 pick/count_ready 的准入一致：enabled 且有凭证。禁用号 / 坏凭证号
+    打上游不但没有意义，还可能被上游回一个**空账本**，把本地账本再零化一次
+    （本仓那个 enabled=False 的 intl 号正是这个形态）。
+
+    返回 (targets, skipped)：skipped 是 [{"uid", "reason"}]，调用方**必须**把它
+    放进响应里 —— 否则「少刷新了几个号」会变成静默行为，排查时看不见。
+    """
+    targets, skipped = [], []
+    for a in accounts or []:
+        if a is None:
+            continue
+        if not a.enabled:
+            skipped.append({"uid": a.uid, "reason": "disabled"})
+            continue
+        if not a.access_token:
+            skipped.append({"uid": a.uid, "reason": "no_credential"})
+            continue
+        targets.append(a)
+    return targets, skipped
 
 
 def account_views(realm=None):
@@ -5966,9 +5990,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/credits":
             if not self._authorized():
                 return
-            for a in (POOL.accounts if POOL else []):
+            # #25：只强刷 enabled 且有凭证的号 —— 禁用号/坏凭证号打上游会被
+            # 回一个空账本，把本地账本再零化一次；被跳过的号在 skipped 里可区分。
+            targets, skipped = _refreshable_accounts(POOL.accounts if POOL else [])
+            for a in targets:
                 a.fetch_credits()
-            return self._json(200, {"accounts": account_views()})
+            return self._json(200, {"accounts": account_views(),
+                                    "skipped": skipped,
+                                    "refreshed": len(targets)})
         if path == "/accounts":
             if not self._authorized():
                 return
@@ -6378,17 +6407,17 @@ class Handler(BaseHTTPRequestHandler):
                 targets = [a for a in POOL.accounts if a.realm == realm]
             else:
                 targets = list(POOL.accounts)
+            # #25：与 GET 同一条守卫（显式 uid 指向禁用号时也会落到 skipped）
+            targets, skipped = _refreshable_accounts(targets)
             results = []
             for account in targets:
-                if account is None:
-                    continue
                 res = account.fetch_credits()
                 account.fetch_plan()
                 results.append({"uid": account.uid, "ok": res.get("ok", False),
                                 "credits": account.credits,
                                 "plan": account.plan,
                                 "error": res.get("error", "")})
-            return self._json(200, {"results": results,
+            return self._json(200, {"results": results, "skipped": skipped,
                                     "accounts": account_views()})
         if path == "/tasks/run":
             import qoder_tasks
@@ -6583,15 +6612,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/refresh":
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
+            # #25：第三个同类入口 —— 同样只对 enabled 且有凭证的号打上游
+            # （refresh 会打 OAuth 端点并 save 落盘，对禁用号纯属副作用）。
+            targets, skipped = _refreshable_accounts(targets)
             results = []
             for account in targets:
-                if account is None:
-                    continue
                 ok = account.refresh()
                 account.save(ACCOUNTS_DIR)
                 results.append({"uid": account.uid, "ok": ok,
                                 "error": account.last_error})
-            return self._json(200, {"results": results})
+            return self._json(200, {"results": results, "skipped": skipped})
         if path == "/accounts/test":
             uid = payload.get("uid")
             if not uid:
