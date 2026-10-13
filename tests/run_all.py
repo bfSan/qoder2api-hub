@@ -67,8 +67,12 @@ def _ensure_suite_line(name, log):
     try:
         with open(log, encoding="utf-8", errors="replace") as fh:
             body = fh.read()
-    except OSError:
-        return None
+    except OSError as exc:
+        # 保险自己的失败也要留痕（拿铁指出的真模式）：原来这里是 return None，
+        # 于是「零触发」与「坏了」在输出上完全一样 —— 正是我们反复在修的
+        # 「不把『不知道』渲染成『没发生』」。
+        return ("SUITE: %s md5=<unavailable> "
+                "(runner fallback FAILED: cannot read log: %s)" % (name, exc))
     # 判据收紧（拿铁指出的边界）：只含 "SUITE:" 不够 —— 套件若 import 了别的套件
     # （如 _test_legacy.py import 主套件），日志里会有**别人**的 SUITE 行，兜底就漏了。
     if ("SUITE: %s" % name) in body:
@@ -77,8 +81,8 @@ def _ensure_suite_line(name, log):
     path = os.path.join(HERE, name)
     try:
         raw = open(path, "rb").read()
-    except OSError:
-        return None
+    except OSError as exc:
+        return "SUITE: %s md5=<unavailable> (runner fallback FAILED: cannot read suite: %s)" % (name, exc)
     line = "SUITE: %s md5=%s (runner-computed; suite did not declare)" % (
         name, hashlib.md5(raw).hexdigest())
     # 同时追加进该套件的 log（拿铁的实测建议：logs: <dir> 这个提示让人以为「日志才是留存
@@ -86,8 +90,8 @@ def _ensure_suite_line(name, log):
     try:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write("\n" + line + "\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        return line + "  [log append FAILED: %s]" % exc
     return line
 
 
