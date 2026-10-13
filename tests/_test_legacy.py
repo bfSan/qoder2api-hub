@@ -1,3 +1,7 @@
+import os as _os_fp, sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["_test_qoder.py"])
 """兼容套件：把仓根那份 _test_qoder.py 整体当一支套件跑。
 
 P0-2 是「先骨架、再逐段迁移」：在迁移完成前，689 条既有断言一条都不能丢，

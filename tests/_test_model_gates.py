@@ -38,6 +38,12 @@ _allows = getattr(S, "key_allows_model", None)
 _banned = getattr(S, "banned_models", None)
 _set_banned = getattr(S, "set_banned_models", None)
 
+# ---- 指纹行（与前端 _test_dashboard_*.js 同格式；实现见 tests/_suite_head.py）----
+import os as _os_fp
+import sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["qoder_proxy.py", "qoder_settings.py"])
 print("[model-gates] P1-4 配置层")
 
 check("S1 清洗：字符串按 逗号 分号 换行 切分 + lower + 去重 + 去空",

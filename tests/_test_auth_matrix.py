@@ -67,6 +67,10 @@ def get(path, headers=None):
         return None, "%s: %s" % (type(e).__name__, e)
 
 
+import os as _os_fp, sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["qoder_proxy.py"])
 print("[auth-matrix] 面板鉴权矩阵")
 # 说明：identify_key() 查的是 settings 里注册的 key 列表，测试环境不写那份文件，
 # 所以这里覆盖的是「未设 key 时放行」这条路径；「已注册 key -> 200」由 _test_legacy 覆盖。

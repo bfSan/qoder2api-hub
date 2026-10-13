@@ -10,6 +10,8 @@ const fs = require('fs');
 const path = require('path');
 const ROOT = process.env.QD_DASH_ROOT || path.join(__dirname, '..');
 const html = fs.readFileSync(path.join(ROOT, 'dashboard.html'), 'utf8');
+// 套件自身指纹在**启动时**取一次：它代表**真正被执行的那份字节**（运行中被编辑也不会让这行说谎）
+const SUITE_MD5 = require('crypto').createHash('md5').update(require('fs').readFileSync(__filename)).digest('hex');
 let PASS = 0, FAIL = 0;
 function check(name, cond){ if(cond){ PASS++; console.log('  ok   ' + name); } else { FAIL++; console.log('  FAIL ' + name); } }
 function slice(from, to){
@@ -99,7 +101,7 @@ env.api.clear(); env.api.renderLogs();
 check('清空日志 → 回到空态占位', env.body.lines.length === 0 && env.body.empty === true);
 
 // 指纹两行：**被测文件**与**套件自身**，各带 as-of（UTC）——并发编辑下先比时间戳，再谈要不要重跑
-console.log('SUITE: ' + path.basename(__filename) + ' md5=' + require('crypto').createHash('md5').update(require('fs').readFileSync(__filename)).digest('hex'));
+console.log('SUITE: ' + path.basename(__filename) + ' md5=' + SUITE_MD5);
 console.log('FILE: ' + path.basename(path.join(ROOT, 'dashboard.html'))
   + ' md5=' + require('crypto').createHash('md5').update(html).digest('hex')
   + ' bytes=' + Buffer.byteLength(html, 'utf8') + ' codeunits=' + html.length

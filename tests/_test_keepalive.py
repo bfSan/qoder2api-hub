@@ -38,6 +38,10 @@ P.API_KEY_FILE_SET = False
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), P.Handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 PORT = srv.server_address[1]
+import os as _os_fp, sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["qoder_proxy.py"])
 print("[keepalive] 裸 socket 行为")
 
 # ① 超长请求行（100KB）——要快速拒绝，不能挂起

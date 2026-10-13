@@ -56,6 +56,41 @@ def total_of(path):
         return None
 
 
+def _ensure_suite_line(name, log):
+    """runner 兜底（拿铁建议）：套件没自己打 SUITE: 行时，由 runner 补一条**显式标注**的，
+    这样「跑的是哪份套件」永远有证据，且不需要动任何人的文件。
+
+    注意只兜「套件身份」（SUITE md5）—— 自动可得、不含领域知识；
+    「守护哪些被测文件」（FILE: 行）需要领域知识，代填有填错的风险（声明错比不声明更糟），
+    留给各 owner 在下一次触碰该套件时补。
+    """
+    try:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError:
+        return None
+    # 判据收紧（拿铁指出的边界）：只含 "SUITE:" 不够 —— 套件若 import 了别的套件
+    # （如 _test_legacy.py import 主套件），日志里会有**别人**的 SUITE 行，兜底就漏了。
+    if ("SUITE: %s" % name) in body:
+        return None
+    import hashlib
+    path = os.path.join(HERE, name)
+    try:
+        raw = open(path, "rb").read()
+    except OSError:
+        return None
+    line = "SUITE: %s md5=%s (runner-computed; suite did not declare)" % (
+        name, hashlib.md5(raw).hexdigest())
+    # 同时追加进该套件的 log（拿铁的实测建议：logs: <dir> 这个提示让人以为「日志才是留存
+    # 证据」，只保存日志的人复查时会以为兜底没生效）。
+    try:
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("\n" + line + "\n")
+    except OSError:
+        pass
+    return line
+
+
 def run_one(name, logdir, env):
     log = os.path.join(logdir, name + ".log")
     with open(log, "wb") as fh:
@@ -93,6 +128,9 @@ def main(argv):
             grand += n
         print("  %-34s %-10s checks=%s" % (name, "PASS" if rc == 0 else "FAIL(rc=%d)" % rc,
                                             n if n is not None else "?"))
+        _fb = _ensure_suite_line(name, log)
+        if _fb:
+            print("      " + _fb)
         if rc != 0:
             failed.append((name, log))
     for name, log in failed:

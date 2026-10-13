@@ -38,6 +38,10 @@ def acc(**kw):
     return a
 
 
+import os as _os_fp, sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["qoder_accounts.py", "qoder_settings.py"])
 print("[guards] 限额护栏不变量")
 check("reserve 含等号：remain==reserve -> 拦",
       acc(reserve_credits=100, credits={"remain": 100}).reserve_blocked() is True)

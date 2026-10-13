@@ -26,6 +26,10 @@ def check(label, ok, detail=None):
         print("  [FAIL] %s %r" % (label, detail))
 
 
+import os as _os_fp, sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["qoder_accounts.py", "qoder_proxy.py"])
 print("[proxy-invariant] 出站不变量")
 calls = []
 orig = A.http_json

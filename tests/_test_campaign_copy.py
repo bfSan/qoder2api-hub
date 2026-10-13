@@ -70,6 +70,12 @@ def _run(items, realm="intl"):
     return res, claims
 
 
+# ---- 指纹行（与前端 _test_dashboard_*.js 同格式；实现见 tests/_suite_head.py）----
+import os as _os_fp
+import sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["qoder_accounts.py"])
 print("[campaign-copy] #25 遗留 · accounts 文案同源")
 
 # P1 三档 action_type 在「已领」状态下文案一致

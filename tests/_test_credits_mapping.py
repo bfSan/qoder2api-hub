@@ -7,6 +7,7 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _suite_head import *  # noqa: F401,F403
+declare_suite(__file__, ["qoder_proxy.py"])
 
 P, A = bootstrap()
 

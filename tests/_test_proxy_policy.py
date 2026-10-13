@@ -58,6 +58,12 @@ for k in _ENV_KEYS:
 _map = getattr(A, "_proxy_map_from_env", None)
 _opf = getattr(A, "_opener_for_request", None)
 
+# ---- 指纹行（与前端 _test_dashboard_*.js 同格式；实现见 tests/_suite_head.py）----
+import os as _os_fp
+import sys as _sys_fp
+_sys_fp.path.insert(0, _os_fp.path.dirname(_os_fp.path.abspath(__file__)))
+from _suite_head import declare_suite
+declare_suite(__file__, ["qoder_accounts.py"])
 print("[proxy-policy] #27 出站代理策略")
 
 check("P1 无 env -> 空映射（直连；不读注册表）",

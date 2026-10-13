@@ -37,6 +37,11 @@ os.environ.setdefault("USAGE_DIR",
 os.environ.setdefault("QD_NATIVE_IDENTITY", "0")
 
 import qoder_proxy as P
+
+# ---- 指纹行（与前端六个 _test_dashboard_*.js 同格式；复用 tests/_suite_head.py 的实现）----
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tests"))
+from _suite_head import declare_suite  # noqa: E402
+declare_suite(__file__, ["qoder_proxy.py", "qoder_accounts.py", "qoder_sign.py"])
 import qoder_sign as S
 import qoder_catalog as C
 import qoder_accounts as A

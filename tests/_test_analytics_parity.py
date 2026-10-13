@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _suite_head import *  # noqa: F401,F403
 
 P, A = bootstrap()
+declare_suite(__file__, ["qoder_proxy.py"])
 
 print("[analytics-parity] by_key ≡ by_account 同源不变量")
 

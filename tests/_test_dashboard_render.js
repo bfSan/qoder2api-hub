@@ -9,6 +9,13 @@
 const fs = require('fs');
 const path = require('path');
 const html = fs.readFileSync(path.join(__dirname, '..', 'dashboard.html'), 'utf8');
+
+const _crypto = require('crypto');
+const _self = fs.readFileSync(__filename);
+console.log('SUITE: ' + path.basename(__filename) + ' md5=' + _crypto.createHash('md5').update(_self).digest('hex'));
+const _dashRoot = process.env.QD_DASH_ROOT || path.join(__dirname, '..');
+const _dashRaw = fs.readFileSync(path.join(_dashRoot, 'dashboard.html'));
+console.log('FILE: dashboard.html md5=' + _crypto.createHash('md5').update(_dashRaw).digest('hex') + ' bytes=' + _dashRaw.length + ' as-of=' + new Date().toISOString());
 const blocks = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
 const code = blocks.join('\n');
 
