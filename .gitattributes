@@ -14,3 +14,7 @@
 *.py text eol=lf
 *.json text eol=lf
 *.sh text eol=lf
+# 前端与前端套件（task-UI 同理）：dashboard.html 由 node 套件按字节读，
+# CRLF/LF 漂移会让 md5 指纹比 as-of 时间戳先「变红」，钉死消除噪声
+*.html text eol=lf
+*.js text eol=lf
