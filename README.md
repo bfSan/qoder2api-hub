@@ -407,6 +407,13 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 # 本机凭证扫描）
 python _test_qoder.py
 
+# 全量套件（29 个：Python + 前端 JS；--jobs 限并发，--logs 把每套件完整
+# 日志落在可见目录而不是临时目录，CI 与本地同一条命令）
+python tests/run_all.py --jobs 4 --logs suite-logs
+
+# 测试跑完后确认套件没把 checkout 弄脏（CI 的第二道门）
+python scripts/check_clean_checkout.py
+
 # 直接启动
 python qoder_proxy.py --port 8790
 

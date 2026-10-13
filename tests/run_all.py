@@ -107,7 +107,20 @@ def main(argv):
     if len(argv) > 1 and argv[1] in ("-h", "--help"):
         print(__doc__)
         return 0
-    pattern = argv[1] if len(argv) > 1 else ""
+    # 兼容两种调用：python tests/run_all.py dashboard（位置参数=过滤模式）
+    # 与 --jobs 4 --logs suite-logs（CI：日志落可见目录、限制并发）。
+    # wb 同款接口——CI 步骤与本地命令一条心。
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("pattern", nargs="?", default="")
+    ap.add_argument("--jobs", type=int, default=0)
+    ap.add_argument("--logs", default="")
+    known, _rest = ap.parse_known_args(argv[1:])
+    pattern = known.pattern
+    jobs = known.jobs or JOBS
+    logdir = known.logs or tempfile.mkdtemp(prefix="qd-suites-")
+    if known.logs:
+        os.makedirs(known.logs, exist_ok=True)
     selected = suites(pattern)
     if not selected:
         print("  no suite matches %r in %s" % (pattern, HERE))
@@ -118,8 +131,7 @@ def main(argv):
     env["PYTHONIOENCODING"] = "utf-8"
     if not shutil.which("node"):
         env.pop("NODE_OK", None)
-    logdir = tempfile.mkdtemp(prefix="qd-suites-")
-    with _cf.ThreadPoolExecutor(max_workers=JOBS) as ex:
+    with _cf.ThreadPoolExecutor(max_workers=jobs) as ex:
         results = list(ex.map(lambda n: run_one(n, logdir, env), selected))
     failed = []
     grand = 0
