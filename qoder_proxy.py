@@ -2217,6 +2217,8 @@ def clean_chunk(raw):
         obj = json.loads(raw)
     except Exception:
         return raw
+    if not isinstance(obj, dict):
+        return raw
     changed = False
     for choice in obj.get("choices") or []:
         delta = choice.get("delta")
@@ -4472,8 +4474,9 @@ def iter_inner_sse(resp, holder=None):
         if isinstance(inner, dict):
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
             note_inner_upstream_error(inner, status=status)
-        if holder is not None and inner.get("usage") and not holder.get("usage"):
-            holder["usage"] = inner["usage"]
+            if holder is not None and inner.get("usage") \
+                    and not holder.get("usage"):
+                holder["usage"] = inner["usage"]
         cleaned = clean_chunk(body)
         if not cleaned:
             continue
@@ -4500,6 +4503,8 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
         try:
             chunk = json.loads(data)
         except Exception:
+            continue
+        if not isinstance(chunk, dict):
             continue
         if first_chunk_at is None:
             first_chunk_at = time.time()
