@@ -3842,11 +3842,12 @@ def build_qoder_body(payload, account, model_key, realm=None):
 
     # tools：客户端给了就用客户端的（custom freeform 已降级），否则置空，
     # 避免把 Qoder 桌面端自带的 agent 工具（Bash/Edit/...）泄漏给普通客户端。
-    tools = payload.get("tools")
-    if tools:
-        body["tools"] = tools
-    else:
-        body["tools"] = []
+    body["tools"] = payload.get("tools") or []
+    # 出站统一嵌套 chat function schema：/v1/responses 的平铺 function 工具
+    # （{"type":"function","name":...}）和 custom 降级产物都是顶层 name 形态，
+    # 上游要求 tools[].function 对象，否则 400
+    # "'function' is a required property, expected an object - 'tools.N'"。
+    normalize_tools(body)
 
     # business 会话卡片
     biz = body.get("business") or {}
