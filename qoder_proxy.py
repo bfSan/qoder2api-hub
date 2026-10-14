@@ -45,6 +45,7 @@ import urllib.request
 import uuid
 
 import qoder_accounts
+import qoder_agents
 import qoder_anthropic
 import qoder_catalog
 import qoder_settings
@@ -1661,6 +1662,34 @@ def free_model_names(realm=None):
     except Exception as exc:
         log("free model list probe failed: %s" % exc, level="WARN")
     return names
+
+
+def gateway_models_for_agents(realm=None):
+    """面板「智能体配置」页的模型预填清单（与 /v1/models 同源裁剪）。"""
+    try:
+        entries = fetch_models_merged(realm=realm) if realm else             fetch_models_merged()
+    except Exception:
+        entries = []
+    out = []
+    for e in entries if isinstance(entries, list) else []:
+        if not isinstance(e, dict):
+            continue
+        mid = str(e.get("id") or "").strip()
+        if not mid:
+            continue
+        item = {"id": mid}
+        try:
+            if e.get("context_length"):
+                item["context_window"] = int(e["context_length"])
+        except (TypeError, ValueError):
+            pass
+        try:
+            if e.get("max_output_tokens"):
+                item["max_output"] = int(e["max_output_tokens"])
+        except (TypeError, ValueError):
+            pass
+        out.append(item)
+    return {"models": out[:80]}
 
 
 def runtime_settings_view():
@@ -5964,6 +5993,14 @@ class Handler(BaseHTTPRequestHandler):
     def _panel_ok(self):
         return PANEL.valid(self._panel_token())
 
+    def _client_is_loopback(self):
+        """agents 写配置只信 loopback：改的是网关本机的文件。"""
+        try:
+            host = self.client_address[0]
+            return ipaddress.ip_address(host).is_loopback
+        except Exception:
+            return False
+
     @staticmethod
     def _is_panel_route(path):
         """Management endpoints shown in the web panel.
@@ -5985,6 +6022,10 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/update"):
             return True
+        if path.startswith("/agents"):
+            # /agents/cli 是唯一的例外：公开只读的配置器源码端点（远程机器
+            # curl 取用），面板拦截会挡掉它的目标用户。
+            return path != "/agents/cli"
         return False
 
     def do_OPTIONS(self):
@@ -6034,6 +6075,37 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             return self.wfile.write(body)
+        if path == "/agents/cli":
+            # 配置器 CLI 源码（远程机器直接 curl 取用，免面板鉴权；
+            # 与仓库内 qoder_agents.py 逐字节一致）。只读。
+            try:
+                cli_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "qoder_agents.py")
+                with open(cli_path, "rb") as fh:
+                    body = fh.read()
+            except OSError as exc:
+                return self._error(500, "agents cli source unavailable: %s" % exc)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/x-python; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if cors_origin_allowed(self.path):
+                self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return self.wfile.write(body)
+        if path == "/agents":
+            if not self._authorized():
+                return
+            try:
+                return self._json(200, qoder_agents.overview(ACCOUNTS_DIR))
+            except qoder_agents.AgentConfigError as exc:
+                return self._error(500, str(exc))
+        if path == "/agents/models":
+            # 网关自己的模型清单（面板配置页预填用；与 /v1/models 同源字段）
+            if not self._authorized():
+                return
+            realm_q = query.get("realm", [None])[0]
+            return self._json(200, gateway_models_for_agents(realm_q))
         if path == "/update/check":
             # 项目新版本检测（看板「运行信息 · 新版本检测」；结果缓存 6h，force=1 强制刷新）
             _u = parse_qs(urlparse(self.path).query)
@@ -7258,6 +7330,40 @@ class Handler(BaseHTTPRequestHandler):
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required",
                                "invalid_request_error")
+        if path in ("/agents/apply", "/agents/restore"):
+            # 写**网关所在机器**的客户端配置文件：面板会话不够，还必须来自
+            # loopback（远程/容器调用按设计拒绝——那是配置器 CLI 的活）。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            if not self._client_is_loopback():
+                return self._error(
+                    403,
+                    "agent config writes are loopback-only: run the "
+                    "configurator CLI on the machine where the client "
+                    "lives (curl /agents/cli)",
+                    "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            try:
+                client_id = str(payload.get("client") or "").strip()
+                base_url = str(payload.get("base_url") or "").strip()
+                api_key = str(payload.get("api_key") or "").strip()
+                model = str(payload.get("model") or "").strip() or None
+                if path == "/agents/apply":
+                    models = None
+                    if payload.get("fetch_models"):
+                        models = qoder_agents.fetch_models_from_gateway(
+                            base_url, api_key)
+                    result = qoder_agents.integrate(
+                        ACCOUNTS_DIR, client_id, base_url, api_key,
+                        model=model, models=models)
+                else:
+                    result = qoder_agents.restore(ACCOUNTS_DIR, client_id)
+                return self._json(200, result)
+            except qoder_agents.AgentConfigError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
         is_account_route = (
             path.startswith("/accounts/")
             or path == "/realm"

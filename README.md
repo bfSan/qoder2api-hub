@@ -357,6 +357,35 @@ personalToken: pt- (长期兜底, 看板导入)
 
 ---
 
+## 三·五、智能体一键配置
+
+看板「智能体配置」页可检测本机已装的 AI 客户端，一键把它们的配置指向本网关：**改前自动备份、byte-exact 还原、多文件两阶段写入**（任一失败整体回滚）。纯标准库的文本级 YAML / TOML / JSON 编辑器，只增量插入或更新 `qoder-proxy` 那一段，绝不重排或抹掉你的注释、缩进与其它 provider 配置。
+
+| 客户端 | 写入位置 | 协议 |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` | 原生 Anthropic Messages（自动剥 `/v1`） |
+| Codex CLI | `~/.codex/config.toml`、`~/.codex/auth.json` | Responses API |
+| OpenCode | `~/.config/opencode/opencode.json` | OpenAI 兼容（`@ai-sdk/openai-compatible`） |
+| DSH (DeepSeek Harness) | `~/.dsh/settings.yaml`、`~/.dsh/.credentials.yaml` | OpenAI 兼容 |
+| Crush (Charm) | `~/.config/crush/crush.json` | OpenAI 兼容 |
+
+- **模型表自动预填**：写入时顺带从网关拉取 `/v1/models`（含上下文窗口），也验证 Key（401 = Key 被拒）；
+- **可回滚**：备份存 `accounts/agent-backups/<客户端>/`（每文件保留最新 10 份），「还原」byte-exact 回到接入前，网关新建的文件会被清理；
+- **密钥安全**：API Key 只写进客户端自己的本地配置；网关侧 state 只存 sha256 指纹，不存明文；
+- **写配置是 loopback-only**：一键配置改的是**网关所在机器**的文件——远程访问、容器部署下入口按设计隐藏。
+
+**客户端装在别的机器（网关跑在服务器 / NAS）**：用自带的配置器 CLI，它在客户端所在机器上运行、只通过 HTTP 从网关取模型表：
+
+```bash
+# 1. 取配置器（免面板鉴权的公开只读端点）
+curl -fsSL http://<网关地址>:8790/agents/cli -o qoder_agents.py
+
+# 2. 一条命令接入（Python 3.9+；Key 在「设置」页生成）
+python qoder_agents.py list                                        # 本机装了哪些客户端
+python qoder_agents.py apply --client dsh --base-url http://<网关>:8790 --key sk-xxxx
+python qoder_agents.py restore --client dsh                        # 随时 byte-exact 还原
+```
+
 ## 四、客户端配置与接入
 
 ### OpenAI 兼容客户端 (Chatbox / NextChat / Cherry Studio / Kelivo 等)
@@ -389,6 +418,11 @@ custom freeform 工具（`apply_patch`）自动降级为 function 工具出站�
 | GET | /tasks | 签到状态、连续天数、福利包资格与额度快照 |
 | POST | /tasks/run | 触发批量每日签到与领奖 |
 | POST | /tasks/travel | 批量领取 Pro 福利包 |
+| GET | /agents | 本机客户端探测与接入状态（需面板会话） |
+| GET | /agents/models | 网关模型清单（智能体配置页预填用） |
+| GET | /agents/cli | 配置器 CLI 源码（公开只读，远程机器直接 curl 取用） |
+| POST | /agents/apply | 一键写入客户端配置并备份原件（面板会话 + loopback） |
+| POST | /agents/restore | 一键还原客户端至接入前（byte-exact） |
 | GET | /scheduler | 定时调度器运行状态与排程日志 |
 | POST | /scheduler/trigger | 手动立即执行后台巡检保活 |
 | POST | /accounts/login/start | 发起 OAuth 设备授权 |
@@ -445,6 +479,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 | `qoder_tasks.py` | 签到闭环（含 DISABLED 归一化）、Pro 福利包、批量执行、保活巡检 |
 | `qoder_scheduler.py` | 整点排程调度器（09/21 签到 · 22:00 保活，签到能力运行时探测） |
 | `qoder_settings.py` | 面板密码 (PBKDF2)、多 API Key 出口绑定、会话管理 |
+| `qoder_agents.py` | 智能体一键配置：本机客户端探测、YAML/TOML/JSON 文本级增量编辑、备份与 byte-exact 还原、独立 CLI |
 | `qoder_fingerprint.py` | UID 稳定设备指纹派生 (derive_id) |
 | `baseprompt.json` | 官方推理请求体模板 |
 | `dashboard.html` | 单文件 Web 看板（本地凭证两步扫描导入 + PAT 导入 + 签到中心的**本机虚拟化检测**卡片） |
