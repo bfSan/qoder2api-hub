@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.7-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.4.0-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,46 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.4.0
+
+**✨ 新增功能**
+
+**① 智能体一键配置** —— 看板新页签「智能体配置」，把本机 AI 客户端指向本网关：
+- 支持五个客户端：**Claude Code**（原生 /v1/messages）、**Codex CLI**（Responses）、**OpenCode**、**DSH (DeepSeek Harness)**、**Crush (Charm)**；本机自动探测（配置目录 or PATH）；
+- **非侵入写入**：纯标准库的文本级 YAML / TOML / JSON 编辑器，只增量插入 qoder-proxy 那一段，注释、缩进、其它 provider 配置逐字节保留；模型表自动从网关拉取预填（顺带验证 Key，401 = Key 被拒）；
+- **byte-exact 还原**：写入前原件字节备份（accounts/agent-backups/，每文件保留 10 份），「还原」回到接入前，网关新建的文件会被清理；多文件客户端（Codex/DSH）两阶段写入，任一失败整体回滚；
+- **远程机器用 CLI**：客户端装在别的电脑时，curl /agents/cli 取配置器在客户端机器上跑（改本机配置、只从网关取模型表）；
+- **安全边界**：写配置是面板会话 + loopback-only（改的是网关所在机器的文件，远程/容器按设计拒绝）；API Key 只写进客户端本地，网关侧 state 只存 sha256 指纹。
+
+**② CI 独立测试门禁**（.github/workflows/tests.yml）—— #23（镜像漏 COPY 模块）的根因是测试只在本地跑：
+- 矩阵 Ubuntu py3.9（README 宣称的最低版）/ Ubuntu py3.12 / Windows py3.12，push(main / v* tag) + 全部 PR 触发；失败套件完整日志上传 artifact；
+- **发版纪律上 CI**：v* tag 必须等于源码 VERSION（带错 tag 的发版出不了门）；
+- 套件跑完 checkout 必须干净（scripts/check_clean_checkout.py——往仓库写东西的套件直接红）。
+
+**③ 深色主题 + 页内导航**（wb WebUI 模式移植，详见 🎨）。
+
+**🐛 问题修复**
+
+- **/v1/responses 扁平工具 400**（PR #30，daothinh）：Responses API 的工具是扁平形态（{"type":"function","name":...}），上游 chat 端点要求嵌套 tools[].function；normalize_tools() 原来只在 chat 路径跑，responses 与 Anthropic 桥接双双跳过 → 修进出站咽喉 build_qoder_body()，三条路径一次全覆盖（幂等：已嵌套的不动）；
+- **容器部署安全**（wb 修过的真实事故）：容器原来不带 --lan，端口发布到宿主网络而 Key 校验默认关闭——等于把上游额度向全网段裸奔；现在强制生成随机 Key（打印在启动日志，docker logs | grep -i "api key"）；
+- **测试时区夹具符号反了**（CI 首跑抓到的潜伏 bug）：_ts() 想构造「UTC+8 的 h:m」的 epoch，本地 offset 的加减号写反——本地恰好 UTC+8 时两个错误抵消所以从没红过，UTC runner 上 7 条窗口断言红 5 条；
+- **#52 抽取器只读第一个 script 块**：页面新增 head 主题脚本后，第一个块是主题脚本（不含被测函数）→ 误报 missing；改为遍历全部块拼接。
+
+**🎨 体验优化**
+
+- **三态主题**：浅色 / 深色 / 跟随系统（右上角切换器，偏好存 localStorage，head 内联脚本防闪白；深色含全部硬编码色覆盖层）；
+- **页内区块导航**：每页 section 现场生成左侧导航（标题取 h2、稳定锚点、滚动高亮、可收起、#锚点直达；窄屏转横向胶囊行）；
+- **页签记忆**：记住上次页签，刷新不回首页；内容区放宽到 1800px + 自适应留白；
+- **工具栏去重**：删掉与三态开关完全重叠的「⇄ 切换默认出口」按钮；9 按钮语义分组，低频全局动作收进「批量操作 ▾」；删除死代码 refreshAccounts/queryCredits；修正遗留品牌名 wb-proxy-console.log → qoder-proxy。
+
+**⚠️ 其他变更**
+
+- **Docker 镜像补 HEALTHCHECK**（跟随 PORT，重映射端口仍正确报告健康）；compose healthcheck 同步跟随 PORT；
+- run_all.py 增加 --jobs / --logs（CI 与本地同一条命令，失败日志落可见目录）；
+- 新增**整页加载层**测试套件（_test_dashboard_full_load.js：手写真 DOM 桩 eval 整个主 script 块——「切片绿 ≠ 整页绿」的补口）；.gitattributes 钉死 html/js 行尾（消除 md5 指纹噪声）。
+
+**验证**：全量 29 suites / 1024 checks / 0 failed（含 PR #30 分支与合并后 main 各复跑一次）；CI 三平台（Ubuntu py3.9/3.12 + Windows py3.12）绿；智能体配置端到端实测（apply 增量写入 / restore byte-exact / 新建文件清理 / state 清空）。
 
 ### v1.3.7
 
