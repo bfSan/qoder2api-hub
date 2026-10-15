@@ -99,6 +99,15 @@ check("tool_result -> role:tool + tool_call_id 配对（图片降级为占位）
 check("image(base64) -> data URI（qoder 的 image_url 形态）",
       _c["messages"][0]["content"][1]["image_url"]["url"]
       == "data:image/png;base64,AAA")
+# 单块 dict 形态（issue #33 根因回归钉）：content 直接给一个 image 块而非列表时，
+# 必须转成 image_url part；旧行为压成 {"type":"text","text":""} 把图静默吞掉。
+_single = AN.messages_to_chat({"max_tokens": 1, "messages": [
+    {"role": "user", "content": {"type": "image", "source":
+        {"type": "base64", "media_type": "image/png", "data": "BBBB"}}}]})
+check("单块 dict content：image 块保留为 image_url part（不吞成空文本）",
+      _single["messages"][0]["content"][0]["type"] == "image_url"
+      and _single["messages"][0]["content"][0]["image_url"]["url"]
+      == "data:image/png;base64,BBBB", _single["messages"][0]["content"])
 check("thinking block 入站丢弃（设计文档 §3.1）",
       "thinking" not in json.dumps(AN.messages_to_chat({"max_tokens": 1, "messages": [
           {"role": "assistant", "content": [

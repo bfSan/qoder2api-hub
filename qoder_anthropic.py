@@ -258,8 +258,16 @@ def messages_to_chat(payload, catalog_meta=None, supported=None):
         if role == "system":
             continue                    # 已由 system_prompt_of 合并（不丢弃，只上提）
         content = m.get("content")
-        blocks = content if isinstance(content, list) else [
-            {"type": "text", "text": content if isinstance(content, str) else ""}]
+        if isinstance(content, str):
+            blocks = [{"type": "text", "text": content}]
+        elif isinstance(content, list):
+            blocks = content
+        elif isinstance(content, dict):
+            # 单块形态（image/tool_use 单 dict 不套列表）：当单元素列表处理；
+            # 旧写法把它压成 {"type":"text","text":""}，图像块被静默吞掉。
+            blocks = [content]
+        else:
+            blocks = []
         texts, images, tool_calls, tool_results = [], [], [], []
         for b in blocks:
             if isinstance(b, str):

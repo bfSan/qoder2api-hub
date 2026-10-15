@@ -1504,6 +1504,24 @@ sys_text, flat, images = P.flatten_messages([
 check("system extracted", sys_text == "base")
 check("text parts joined", flat[0]["content"] == "part1")
 check("image collected", images == ["data:image/png;base64,AAA"])
+# 单 part dict 形态（issue #33 根因）：content 直接给一个 part 对象而非列表时，
+# 图像必须被收集、绝不 str() 成 Python 字面量文本——旧行为是模型收到
+# "{'type': 'image_url', ...}" 字符串且图像丢失。
+_sys_d, _flat_d, _img_d = P.flatten_messages([
+    {"role": "user", "content": {"type": "image_url",
+                                  "image_url": {"url": "data:image/png;base64,BBB"}}}])
+check("dict 单 part：图像收集而非字符串化",
+      _img_d == ["data:image/png;base64,BBB"]
+      and "image_url" not in str(_flat_d[0].get("content") or ""))
+_resp_d = P._flatten_content({"type": "input_image",
+                              "image_url": "data:image/png;base64,CCC"})
+check("Responses dict 单 part：保留结构化 image_url part 而非 str()",
+      isinstance(_resp_d, list) and len(_resp_d) == 1
+      and _resp_d[0].get("type") == "image_url"
+      and _resp_d[0]["image_url"]["url"] == "data:image/png;base64,CCC")
+# 非 dict 非 list（数值等）仍走 str() 兜底（该行为不受影响）
+_check_int = P._flatten_content(123)
+check("非 dict 非 list 仍 str() 兜底", _check_int == "123")
 check("fingerprint string sanitized",
       "You are Claude Code, Anthropic's official CLI tool" in
       P.sanitize_text("You are Claude Code, Anthropic's official CLI tool for Claude"))
