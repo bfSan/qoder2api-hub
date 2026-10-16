@@ -2717,6 +2717,82 @@ check("#36 流式：DSML 残片不再把回声块证伪——恢复为 tool_call
       and _calls36[0][0]["function"]["name"] == "terminal"
       and _c36[-1]["finish_reason"] == "tool_calls", _c36)
 
+# --- issue #36 后续（qingannn 二次报告）：尖括号标记变体 + DSML 标签跨帧 + 帧上限 ---
+_ALT36 = P.LEAK_MARKER_ALT
+check("ALT 常量：尖括号形态与方括号仅括号不同",
+      _ALT36 == "<" + P.LEAK_MARKER[1:-1] + ">")
+check("归一化：开头尖括号变体 -> 方括号形态",
+      P._normalize_leak_marker(_ALT36 + " rest") == P.LEAK_MARKER + " rest")
+check("归一化：中段出现不误伤（只改开头）",
+      P._normalize_leak_marker("note " + _ALT36 + " usage")
+      == "note " + _ALT36 + " usage")
+check("归一化：尖括号真前缀（跨帧进行中）判 pre",
+      P._leak_body_offset("<assistant") == ("pre", None))
+
+def _chunks36(pieces, n):
+    out = []
+    for p in pieces:
+        for i in range(0, len(p), n):
+            out.append(p[i:i + n])
+    return out
+
+def _raw36c(content=None, fin=None):
+    delta = {}
+    if content is not None:
+        delta["content"] = content
+    inner = {"id": "c36", "model": "m36", "created": 1, "choices": [
+        {"index": 0, "delta": delta, "finish_reason": fin}]}
+    return ("data: " + json.dumps(inner, ensure_ascii=False)
+            + chr(10) * 2).encode("utf-8")
+
+def _frames36c(pieces):
+    return [_raw36c(p, "stop" if i == len(pieces) - 1 else None)
+            for i, p in enumerate(pieces)]
+
+def _collect36(pieces, names=None):
+    res = []
+    for f in P.recover_leaked_tool_calls(iter(pieces),
+                                         allowed_names=names or {"terminal"}):
+        d = P.strip_data_prefix(f.decode("utf-8", "replace"))
+        if not d or d == "[DONE]":
+            continue
+        o = json.loads(d)
+        ch = (o.get("choices") or [{}])[0]
+        dd = ch.get("delta") or {}
+        res.append((dd.get("content"), dd.get("tool_calls"),
+                    ch.get("finish_reason")))
+    return res
+
+_VBAR = chr(0xFF5C)
+_DSML36 = ("</" + _VBAR * 2 + "DSML" + _VBAR * 2 + " parameter>\n"
+           + "</" + _VBAR * 2 + "DSML" + _VBAR * 2 + " invoke>\n"
+           + "</" + _VBAR * 2 + "DSML" + _VBAR * 2 + " calls>")
+_PRE36 = chr(0x51C6) + chr(0x5907) + chr(0x6838) + chr(0x5BF9) + chr(0x6587) + chr(0x4EF6) + chr(0x5185) + chr(0x5BB9) + chr(0xFF1A) + chr(10) * 2
+for _mk36 in (P.LEAK_MARKER, _ALT36):
+    for _n36 in (1, 4, 16, 64, 512):
+        _res36 = _collect36(_frames36c(_chunks36(
+            [_PRE36, _mk36 + chr(10), _CALLS27,
+             chr(10) + _DSML36], _n36)))
+        _tc36 = [c for _, c, _ in _res36 if c]
+        _tx36 = "".join(t for t, _, _ in _res36 if t)
+        _ok36 = (len(_tc36) == 1
+                 and _tc36[0][0]["function"]["name"] == "terminal"
+                 and P.LEAK_MARKER[1:-1] not in _tx36
+                 and "DSML" not in _tx36)
+        check("#36b 分片矩阵 %s/%d 帧：恢复且零泄漏"
+              % ("方括号" if _mk36 == P.LEAK_MARKER else "尖括号", _n36),
+              _ok36, _tx36[:80])
+
+check("#36b 尾巴判定：完整 DSML 标签可暂留",
+      P._dsml_tail_holdable("</" + _VBAR + "DSML" + _VBAR + "calls>"))
+check("#36b 尾巴判定：完整+半截组合可暂留（旧版 strip 卡死 + match 不中）",
+      P._dsml_tail_holdable(_DSML36[:21] + chr(10)
+                            + "</" + _VBAR * 2 + "DSML" + _VBAR * 2))
+check("#36b 尾巴判定：单字符 <（1 字符/帧边界）可暂留",
+      P._dsml_tail_holdable("<"))
+check("#36b 尾巴判定：长散文不暂留（长度护栏）",
+      not P._dsml_tail_holdable("<div " + "x" * 100))
+
 _ev27 = [f.decode() for f in P.stream_responses_events(
     iter([_raw27(_LEAK27), _raw27("", "stop")]), "m27",
     {"usage": None, "custom_names": set(), "allowed_names": {"terminal"}})]
@@ -3054,14 +3130,27 @@ check("上限常量：32KB / 200 帧",
 _keep_frames16 = P._HOLD_MAX_FRAMES
 try:
     P._HOLD_MAX_FRAMES = 2
+    # issue #36 follow-up: the frame cap only guards against idle frames
+    # (no growth, e.g. keep-alive noise); a growing legal echo block is
+    # bounded by the 32KB char cap instead.
     _fr16 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
-        iter([_raw27(P.LEAK_MARKER), _raw27("\n["), _raw27("1"), _raw27("2"),
-              _raw27("", "stop")]), {"terminal"})]
+        iter([_raw27(P.LEAK_MARKER + "\n[1"), _raw27(""),
+              _raw27(""), _raw27(""), _raw27("", "stop")]), {"terminal"})]
 finally:
     P._HOLD_MAX_FRAMES = _keep_frames16
-check("帧数兜底：超过 _HOLD_MAX_FRAMES 帧仍未证伪 -> 放行",
+check("帧数兜底：连续空转帧超 _HOLD_MAX_FRAMES -> fail-open 放行",
       "".join(f["choices"][0]["delta"].get("content") or "" for f in _fr16)
-      == P.LEAK_MARKER + "\n[12")
+      == P.LEAK_MARKER + "\n[1")
+# 有内容帧不再计入帧数上限（1 字符/帧的合法长块不受误伤——issue #36 后续）
+_calls16b = json.dumps([{"name": "terminal", "arguments": "{}"}],
+                       ensure_ascii=False)
+_fr16b = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27(P.LEAK_MARKER), _raw27("\n" + _calls16b[:8]),
+          _raw27(_calls16b[8:16]), _raw27(_calls16b[16:]),
+          _raw27("", "stop")]), {"terminal"})]
+check("有增长的帧不计帧数上限：4 内容帧在 _HOLD_MAX_FRAMES=2 下仍恢复",
+      any(f["choices"][0]["delta"].get("tool_calls") for f in _fr16b)
+      and _fr16b[-1]["choices"][0]["finish_reason"] == "tool_calls")
 
 print()
 print("[28] 发布前补强：终局验证 §10.7#5 的零覆盖项（防止静默回归）")

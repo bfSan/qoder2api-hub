@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.4.2-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.4.3-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,22 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.4.3
+
+**🐛 问题修复**
+
+- **流式工具调用回声的三种新泄漏形态**（issue #36 后续，报告者 qingannn 二次报告并给出精确分片实验）：
+  - **尖括号标记变体**：上游同一转换器还会产出 `<assistant 请求调用工具>`（方括号换尖括号）——回读守卫只认方括号，整块直接透传。修复：入口归一化（含围栏内、真前缀跨帧判定），判定逻辑仍只有一套；
+  - **DSML 闭合标签跨帧**：帧边界落在标签内部（如 `</｜｜DSML｜｜ param`，无 `>`）时，尾部剥离剥不动、JSON 在 "Extra data" 处证伪 → 整段泄漏。报告者实测「16/128 字符分片失败、512 成功」正是此因。修复：尾巴判定统一为「剥掉完整标签后，剩余为空或以 `</` 进行中（含单字符 `<`）即暂留」，长度护栏 80 字符防散文误留；
+  - **帧数上限误伤**：`_HOLD_MAX_FRAMES=200` 对「每帧 1 字符」的合法回声块（201+ 帧）触发 fail-open。修复：帧上限只防**空转**（连续无增长帧），有增长的块交给 32KB 字符上限兜底。
+- **验证**：分片矩阵 2 种标记 × 5 种尺寸（1/4/16/64/512）全部恢复且零泄漏；报告者三个场景逐一复现转绿。
+
+**⚠️ 其他变更**
+
+- 测试：`_test_proxy_policy.py` P3（能红证据）在本机系统代理 bypass 含 loopback 时如实 SKIP（Windows `proxy_bypass` 读注册表 bypass 列表会让死代理对 loopback 不生效——环境不可测，SKIP ≠ PASS）；产品行为断言（P3b/P4/P5）不受影响。
+
+**验证**：全量 **29 suites / 1050 checks / 0 failed**；新增 18 条 #36b 回归断言（归一化 4 + 分片矩阵 10 + 尾巴判定 4）。
 
 ### v1.4.2
 

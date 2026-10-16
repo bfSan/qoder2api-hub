@@ -92,14 +92,27 @@ check("P2 修复路径（无 env）直连可达本地服务",
 
 old_opener = U._opener
 U.install_opener(U.build_opener(U.ProxyHandler({"http": "http://127.0.0.1:9"})))
+# 环境探测：Windows 上 ProxyHandler 对每个目标先查 proxy_bypass(host)——
+# 它读注册表系统代理的 bypass 列表。本机代理工具开着且 bypass 含 <local>/
+# localhost 时，127.0.0.1 目标会被绕开死代理 -> urlopen 直连成功 ->
+# P3 的「旧路径必败」在这类环境不可测。如实 SKIP（SKIP != PASS）。
+_env_bypass = False
+try:
+    _env_bypass = bool(U.proxy_bypass("127.0.0.1"))
+except Exception:
+    pass
 legacy_ok = False
 try:
     U.urlopen(URL, timeout=3)
     legacy_ok = True
 except Exception:
     pass
-check("P3 模拟修复前：全局 opener 固化到死端口 -> 旧路径(urllib.urlopen)"
-      "失败（10061 形态）", legacy_ok is False, None)
+if _env_bypass:
+    print("  [SKIP] P3 本机系统代理 bypass 含 loopback（proxy_bypass=1），"
+          "旧路径的 10061 判定在该环境不可测")
+else:
+    check("P3 模拟修复前：全局 opener 固化到死端口 -> 旧路径(urllib.urlopen)"
+          "失败（10061 形态）", legacy_ok is False, None)
 try:
     with _opf().open(URL, timeout=5) as r2:
         _p3b = (r2.status, r2.read())

@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2910,6 +2910,37 @@ def parse_dsml_tool_calls(text):
 # tool_calls），客户端就会把这段 JSON 当正文显示、本轮工具调用不执行。
 # 这里补齐回读：在严格守卫下还原成结构化 tool_calls 并从正文移除。
 LEAK_MARKER = "[assistant 请求调用工具]"
+# issue #36 follow-up: the same upstream converter also emits the marker
+# with ANGLE brackets (<assistant 请求调用工具>). Normalize it to the square-bracket
+# form at every entry so there is exactly one code path for detection.
+LEAK_MARKER_ALT = "<assistant 请求调用工具>"
+
+
+def _normalize_leak_marker(text):
+    """Rewrite a leading angle-bracket marker variant into the
+    square-bracket form (also through a ``` fence).
+
+    Only a LEADING hit is rewritten; the variant appearing mid-prose is
+    untouched (that is not the start of an echo block).
+    """
+    if not text:
+        return text
+    t = text.lstrip()
+    lead = text[:len(text) - len(t)]
+    if t.startswith(LEAK_MARKER_ALT):
+        return lead + LEAK_MARKER + t[len(LEAK_MARKER_ALT):]
+    if t.startswith("```"):
+        rest = t[3:]
+        low = rest.lstrip().lower()
+        if low.startswith("json"):
+            after = rest.lstrip()[4:].lstrip()
+        else:
+            after = rest.lstrip()
+        if after.startswith(LEAK_MARKER_ALT):
+            return (lead + t[:len(t) - len(after)]
+                    + LEAK_MARKER + after[len(LEAK_MARKER_ALT):])
+    return text
+
 
 # issue #36：上游把 DSML 工具调用转成「marker + JSON 数组」后，偶尔还会在
 # 数组之后漏出原始 DSML 闭合标签（</｜DSML｜parameter> / </｜DSML｜invoke>
@@ -2928,6 +2959,30 @@ def _strip_dsml_close_tail(text):
     return text
 
 
+def _dsml_tail_holdable(tail):
+    """Extra-data 尾巴是否是「DSML 闭合标签（完整 / 帧边界截断的半截）」。
+
+    先剥掉所有尾部完整标签，剩余若空（全是标签）或以 </ 开头（标签
+    进行中）→ 值得暂留。宽松只影响延迟：流末 parse 入口的完整剥离是
+    最终兜底（issue #36 后续）。
+    """
+    s = (tail or "").strip()
+    if not s:
+        return True
+    prev = None
+    while prev != s:
+        prev = s
+        s = _DSML_CLOSE_TAG_RE.sub("", s).strip()
+    if not s:
+        return True
+    # 半截标签进行中：已见 "</" 或恰好切在首字符 "<"（1 字符/帧的真实边界）。
+    # 长度护栏：真实 DSML 标签 <= ~25 字符，80 已留足余量；更长的大概率是
+    # 散文，不再压住（fail-open 语义不破坏）。
+    if s.startswith("</"):
+        return len(s) <= 80
+    return s == "<"
+
+
 # issue #11：tool 角色消息被序列化进 content 时的开标记（写入侧见
 # flatten_messages）。网关只写开标记、不写闭标记；模型常自造一个
 # 「[工具结果结束]」闭标记，甚至夹带自造的 <system_warning> 残片。
@@ -2940,13 +2995,14 @@ TOOL_RESULT_CLOSE = "[工具结果结束]"
 # issue #16-B1：跨帧补全窗口 = 最长标记长度 - 1（LEAK_MARKER 18 字符 -> 17）。
 # 只有帧/缓冲**末尾**的这 17 个字符内匹配到某个标记的真前缀时才暂留；
 # 下一帧一旦证伪立即补发（fail-open），不会无限压住正常文本。
-_MARKER_HOLD_WINDOW = max(len(LEAK_MARKER), len(TOOL_RESULT_MARKER)) - 1
+_MARKER_HOLD_WINDOW = max(len(LEAK_MARKER), len(LEAK_MARKER_ALT),
+                           len(TOOL_RESULT_MARKER)) - 1
 
 # issue #16 兜底：hold 缓冲上限。正常文本长期"看起来仍是候选"时（模型写超长
 # JSON/正则示例），hold 会持续增长 -> 内存与首字延迟风险。超限即 fail-open
 # 放行并记一条 WARN：宁可漏一次，也不无限压住客户端。
 _HOLD_MAX_CHARS = 32768            # 32KB（真实回声块远小于此；见档案 §13）
-_HOLD_MAX_FRAMES = 200             # 极端"每帧 1 字符"场景的二级兜底
+_HOLD_MAX_FRAMES = 200             # 连续空转帧上限（帧不增长才算一帧）
 
 
 def parse_leaked_tool_calls(text, allowed_names=None):
@@ -2961,6 +3017,8 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     （整段都是该块）；未识别时原样返回 text。
     """
     t = (text or "").strip()
+    # issue #36 follow-up: normalize the angle-bracket marker variant.
+    t = _normalize_leak_marker(t)
     # issue #36：整段解析前先剥尾部 DSML 闭合标签残片。
     t = _strip_dsml_close_tail(t)
     # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
@@ -3015,11 +3073,15 @@ def _leak_body_offset(text):
     state='body'（已越过 marker，body 为其后文本）、state='no'（显然不是）。
     流式暂存与判真共用同一套前缀规则（含 ``` 与 ```json 围栏）。
     """
-    t = (text or "").lstrip()
+    t = _normalize_leak_marker((text or "")).lstrip()
     if not t or LEAK_MARKER.startswith(t):
         return "pre", None
     if t.startswith(LEAK_MARKER):
         return "body", t[len(LEAK_MARKER):]
+    # issue #36 后续：尖括号变体的**真前缀**（跨帧进行中）同样算 pre——
+    # 1 字符/帧时 '<' 单独到达，不能当散文放出（否则 marker 开头丢失）。
+    if LEAK_MARKER_ALT.startswith(t):
+        return "pre", None
     if not t.startswith("`"):
         return "no", None
     if len(t) < 3:
@@ -3093,7 +3155,14 @@ def _json_array_prefix_ok(text):
         if msg.startswith("Extra data"):
             # 数组已完整，尾随的只能是（可能还没打完的）``` 收尾围栏
             tail = s[pos:].strip()
-            return (not tail) or "```".startswith(tail)
+            # issue #36 follow-up: the tail may also be upstream DSML
+            # close tags (complete, or cut mid-tag by a frame boundary
+            # before the closing >). Hold those too - the stream-end
+            # parse strips them; leniency only delays, never changes
+            # the final verdict.
+            if (not tail) or "```".startswith(tail):
+                return True
+            return _dsml_tail_holdable(tail)
         # 语法错误点落在末尾（未闭合括号等）→ 还允许继续扩展
         return pos >= len(s) - 1
 
@@ -3109,7 +3178,7 @@ def _find_marker_split(text, allow_prefix=True):
     背景：服务端 delta 切分不可控，"散文 + marker" 可能落在同一帧，而
     _leak_prefix_hold 只认「整帧以标记开头」-> 整帧被透传 -> 泄漏。
     """
-    t = text or ""
+    t = _normalize_leak_marker(text or "")
     if not t:
         return "", ""
     best = -1
@@ -3122,7 +3191,7 @@ def _find_marker_split(text, allow_prefix=True):
     if not allow_prefix:
         return t, ""
     tail = t[-_MARKER_HOLD_WINDOW:] if len(t) > _MARKER_HOLD_WINDOW else t
-    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+    for mk in (LEAK_MARKER, LEAK_MARKER_ALT, TOOL_RESULT_MARKER):
         for n in range(min(len(tail), len(mk) - 1), 0, -1):
             if tail.endswith(mk[:n]):
                 return t[:-n], t[-n:]
@@ -3134,7 +3203,7 @@ def _marker_starts_at(text):
     t = text or ""
     if not t:
         return True
-    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
+    for mk in (LEAK_MARKER, LEAK_MARKER_ALT, TOOL_RESULT_MARKER):
         if t.startswith(mk):
             return True
         if len(t) < len(mk) and mk.startswith(t):
@@ -3300,7 +3369,7 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
       - 上游中断时暂存直接丢弃（正文未发，交给上游重试/错误帧处理）。
     """
     hold = None          # 正在暂存的候选正文（None = 未暂存）
-    hold_frames = 0      # hold 已累积的帧数（上限兜底用，issue #16）
+    hold_frames = 0      # 连续未增长的帧数（空转保护，issue #16/#36 后续）
     finished = None      # 暂存的收尾帧：(payload, 原 finish_reason)
     recovered = False
     meta = {"id": None, "model": None, "created": None}
@@ -3341,7 +3410,13 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
             continue
         if hold is not None:
             hold += piece
-            hold_frames += 1
+            # issue #36 后续：帧上限只防**空转**（连续空帧不增长），有增长的
+            # 合法回声块（每帧 1 字符也会推进长度）交给 32KB 字符上限兜底——
+            # 否则 201 字符的合法块在 1 字符/帧下会在 200 帧处被误伤 fail-open。
+            if piece:
+                hold_frames = 0
+            else:
+                hold_frames += 1
             # issue #36：尾部 DSML 闭合标签是上游协议残片，剥掉再判候选；
             # 只有剥掉后仍是候选时才采纳（讨论 DSML 的普通散文不被误伤）。
             _stripped = _strip_dsml_close_tail(hold)
