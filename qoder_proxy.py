@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2911,6 +2911,23 @@ def parse_dsml_tool_calls(text):
 # 这里补齐回读：在严格守卫下还原成结构化 tool_calls 并从正文移除。
 LEAK_MARKER = "[assistant 请求调用工具]"
 
+# issue #36：上游把 DSML 工具调用转成「marker + JSON 数组」后，偶尔还会在
+# 数组之后漏出原始 DSML 闭合标签（</｜DSML｜parameter> / </｜DSML｜invoke>
+# / </｜DSML｜calls>，全角或半角竖线）。这些残片落在 hold 尾部会让
+# _json_array_prefix_ok 在 "Extra data" 处证伪 -> 整段被当正文补发，工具调用
+# 不执行且内部协议文本泄漏给用户。剥离只作用于尾部（内部出现则不属于此形态）。
+_DSML_CLOSE_TAG_RE = re.compile(r"</[^>]*DSML[^>]*>\s*$")
+
+
+def _strip_dsml_close_tail(text):
+    """反复剥掉正文尾部连续的 DSML 闭合标签 + 空白；返回剥离后的文本。"""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _DSML_CLOSE_TAG_RE.sub("", text)
+    return text
+
+
 # issue #11：tool 角色消息被序列化进 content 时的开标记（写入侧见
 # flatten_messages）。网关只写开标记、不写闭标记；模型常自造一个
 # 「[工具结果结束]」闭标记，甚至夹带自造的 <system_warning> 残片。
@@ -2944,6 +2961,8 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     （整段都是该块）；未识别时原样返回 text。
     """
     t = (text or "").strip()
+    # issue #36：整段解析前先剥尾部 DSML 闭合标签残片。
+    t = _strip_dsml_close_tail(t)
     # 整段被 ``` 围栏包裹时先剥壳（模型复述时常带围栏）
     if t.startswith("```") and t.endswith("```") and len(t) > 6:
         inner = t[3:]
@@ -3323,6 +3342,11 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
         if hold is not None:
             hold += piece
             hold_frames += 1
+            # issue #36：尾部 DSML 闭合标签是上游协议残片，剥掉再判候选；
+            # 只有剥掉后仍是候选时才采纳（讨论 DSML 的普通散文不被误伤）。
+            _stripped = _strip_dsml_close_tail(hold)
+            if _stripped != hold and _still_leak_candidate(_stripped):
+                hold = _stripped
             if _echo_hold_candidate(hold):
                 # issue #16 兜底：超限即 fail-open 放行（内存 + 首字延迟）。
                 if len(hold) > _HOLD_MAX_CHARS \
@@ -3717,7 +3741,17 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
             flat.append(item)
             continue
         if role in ("user", "assistant"):
-            item = {"role": role, "content": text or ""}
+            if imgs:
+                # 上游只读消息 content 里的结构化 image_url parts，**不读**
+                # 顶层 image_urls / chat_context.imageUrls（实测：image_urls
+                # 填了模型仍回「我没有收到图片」，改 parts 后正确识别颜色）。
+                # 带图消息保留 parts 形态；顶层 image_urls 仍照填（兼容无害）。
+                _parts = _flatten_content(m.get("content"))
+                item = {"role": role,
+                        "content": _parts if isinstance(_parts, list)
+                        else (text or "")}
+            else:
+                item = {"role": role, "content": text or ""}
             if role == "assistant" and keep_reasoning \
                     and m.get("reasoning_content") is not None:
                 item["reasoning_content"] = m.get("reasoning_content") or ""
@@ -3774,7 +3808,12 @@ def build_qoder_body(payload, account, model_key, realm=None):
     prompt = ""
     for m in reversed(flat):
         if m["role"] == "user" and m.get("content"):
-            prompt = m["content"]
+            _c = m["content"]
+            if isinstance(_c, list):
+                _c = "\n".join(
+                    str(p.get("text") or "") for p in _c
+                    if isinstance(p, dict) and p.get("type") == "text")
+            prompt = _c
             break
 
     nid = str(uuid.uuid4())

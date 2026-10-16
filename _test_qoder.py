@@ -1502,17 +1502,30 @@ sys_text, flat, images = P.flatten_messages([
                                    "image_url": {"url": "data:image/png;base64,AAA"}}]},
 ])
 check("system extracted", sys_text == "base")
-check("text parts joined", flat[0]["content"] == "part1")
+# v1.4.2：带图消息的 content 保留结构化 parts（上游只读 content 里的 image_url
+# parts，不读顶层 image_urls——实测确认）。文本 part 仍在，图像 part 并存。
+check("带图消息 content 是结构化 parts（text + image_url 并存）",
+      isinstance(flat[0]["content"], list)
+      and flat[0]["content"][0] == {"type": "text", "text": "part1"}
+      and flat[0]["content"][1]["type"] == "image_url"
+      and flat[0]["content"][1]["image_url"]["url"]
+      == "data:image/png;base64,AAA", flat[0]["content"])
 check("image collected", images == ["data:image/png;base64,AAA"])
+# 无图消息仍压平为纯文本（行为不变）
+_sys_n, _flat_n, _img_n = P.flatten_messages([
+    {"role": "user", "content": [{"type": "text", "text": "plain"}]}])
+check("无图消息 content 仍为纯文本", _flat_n[0]["content"] == "plain")
 # 单 part dict 形态（issue #33 根因）：content 直接给一个 part 对象而非列表时，
 # 图像必须被收集、绝不 str() 成 Python 字面量文本——旧行为是模型收到
 # "{'type': 'image_url', ...}" 字符串且图像丢失。
 _sys_d, _flat_d, _img_d = P.flatten_messages([
     {"role": "user", "content": {"type": "image_url",
                                   "image_url": {"url": "data:image/png;base64,BBB"}}}])
-check("dict 单 part：图像收集而非字符串化",
+check("dict 单 part：图像收集且 content 为结构化 parts 而非 str() 文本",
       _img_d == ["data:image/png;base64,BBB"]
-      and "image_url" not in str(_flat_d[0].get("content") or ""))
+      and isinstance(_flat_d[0].get("content"), list)
+      and _flat_d[0]["content"][0]["image_url"]["url"]
+      == "data:image/png;base64,BBB", _flat_d[0]["content"])
 _resp_d = P._flatten_content({"type": "input_image",
                               "image_url": "data:image/png;base64,CCC"})
 check("Responses dict 单 part：保留结构化 image_url part 而非 str()",
@@ -2676,6 +2689,33 @@ _frames27c = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
 check("流式：未声明工具名 -> 不吞正文，按普通文本透传",
       "".join(_f["choices"][0]["delta"].get("content") or ""
               for _f in _frames27c) == _LEAK27, _frames27c)
+
+# --- issue #36：marker + JSON 数组之后漏出 DSML 闭合标签残片 ---
+# 修复前整段被当正文补发（finish=stop、工具不执行）；修复后恢复为
+# 结构化 tool_calls（finish=tool_calls），残片零泄漏。
+_DSML_TAIL = ("</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜calls>")
+check("#36 尾部剥离：DSML 闭合标签残片被剥掉（残留换行由调用方 strip 处理）",
+      P._strip_dsml_close_tail(_LEAK27 + "\n" + _DSML_TAIL).strip() == _LEAK27)
+check("#36 尾部剥离：正文内部出现 DSML 字串不受影响（只剥尾部）",
+      P._strip_dsml_close_tail("讨论 </｜DSML｜invoke> 的正文") == "讨论 </｜DSML｜invoke> 的正文")
+_frames36 = [json.loads(f[6:]) for f in P.recover_leaked_tool_calls(
+    iter([_raw27("准备修改命令后重试：\n\n"),
+          _raw27(_LEAK27.split("\n")[0] + "\n"),
+          _raw27(_LEAK27.split("\n")[1]),
+          _raw27("\n</｜DSML｜parameter>\n"),
+          _raw27("</｜DSML｜invoke>\n"),
+          _raw27("</｜DSML｜calls>"),
+          _raw27("", "stop")]),
+    {"terminal"})]
+_c36 = [_f["choices"][0] for _f in _frames36]
+_txt36 = "".join(_d.get("delta", {}).get("content") or "" for _d in _c36)
+_calls36 = [(_d.get("delta", {}) or {}).get("tool_calls") for _d in _c36
+            if _d.get("delta", {}).get("tool_calls")]
+check("#36 流式：DSML 残片不再把回声块证伪——恢复为 tool_calls 增量",
+      not ("DSML" in _txt36 or "请求调用工具" in _txt36)
+      and len(_calls36) == 1
+      and _calls36[0][0]["function"]["name"] == "terminal"
+      and _c36[-1]["finish_reason"] == "tool_calls", _c36)
 
 _ev27 = [f.decode() for f in P.stream_responses_events(
     iter([_raw27(_LEAK27), _raw27("", "stop")]), "m27",

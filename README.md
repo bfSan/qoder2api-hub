@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.4.1-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.4.2-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,15 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.4.2
+
+**🐛 问题修复**
+
+- **图像真正送达上游**（v1.4.1 修复不彻底）：实测发现 qoder 上游**不读**顶层 image_urls / chat_context.imageUrls——图像填进这两个字段后模型仍回「我没有收到图片」。改为带图消息的 content 保留结构化 image_url parts（与 workbuddy 网关同款形态），上游从此识别图像（200x200 纯红图实测模型答「红色」）；顶层 image_urls 仍照填（兼容无害）。三个入口（Chat / Responses / Anthropic）全部覆盖。
+- **DeepSeek-Flash 流式工具调用偶发变正文**（issue #36，报告者 qingannn）：上游把 DSML 工具调用转成「marker + JSON 数组」后偶尔在数组尾部漏出原始 DSML 闭合标签（</｜DSML｜parameter> / invoke / calls）——残片让流式暂存缓冲在 JSON 已完成处证伪，整段被当正文补发：工具不执行、内部协议文本泄漏给客户端。修复：尾部 DSML 闭合标签剥离（仅尾部，正文内部讨论 DSML 不受影响），流式暂存与整段解析双入口生效。修复前帧序列复现必红、修复后恢复为结构化 tool_calls（finish_reason=tool_calls）。
+
+**验证**：全量 **29 suites / 1032 checks / 0 failed**；真实链路实测（经网关 → qoder 上游）：文本基线正常、1x1 图模型确认收到（回答颜色）、200x200 纯红图模型答「红色」；#36 帧序列离线复现 + 能红证据（stash 回退必红）。
 
 ### v1.4.1
 
