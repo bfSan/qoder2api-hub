@@ -1392,6 +1392,15 @@ function setRealmMode(mode){
   setGatewayRealm(mode);
 }
 
+// issue #39：账号的**有效余额** = 套餐 remain + 可用共享池（团队账号套餐用满时
+// 仍有共享额度可用）。没有共享字段时等价于 remain；两者都缺 → null（未知）。
+function credRemain(a){
+  const c = a && a.credits;
+  if(!c) return null;
+  if(c.remain_effective != null) return c.remain_effective;
+  return (c.remain != null) ? c.remain : null;
+}
+
 function updateUI(){
   const isIntlView = (window.VIEW_REALM === "intl");
   const tIntl = document.getElementById("tabIntl");
@@ -1448,9 +1457,9 @@ function updateUI(){
   const cnAccts = allAccts.filter(a => a.realm === 'cn');
 
   let intlCred = 0, hasIntlCred = false;
-  intlAccts.forEach(a => { if(a.credits && a.credits.remain != null){ intlCred += a.credits.remain; hasIntlCred = true; } });
+  intlAccts.forEach(a => { const _r = credRemain(a); if(_r != null){ intlCred += _r; hasIntlCred = true; } });
   let cnCred = 0, hasCnCred = false;
-  cnAccts.forEach(a => { if(a.credits && a.credits.remain != null){ cnCred += a.credits.remain; hasCnCred = true; } });
+  cnAccts.forEach(a => { const _r = credRemain(a); if(_r != null){ cnCred += _r; hasCnCred = true; } });
 
   const elIntlCred = document.getElementById("tabIntlCredits");
   if(elIntlCred) elIntlCred.textContent = hasIntlCred ? fmt(intlCred) : "—";
@@ -3027,7 +3036,7 @@ async function refreshInner(){
   let totRemain = 0, totSize = 0, hasCreds = false;
   window.ACCOUNTS.forEach(a => {
     if(a.credits){
-      totRemain += (a.credits.remain || 0);
+      totRemain += (credRemain(a) || 0);
       totSize += (a.credits.size || 0);
       hasCreds = true;
     }
@@ -4827,11 +4836,15 @@ function renderAnalytics(data){
           : '<span class="badge s" style="font-size:10px">国际版</span>';
 
         let creditStr = '<span style="color:var(--dim)">—</span>';
-        if(a.credits && a.credits.remain != null){
+        const _eff = credRemain(a);
+        if(a.credits && _eff != null){
+          const _shared = (a.credits.shared && a.credits.shared.remain != null)
+            ? ' <span style="color:var(--dim);font-size:11px" title="共享额度（团队/企业池）剩余">共享 ' + fmt(a.credits.shared.remain) + '</span>'
+            : '';
           if(a.credits.size){
-            creditStr = '<b style="color:var(--accent2)">' + fmt(a.credits.remain) + '</b> <span style="color:var(--dim);font-size:11px">/ ' + fmt(a.credits.size) + ' 积分</span>';
+            creditStr = '<b style="color:var(--accent2)">' + fmt(a.credits.remain) + '</b> <span style="color:var(--dim);font-size:11px">/ ' + fmt(a.credits.size) + ' 积分</span>' + _shared;
           } else {
-            creditStr = '<b style="color:var(--accent2)">' + fmt(a.credits.remain) + '</b> <span style="color:var(--dim);font-size:11px">积分</span>';
+            creditStr = '<b style="color:var(--accent2)">' + fmt(a.credits.remain) + '</b> <span style="color:var(--dim);font-size:11px">积分</span>' + _shared;
           }
         }
 

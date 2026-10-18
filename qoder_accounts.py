@@ -1397,7 +1397,9 @@ class Account(object):
         cred = self.credits
         if not isinstance(cred, dict):
             return False
-        remain = cred.get("remain")
+        # issue #39：团队账号「套餐已用满 + 共享池仍有余额」按有效余额判定，
+        # 否则共享额度白有、账号被误停。
+        remain = cred.get("remain_effective", cred.get("remain"))
         if remain is None:
             return False
         try:
@@ -1573,7 +1575,9 @@ class Account(object):
         if not self.balance_until:
             return False
         cred = self.credits
-        remain = cred.get("remain") if isinstance(cred, dict) else None
+        # issue #39：团队账号可能套餐 remain=0 但共享池仍有余额——按有效余额解封。
+        remain = (cred.get("remain_effective", cred.get("remain"))
+                  if isinstance(cred, dict) else None)
         try:
             if remain is None or float(remain) <= 0:
                 return False
@@ -2547,20 +2551,27 @@ class Account(object):
         # issue #39：上游若有**共享额度池**（团队/企业/池化），原样纳入
         # packages 与 credits.shared——此前只显示套餐内 + 赠送，共享额度被漏掉。
         # 字段名按常见形态兼容；不存在就不编造（面板不显示该行）。
+        # 实测字段（issue #39 报告者提供）：团队账号返回
+        #   "orgResourcePackage": {"used":1548,"remaining":952,"percentage":0.62,
+        #                          "unit":"credits","cap":2500,"available":true}
+        # 注意它用 cap（不是 total），且带 available——不可用时不计入有效余额。
         shared = None
-        for _key in ("sharedQuota", "teamQuota", "poolQuota",
-                     "sharedCredits", "sharedCredit"):
+        for _key in ("orgResourcePackage", "sharedQuota", "teamQuota",
+                     "poolQuota", "sharedCredits", "sharedCredit"):
             _src = q.get(_key)
             if isinstance(_src, dict):
                 shared = {
                     "remain": int(_num(_src, "remaining")),
                     "used": int(_num(_src, "used")),
-                    "size": int(_num(_src, "total")),
+                    "size": int(_num(_src, "cap") or _num(_src, "total")),
+                    "available": bool(_src.get("available", True)),
+                    "source": _key,
                     **_expiry_of(_src),
                 }
                 break
             if isinstance(_src, (int, float)) and not isinstance(_src, bool):
-                shared = {"remain": int(_src), "used": 0, "size": int(_src)}
+                shared = {"remain": int(_src), "used": 0, "size": int(_src),
+                          "available": True, "source": _key}
                 break
         _pkgs = [
             {"name": "基础额度", "remain": int(_num(uq, "remaining")),
@@ -2572,8 +2583,15 @@ class Account(object):
         ]
         if shared:
             _pkgs.append({"name": "共享额度", **shared})
+        # issue #39：团队账号的 userQuota 可能已用满（remain=0）而共享池仍有余额
+        # ——有效余额 = 套餐 remain + 可用的共享 remain。护栏与汇总按它判断，
+        # 否则「套餐用满但共享池还有 952」会被误判为余额耗尽。
+        _shared_avail = (shared.get("remain") or 0) \
+            if (shared and shared.get("available", True)) else 0
+        remain_effective = int(remain + _shared_avail)
         self.credits = {
             "remain": remain,
+            "remain_effective": remain_effective,
             "used": used,
             "size": size,
             "exceeded": bool(q.get("isQuotaExceeded")),

@@ -156,6 +156,97 @@ check("#39 packages 里出现「共享额度」行",
 check("#39 套餐总额口径不变（不把共享额度并进 remain）",
       _cr39.get("remain") == 135 and _cr39.get("size") == 150, _cr39)
 
+# ---- #39 后续：报告者提供的真实团队账号响应（orgResourcePackage，cap 而非 total）
+_TEAM_QUOTA = {
+    "userType": "teams",
+    "usageType": "credits",
+    "totalUsagePercentage": 1.0,
+    "isQuotaExceeded": False,
+    "expiresAt": 1794240000000,
+    "outerProviders": [],
+    "userQuota": {"total": 3000.0, "used": 3000.0, "remaining": 0.0,
+                  "percentage": 1.0, "unit": "credits"},
+    "orgResourcePackage": {"used": 1548.0, "remaining": 952.0,
+                           "percentage": 0.62, "unit": "credits",
+                           "cap": 2500.0, "available": True},
+    "isPlanQuotaProrated": False,
+}
+
+
+def _quota_with(payload):
+    def _fake(*a, **k):
+        return dict(payload)
+    return _fake
+
+
+try:
+    A.http_json = _quota_with(_TEAM_QUOTA)
+    _acc_team = A.Account({"uid": "u-team", "realm": "cn",
+                           "accessToken": "tok"})
+    _acc_team.reserve_credits = 500
+    _r_team = _acc_team.fetch_credits()
+finally:
+    A.http_json = _real_http
+_c_team = (_r_team or {}).get("credits") or {}
+_sh_team = _c_team.get("shared") or {}
+check("#39b orgResourcePackage 被识别：remain=952 / size=cap=2500",
+      _sh_team.get("remain") == 952 and _sh_team.get("size") == 2500
+      and _sh_team.get("available") is True, _sh_team)
+check("#39b 套餐 remain 仍为 0（口径不变，便于核对）",
+      _c_team.get("remain") == 0, _c_team.get("remain"))
+check("#39b 有效余额 = 套餐 0 + 共享 952 = 952",
+      _c_team.get("remain_effective") == 952, _c_team.get("remain_effective"))
+check("#39b packages 出现「共享额度」行且带 cap",
+      any(p.get("name") == "共享额度" and p.get("size") == 2500
+          for p in (_c_team.get("packages") or [])),
+      _c_team.get("packages"))
+check("#39b 预留护栏按有效余额判定（reserve 500 < 952 -> 不拦）",
+      _acc_team.reserve_blocked() is False)
+
+# available=false：共享池不可用 -> 不计入有效余额
+_TEAM_OFF = dict(_TEAM_QUOTA)
+_TEAM_OFF["orgResourcePackage"] = dict(_TEAM_QUOTA["orgResourcePackage"],
+                                       available=False)
+try:
+    A.http_json = _quota_with(_TEAM_OFF)
+    _acc_off = A.Account({"uid": "u-team-off", "realm": "cn",
+                          "accessToken": "tok"})
+    _r_off = _acc_off.fetch_credits()
+finally:
+    A.http_json = _real_http
+_c_off = (_r_off or {}).get("credits") or {}
+check("#39b available=false：共享额度不计入有效余额",
+      _c_off.get("remain_effective") == 0, _c_off.get("remain_effective"))
+
+# 只读汇总（/credits/summary）同样按有效余额
+try:
+    A.http_json = _quota_with(_TEAM_QUOTA)
+    _acc_sum = A.Account({"uid": "u-sum", "realm": "cn",
+                          "accessToken": "tok"})
+    _acc_sum.fetch_credits()
+finally:
+    A.http_json = _real_http
+
+
+class _FakePool:
+    def __init__(self, accounts):
+        self.accounts = list(accounts)
+
+
+_real_pool = getattr(P, "POOL", None)
+try:
+    P.POOL = _FakePool([_acc_sum])
+    _sum = P.credits_summary()
+finally:
+    P.POOL = _real_pool
+check("#39b credits_summary 合计用有效余额（952，不是 0）",
+      (_sum.get("totals") or {}).get("remain") == 952, _sum.get("totals"))
+_row = (_sum.get("accounts") or [{}])[0]
+check("#39b 汇总行同时保留原始 remain 与有效余额",
+      _row.get("credits_remain") == 0
+      and _row.get("credits_remain_effective") == 952
+      and _row.get("credits_shared_remain") == 952, _row)
+
 # ---------------------------------------------------------------- #40
 print("[40] 403 降级与区域标记错误提示")
 _calls40 = []

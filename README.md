@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.4.4-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.4.5-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,21 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.4.5
+
+**🐛 问题修复**
+
+- **共享额度字段名对齐**（#39 后续，报告者 realhuhu 提供了真实团队账号响应）：v1.4.4 按猜测字段名透传，实际字段是 **`orgResourcePackage`**，且用 **`cap`**（不是 `total`）、带 `available` 开关。现在：
+  - 识别 `orgResourcePackage`（保留 `sharedQuota`/`teamQuota`/`poolQuota` 等兼容名），`size` 取 `cap`；
+  - 账号行显示「共享 N」，`packages` 多一行「共享额度」；
+  - **有效余额** `remain_effective` = 套餐 remain + 可用的共享 remain；`available=false` 时不计入；
+  - **预留护栏与 402 解封改用有效余额**——团队账号「套餐用满（0/3000）+ 共享池 952」不再被误判为余额耗尽而停号；
+  - `/credits/summary` 合计与面板区域卡片改用有效余额，行里同时保留原始 `remain` 便于核对。
+
+**⚠️ 其他变更**：回归套件新增 8 条团队账号断言（报告者的真实响应逐字段：`remain=952` / `size=cap=2500` / 有效余额 952 / 护栏不拦 / `available=false` 不计入 / 汇总用有效余额）。
+
+**验证**：全量 **30 suites / 1090 checks / 0 failed**。
 
 ### v1.4.4
 

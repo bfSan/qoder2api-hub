@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1183,19 +1183,25 @@ def credits_summary():
             cred = {}
         realm = getattr(a, "realm", "") or ""
         remain = cred.get("remain")
+        # issue #39：团队账号的套餐 may 用满而共享池仍有余额——汇总按有效余额，
+        # 同时保留原始 remain 便于核对（两者都会出现在行里）。
+        eff = cred.get("remain_effective", remain)
         rows.append({
             "uid": getattr(a, "uid", "") or "",
             "nickname": getattr(a, "nickname", "") or "",
             "realm": realm,
             "credits_remain": remain,
+            "credits_remain_effective": eff,
+            "credits_shared_remain": (cred.get("shared") or {}).get("remain")
+            if isinstance(cred.get("shared"), dict) else None,
             "credits_used": cred.get("used"),
             "credits_size": cred.get("size"),
             # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
             "registered_at": cred.get("updated_at"),
         })
-        if isinstance(remain, (int, float)) and not isinstance(remain, bool):
-            by_realm[realm] = by_realm.get(realm, 0) + int(remain)
-            total_remain += int(remain)
+        if isinstance(eff, (int, float)) and not isinstance(eff, bool):
+            by_realm[realm] = by_realm.get(realm, 0) + int(eff)
+            total_remain += int(eff)
     return {
         "by_realm": by_realm,
         "totals": {"remain": total_remain, "accounts": len(rows)},
