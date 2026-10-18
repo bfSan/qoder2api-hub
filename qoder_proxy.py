@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.4.5"
+VERSION = "1.5.0"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -593,6 +593,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
                 per[k] += fields[k]
         summary = json.loads(json.dumps(_usage))
     _persist_usage(row, summary, "usage persist failed")
+    # issue #43：把「这个号刚被用过」告诉余额刷新器（**只打标，不联网**）。
+    # 打标失败绝不能影响记账/响应，所以整段吞异常。
+    try:
+        if account and CREDITS_USAGE_REFRESHER is not None:
+            CREDITS_USAGE_REFRESHER.mark_used(account)
+    except Exception:
+        pass
     try:
         t_tokens = fields.get("total_tokens", 0)
         dur = " %dms" % elapsed_ms if elapsed_ms is not None else ""
@@ -1080,6 +1087,8 @@ def recent_usage(limit=100, realm=None, page=1):
 
 
 POOL = None
+# issue #43：使用驱动的余额刷新器（main() 里创建；单测/CLI 场景保持 None）
+CREDITS_USAGE_REFRESHER = None
 SCHEDULER = None
 ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
 REALM_STATE_FILE = os.path.join(ACCOUNTS_DIR, "active_realm.json")
@@ -3720,7 +3729,69 @@ def _frame_without_content(payload):
     return out
 
 
-def recover_leaked_tool_calls(frames, allowed_names=None):
+def _sse_fill_tool_call_ids(frames):
+    """流式出口保证：tool_call 增量的 id 必须非空（issue #47）。
+
+    上游偶尔给出**缺 id**（甚至缺 function）的增量帧，网关此前原样透传；
+    下游客户端会把 id="" 落盘，而它的会话加载器要求非空字符串 —— 一条空 id
+    （校验发生在「从 seq 0 顺序回放整份会话」的状态机里，不是跳过坏行）
+    就让整份会话报废。三层客户端都把 "" 一路放行，**只有网关出口能拦**。
+
+    规则：
+      - 上游给了 id -> 原样保留（不改写、不重新造号），并让同 index 的后续
+        分帧沿用同一个 id（下游靠 id 把 tool_call 与 tool_result 配对）；
+      - 缺 id -> 补 _new_id("call_")，**按 index 记忆**（分帧到达时换号会断链）；
+      - 非 tool_call 帧（[DONE] / 纯正文 / 非 JSON）**字节级原样透传**。
+    放在出口而不是各产出点：流式侧有多个来源（上游原生增量 / #8 泄漏回读 /
+    DSML 回放），逐个补必然漏，这是唯一合流点。
+    """
+    ids = {}
+    for raw in frames:
+        text = (raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else raw)
+        data = strip_data_prefix(text)
+        if not data or data == "[DONE]":
+            yield raw
+            continue
+        try:
+            payload = json.loads(data)
+        except Exception:
+            yield raw
+            continue
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list):
+            yield raw
+            continue
+        touched = False
+        for ch in choices:
+            if not isinstance(ch, dict):
+                continue
+            delta = ch.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            calls = delta.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for tc in calls:
+                if not isinstance(tc, dict):
+                    continue
+                key = tc.get("index")
+                cur = tc.get("id")
+                if isinstance(cur, str) and cur.strip():
+                    ids.setdefault(key, cur)      # 上游给了：原样保留并记忆
+                    continue
+                new_id = ids.get(key) or _new_id("call_")
+                ids[key] = new_id
+                tc["id"] = new_id
+                touched = True
+        if touched:
+            yield ("data: " + json.dumps(payload, ensure_ascii=False)
+                   + "\n\n").encode("utf-8")
+        else:
+            yield raw
+
+
+def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
     """流式回读（issue #8）：把模型逐块吐出的「marker + JSON 数组」正文恢复
     成结构化 tool_calls 增量帧；其余内容原样透传（fail-open）。
 
@@ -3896,6 +3967,16 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
                + "\n\n").encode("utf-8")
     elif recovered:
         yield _leak_chunk_frame(meta, {}, "tool_calls")
+
+
+def recover_leaked_tool_calls(frames, allowed_names=None):
+    """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）。
+
+    保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
+    """
+    for frame in _sse_fill_tool_call_ids(
+            _recover_leaked_tool_calls_inner(frames, allowed_names)):
+        yield frame
 
 
 # ---------------------------------------------------------------------------
@@ -6773,7 +6854,11 @@ class Handler(BaseHTTPRequestHandler):
             # 回一个空账本，把本地账本再零化一次；被跳过的号在 skipped 里可区分。
             targets, skipped = _refreshable_accounts(POOL.accounts if POOL else [])
             for a in targets:
-                a.fetch_credits()
+                res = a.fetch_credits()
+                # issue #43：手动查询已经拿到新快照 -> 清掉待刷新，别紧接着重复查
+                if (isinstance(res, dict) and res.get("ok")
+                        and CREDITS_USAGE_REFRESHER is not None):
+                    CREDITS_USAGE_REFRESHER.mark_manual(a.uid)
             return self._json(200, {"accounts": account_views(),
                                     "skipped": skipped,
                                     "refreshed": len(targets)})
@@ -8295,6 +8380,18 @@ def main():
                             free_models=free_model_names(CURRENT_REALM))
     except Exception as exc:
         log("quota limits apply failed at startup: %s" % exc, level="WARN")
+    # issue #43：余额刷新与护栏**解耦**——护栏阈值全 0 时也要能刷新「用过的号」。
+    # 默认 5 分钟合并一次，空闲不轮询（QD_CREDITS_USAGE_INTERVAL 可调）。
+    global CREDITS_USAGE_REFRESHER
+    try:
+        CREDITS_USAGE_REFRESHER = qoder_accounts.CreditsUsageRefresher(
+            POOL, log=log)
+        CREDITS_USAGE_REFRESHER.start()
+        log("credits usage refresher started (interval=%ds)"
+            % CREDITS_USAGE_REFRESHER.interval_seconds, tag="credits")
+    except Exception as exc:
+        CREDITS_USAGE_REFRESHER = None
+        log("credits usage refresher failed to start: %s" % exc, level="WARN")
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
