@@ -92,27 +92,41 @@ check("#37 普通散文讨论 marker：不判",
 check("#37 合法 JSON 示例（无 marker）：不判",
       not P._echo_with_bad_args('A JSON example: [{"content":"probe"}]',
                                 {"Write"}))
-# 流末行为：不泄漏协议、给明确说明、finish=stop（不是协议正文+普通 stop）
+# fail-closed（v1.5.1）：坏参数必须抛协议错误，而不是「说明 + 普通 stop」
 _stream = _echo(_BAD_LF)
 _frames37 = [("data: " + json.dumps(
     {"id": "c", "model": "m", "choices": [{"index": 0,
      "delta": {"content": _stream}, "finish_reason": "stop"}]},
     ensure_ascii=False) + "\n\n").encode("utf-8")]
 _out37 = []
-for f in P.recover_leaked_tool_calls(iter(_frames37), {"Write"}):
-    d = P.strip_data_prefix(f.decode("utf-8", "replace"))
-    if d and d != "[DONE]":
-        _out37.append(json.loads(d))
+_raised37 = None
+try:
+    for f in P.recover_leaked_tool_calls(iter(_frames37), {"Write"}):
+        d = P.strip_data_prefix(f.decode("utf-8", "replace"))
+        if d and d != "[DONE]":
+            _out37.append(json.loads(d))
+except P.InvalidToolArguments as exc:
+    _raised37 = exc
 _txt37 = "".join(((_o.get("choices") or [{}])[0].get("delta") or {})
                  .get("content") or "" for _o in _out37)
 _calls37 = [c for _o in _out37
             for c in (((_o.get("choices") or [{}])[0].get("delta") or {})
                       .get("tool_calls") or [])]
-check("#37 流末：零 tool_calls（不伪造可执行调用）", _calls37 == [], _calls37)
-check("#37 流末：协议文本零泄漏（marker/arguments 都不出现）",
+_fins37 = [(_o.get("choices") or [{}])[0].get("finish_reason") for _o in _out37]
+check("#37 流末：坏参数抛 InvalidToolArguments（status 502）",
+      isinstance(_raised37, P.InvalidToolArguments)
+      and _raised37.status == 502, _raised37)
+check("#37 流末：抛出前零 tool_calls（不伪造可执行调用）",
+      _calls37 == [], _calls37)
+check("#37 流末：抛出前协议文本零泄漏（marker/arguments 都不出现）",
       _MK not in _txt37 and "file_path" not in _txt37, _txt37[:80])
-check("#37 流末：给出明确的失败说明（BAD_ARGS_NOTICE）",
-      P.BAD_ARGS_NOTICE in _txt37, _txt37[:80])
+check("#37 流末：抛出前没有正常结束帧（不以 stop/tool_calls 结束）",
+      not any(f in ("stop", "tool_calls") for f in _fins37 if f), _fins37)
+check("#37 错误详情是固定串（不含参数/路径/正文）",
+      _raised37 is not None
+      and _raised37.detail == P.BAD_ARGS_ERROR_DETAIL
+      and "file_path" not in _raised37.detail, 
+      getattr(_raised37, "detail", None))
 
 # ---------------------------------------------------------------- #38
 print("[38] 排队信号 -> 等待重试")

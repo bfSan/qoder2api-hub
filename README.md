@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.0-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.6.0-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,39 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.6.0
+
+**⚠️ 行为变更（fail-closed，issue #37）**
+
+「工具协议回声 + 内层 arguments 非法」不再以「一句说明 + 普通 stop」结束，改为**协议级失败**：
+
+| 出口 | 行为 |
+|---|---|
+| `/v1/chat/completions` 流式 | `data: {"error": …}` → `[DONE]`；**不再发** stop/tool_calls 正常收尾 |
+| `/v1/chat/completions` 非流式 | **HTTP 502** + 标准错误信封 |
+| `/v1/responses` 流式 | `response.failed`；**不再发** `response.completed` |
+| `/v1/messages`（Anthropic） | `event: error`；**不再发** `message_stop` |
+
+动机：旧行为对按「错误帧 + 结束状态」驱动工具循环的客户端等价于**成功**（`stopReason=end_turn`、`hasFatalError=false`），工具没执行却把任务当完成。
+
+**🐛 问题修复**
+
+- **协议回声的围栏 / DSML 组合识别**（#37）：`_echo_with_bad_args` 此前只在「整串被围栏包住」时才剥围栏——流式里 `_find_marker_split` 先把开围栏切进散文，hold 只剩 `marker + 数组 + 闭围栏`，于是认不出、marker 原样吐给客户端。现在首尾围栏残余（含 `json` 标注）与 DSML 尾标签**交替剥两轮**再判定。
+- **判定顺序**（#37）：三处出口（流式收尾 / 非流式聚合 / Responses）原先 `_leaked_partial_droppable` 在前，会把「外层数组合法 + 内层参数坏 + DSML 尾」误判成 #9 截断回声**静默吞掉**并照常 stop。现在 fail-closed 判定**提前**，与 #9 互斥（后者要求外层数组解析失败）。
+- **小分块漏检**（#37）：`_json_array_prefix_ok` 的 Extra data 分支在 `tail = "```\n</"` 时既不是围栏前缀、又被 `_dsml_tail_holdable` 当成散文 → 候选在**流式中途**被证伪，1/16 字符每帧下整块当正文补发。现在 tail 以完整闭围栏开头时先剥掉再判。
+
+**🐛 其他修正**
+
+- 坏参数**不自动重试、不冷却账号**：`should_retry_envelope` 对该异常直接 False（避免重复计费），账号冷却/归因入口直接返回（模型内容问题不等于账号不可用）。
+- 错误详情是**固定串**（不含实际参数、路径、正文）；面向客户端的文案单独给出可读中文。
+
+**⚠️ 两个契约细节**（写在这里以免误判）
+
+- 混合批次要 fail-closed，数组里**每个** `name` 都必须在本次声明集合内；只要有一个未声明，整块仍走原有 fail-open（不把普通示例当错误）。
+- 「内层真实 LF」必须落在 JSON **字符串内部**（`{"body":"line1<LF>line2"}`）；落在 token 之间的换行是合法 JSON，属「合法参数」路径。
+
+**验证**：全量 **35 suites / 1285 checks / 0 failed**（新增 `tests/_test_issue37_fail_closed.py` 103 条）；另有 `tests/manual_issue37_e2e.py` 真起网关验证四组 HTTP 行为（200+error 帧 / 502 / response.failed / event:error）。
 
 ### v1.5.0
 
