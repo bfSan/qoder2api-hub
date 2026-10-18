@@ -84,6 +84,14 @@ tbody tr:last-child td{border-bottom:none}
 tbody tr:hover{background:rgba(241,245,249,.6)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 .bar-fill{height:6px;border-radius:3px;background:var(--accent);min-width:2px;display:inline-block;vertical-align:middle}
+/* 用量占比列：条占剩余宽度，数字固定 44px 右对齐——位数不同的百分比
+   （5% / 35% / 100%）右边缘对齐才看得成列。 */
+.pct-num{display:inline-block;width:44px;padding-left:4px;text-align:right;
+  font-size:11px;color:var(--dim);vertical-align:middle;
+  font-variant-numeric:tabular-nums}
+/* 只给占比列 nowrap + min-width：这一列是「条 + 固定宽数字」，折行会散架；
+   其余数字列仍靠内容自己折行（不给整表 nowrap，否则窄屏只能横向滚动）。 */
+.pct-cell{min-width:150px;text-align:right;white-space:nowrap}
 .bar-fill.think{background:var(--think)}
 .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;border-radius:8px}
 .table-wrap table{min-width:720px}
@@ -223,8 +231,12 @@ a:hover{text-decoration:underline}
 .main-nav-btn:hover{color:var(--fg);background:#fff}
 .main-nav-btn.active{background:#fff;color:var(--fg);border-color:var(--line);box-shadow:var(--shadow-sm);font-weight:600}
 .range-btn{background:transparent;border:none;color:var(--dim);padding:4px 12px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;transition:all .15s ease}
-.range-btn:hover{color:var(--fg)}
+.range-btn:hover{background:transparent;color:var(--fg)}
 .range-btn.active{background:var(--accent);color:#fff;font-weight:600;box-shadow:var(--shadow-sm)}
+/* hover 必须分状态给底色：通用 button:hover 会给**非 active** 的 range-btn 套上
+   蓝底（--accent-hover），而文字又被 .range-btn:hover 改成 --fg（浅色主题下是
+   深色）——蓝底深字，对比度极差。active 的 hover 保持蓝底白字。 */
+.range-btn.active:hover{background:var(--accent);color:#fff}
 #analyticsKpiCards .card{padding:12px 16px;min-width:0;overflow:hidden;border-radius:12px;background:#fff;border:1px solid var(--line);box-shadow:var(--shadow)}
 #analyticsKpiCards .card .v{font-size:19px;font-weight:700;white-space:nowrap}
 #analyticsKpiCards .card .k{font-size:11px;white-space:nowrap;margin-bottom:3px;font-weight:600;color:var(--dim)}
@@ -3154,33 +3166,54 @@ async function refreshInner(){
   if(!models.length){
     matrixEl.innerHTML = '<div class="empty">当前版本暂无模型请求或性能数据</div>';
   } else {
-    const maxTok = Math.max(1, ...models.map(m => m.total_tokens));
+    // 进度条按「占窗口总量的比例」画，不是「相对最大的那个模型」：之前用
+    // maxTok 归一化，于是最大的模型永远 100%、而它实际可能只占总量的 35%——
+    // 列名叫「用量占比」，读起来就是错的。小比例保留一位小数（3.2% 比 3% 准），
+    // 条宽给 2% 地板，否则 0.4% 的行看不见。
+    // 分母用**表内可见行之和**而不是 t.total_tokens：models 已被过滤掉
+    // 「不在当前目录的模型 / 以 -model 结尾 / requests=0」这几类行，拿未过滤的
+    // 总量当分母会让行内百分比加起来不到汇总行的 100%，读者一验算就发现对不上。
+    const rowTotalTok = models.reduce((s2, m) => s2 + (Number(m.total_tokens) || 0), 0);
+    const pctOf = (v) => {
+      if(!rowTotalTok) return null;
+      return (Number(v) || 0) / rowTotalTok * 100;
+    };
+    const pctText = pctLabel;
     // 汇总行 (Total / All Models)
-    const totTtft = perf.ttft_ms ? (ms(perf.ttft_ms.avg) + " (P50 " + ms(perf.ttft_ms.p50) + ")") : "-";
-    const totTps = perf.tokens_per_sec ? (perf.tokens_per_sec.avg.toFixed(1) + " tok/s") : "-";
+    // TTFT / 输入输出这类双值列用显式 <br> 断行：交给浏览器自动折行会在
+    // "P50 825" 和 "ms)" 之间断开，"ms)" 孤零零一行。
+    const ttftCell = (blk) => blk
+      ? (ms(blk.avg) + '<span class="cell-sub">P50 ' + ms(blk.p50) + '</span>')
+      : '-'
+    const ioCell = (prompt, completion, reasoning) =>
+      (fmt(prompt) + ' / ' + fmt(completion)
+        + (Number(reasoning)
+            ? '<span class="cell-sub" style="color:var(--think)">思考 ' + fmt(reasoning) + '</span>'
+            : ''))
+    const totTtft = ttftCell(perf.ttft_ms);
+    const totTps = perf.tokens_per_sec ? (perf.tokens_per_sec.avg.toFixed(1)) : "-";
     const totWall = perf.wall_ms ? ms(perf.wall_ms.avg) : "-";
     const totCache = perf.cache_hit_pct ? (perf.cache_hit_pct.avg.toFixed(1) + "%") : "-";
     const summaryRow = '<tr style="background:rgba(37,99,235,.06);font-weight:600">'
       + '<td style="text-align:left"><b>全部模型合计 (Total)</b></td>'
       + '<td style="text-align:center"><span style="color:var(--dim)">—</span></td>'
-      + '<td style="text-align:left"><span style="color:var(--dim)">全部账号</span></td>'
+      + '<td style="text-align:left"><span class="cell-nowrap" style="color:var(--dim)">全部账号</span></td>'
       + '<td>' + fmt(t.requests) + '</td>'
       + '<td><b style="color:var(--accent)">' + fmt(t.total_tokens) + '</b></td>'
-      + '<td>' + fmt(t.prompt_tokens) + ' / ' + fmt(t.completion_tokens) + (t.reasoning_tokens ? (' (<span style="color:var(--think)">' + fmt(t.reasoning_tokens) + '</span>)') : '') + '</td>'
+      + '<td>' + ioCell(t.prompt_tokens, t.completion_tokens, t.reasoning_tokens) + '</td>'
       + '<td>' + totTtft + '</td>'
-      + '<td><b style="color:var(--accent2)">' + totTps + '</b></td>'
+      + '<td><b style="color:var(--accent2)">' + totTps + '</b><span class="cell-sub">tok/s</span></td>'
       + '<td>' + totWall + '</td>'
       + '<td>' + totCache + '</td>'
-      + '<td>100%</td>'
+      + '<td class="pct-cell"><span class="pct-num">100%</span></td>'
       + '</tr>';
-
     const rows = models.map(m => {
       const mp = bmPerf[m.id] || {};
-      const m_ttft = mp.ttft_ms ? (ms(mp.ttft_ms.avg) + " <span style='color:var(--dim);font-size:11px'>(P50 " + ms(mp.ttft_ms.p50) + ")</span>") : "-";
-      const m_tps = mp.tokens_per_sec ? ('<b style="color:var(--accent2)">' + mp.tokens_per_sec.avg.toFixed(1) + '</b> <span style="font-size:11px;color:var(--dim)">tok/s</span>') : "-";
+      const m_ttft = ttftCell(mp.ttft_ms);
+      const m_tps = mp.tokens_per_sec ? ('<b style="color:var(--accent2)">' + mp.tokens_per_sec.avg.toFixed(1) + '</b><span class="cell-sub">tok/s</span>') : "-";
       const m_wall = mp.wall_ms ? ms(mp.wall_ms.avg) : "-";
       const m_cache = (m.prompt_tokens > 0) ? pct(m.cached_tokens / m.prompt_tokens * 100) : (mp.cache_hit_pct ? mp.cache_hit_pct.avg.toFixed(1) + "%" : "-");
-      const pctTok = Math.round(m.total_tokens / maxTok * 100);
+      const pctTok = pctOf(m.total_tokens);
       const errText = mp.errors ? (' <span class="badge bad" style="font-size:10px">' + mp.errors + ' 失败</span>') : '';
       const acctsMap = t.accounts_map || {};
       const mAccts = m.accounts || {};
@@ -3214,17 +3247,21 @@ async function refreshInner(){
         }).join('');
       }
       return '<tr>'
-        + '<td style="text-align:left" class="mono"><b>' + esc(m.id) + '</b>' + errText + '</td>'
+        + '<td style="text-align:left" class="mono cell-nowrap"><b>' + esc(m.id) + '</b>' + errText + '</td>'
         + '<td style="text-align:center;white-space:nowrap">' + realmCell + '</td>'
         + '<td style="text-align:left">' + acctCell + '</td>'
         + '<td>' + fmt(m.requests) + '</td>'
         + '<td><b>' + fmt(m.total_tokens) + '</b></td>'
-        + '<td>' + fmt(m.prompt_tokens) + ' / ' + fmt(m.completion_tokens) + (m.reasoning_tokens ? (' (<span style="color:var(--think)">' + fmt(m.reasoning_tokens) + '</span>)') : '') + '</td>'
+        + '<td>' + ioCell(m.prompt_tokens, m.completion_tokens, m.reasoning_tokens) + '</td>'
         + '<td>' + m_ttft + '</td>'
         + '<td>' + m_tps + '</td>'
         + '<td>' + m_wall + '</td>'
         + '<td>' + m_cache + '</td>'
-        + '<td style="min-width:90px"><span class="bar-fill" style="width:' + Math.max(3, pctTok) + '%"></span> <span style="font-size:11px;color:var(--dim)">' + pctTok + '%</span></td>'
+        + '<td class="pct-cell">'
+        +   ((pctTok == null || pctTok <= 0) ? '' :
+              '<span class="bar-fill" style="width:calc((100% - 48px) * '
+              + Math.min(100, pctTok) / 100 + ')"></span>')
+        +   '<span class="pct-num">' + pctText(pctTok) + '</span></td>'
         + '</tr>';
     }).join('');
 
@@ -3233,7 +3270,7 @@ async function refreshInner(){
       + '<th style="text-align:center;width:76px">区域</th>'
       + '<th style="text-align:left">账号</th>'
       + '<th>请求数</th><th>总 Token</th><th>输入 / 输出 (思考)</th>'
-      + '<th>首字延迟 (TTFT)</th><th>生成速度</th><th>端到端耗时</th><th>缓存命中率</th><th>用量占比</th>'
+      + '<th>首字延迟 (TTFT)</th><th>生成速度</th><th>端到端耗时</th><th>缓存命中率</th><th class="pct-cell">用量占比</th>'
       + '</tr></thead><tbody>' + summaryRow + rows + '</tbody></table>';
   }
 
@@ -4726,15 +4763,18 @@ function renderByKey(data){
     box.innerHTML = '<div class="empty">当前窗口没有按 Key 的用量数据</div>';
     return;
   }
-  const maxTok = Math.max(1, ...keys.map(k => Number(k.total_tokens) || 0));
+  // 同模型表：占比 = 占本窗口全部 Key 总 Token 的比，而不是相对最大 Key
+  const keyTotalTok = keys.reduce((s, k) => s + (Number(k.total_tokens) || 0), 0);
+  const keyPct = (v) => keyTotalTok ? (Number(v) || 0) / keyTotalTok * 100 : null;
+  const keyPctText = pctLabel;
   box.innerHTML = '<table><thead><tr>'
     + '<th style="text-align:left;min-width:190px">Key（仅标识）</th>'
-    + '<th>请求数</th><th>输入</th><th>输出 (思考)</th><th>缓存</th><th>总 Token</th><th>用量占比</th><th>积分</th>'
+    + '<th>请求数</th><th>输入</th><th>输出 (思考)</th><th>缓存</th><th>总 Token</th><th class="pct-cell">用量占比</th><th>积分</th>'
     + '<th style="text-align:left">模型（前 5）</th>'
     + '</tr></thead><tbody>'
     + keys.map(k => {
         const d = keyDisplay(k.key_id);
-        const pctTok = Math.round((Number(k.total_tokens) || 0) / maxTok * 100);
+        const pctTok = keyPct(k.total_tokens);
         const pills = (Array.isArray(k.models) ? k.models : []).map(m => {
           const name = Array.isArray(m) ? m[0] : m;
           const hits = Array.isArray(m) ? m[1] : '';
@@ -4756,8 +4796,11 @@ function renderByKey(data){
           +   (Number(k.reasoning_tokens) ? ' <span style="color:var(--think);font-size:11px">(' + fmt(k.reasoning_tokens) + ')</span>' : '') + '</td>'
           + '<td>' + fmt(k.cached_tokens) + '</td>'
           + '<td><b style="color:var(--accent)">' + fmt(k.total_tokens) + '</b></td>'
-          + '<td style="min-width:90px"><span class="bar-fill" style="width:' + Math.max(3, pctTok) + '%"></span>'
-          +   ' <span style="font-size:11px;color:var(--dim)">' + pctTok + '%</span></td>'
+          + '<td class="pct-cell">'
+          +   ((pctTok == null || pctTok <= 0) ? '' :
+                '<span class="bar-fill" style="width:calc((100% - 48px) * '
+                + Math.min(100, pctTok) / 100 + ')"></span>')
+          +   '<span class="pct-num">' + keyPctText(pctTok) + '</span></td>'
           + '<td>' + credit + orig + '</td>'
           + '<td style="text-align:left;max-width:420px">' + pills + '</td>'
           + '</tr>';

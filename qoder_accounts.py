@@ -838,6 +838,36 @@ def normalize_epoch(value):
     return int(number)
 
 
+def effective_remain(credits):
+    """有效余额 = 套餐 remain + 可用的共享池 remain（issue #39）。
+
+    团队账号「套餐已用满（remain=0）+ 共享池仍有余额」时，只看 remain 会把
+    可用账号误判成余额耗尽（护栏停号、402 不解除、汇总显示 0）——所以额度
+    判定与展示一律走本函数。快照里没有 remain_effective 的（旧数据 / 非 dict）
+    回退 remain，与本字段引入前的行为完全一致。
+    """
+    if not isinstance(credits, dict):
+        return None
+    value = credits.get("remain_effective")
+    return credits.get("remain") if value is None else value
+
+
+def _truthy(value, default=False):
+    """上游布尔字段的防御性解读：字符串 "false" / "0" / "no" 也算假。
+
+    `bool("false")` 是 True——共享池的 available 若从 JSON 布尔漂移成字符串，
+    就会把「不可用」当成「可用」，凭空多算额度（issue #39 的字段形态）。
+    value 为 None（显式 null）时取 default：**缺键语义必须由调用方决定**，
+    因为「没这个字段」和「字段是 null」在额度语义上并不等价。
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in (
+            "", "0", "false", "no", "off", "none", "null")
+    return bool(value)
+
+
 # ---------------------------------------------------------------------------
 # 每日签到的「下次可签到时间」
 # ---------------------------------------------------------------------------
@@ -1399,7 +1429,7 @@ class Account(object):
             return False
         # issue #39：团队账号「套餐已用满 + 共享池仍有余额」按有效余额判定，
         # 否则共享额度白有、账号被误停。
-        remain = cred.get("remain_effective", cred.get("remain"))
+        remain = effective_remain(cred)
         if remain is None:
             return False
         try:
@@ -1576,8 +1606,7 @@ class Account(object):
             return False
         cred = self.credits
         # issue #39：团队账号可能套餐 remain=0 但共享池仍有余额——按有效余额解封。
-        remain = (cred.get("remain_effective", cred.get("remain"))
-                  if isinstance(cred, dict) else None)
+        remain = effective_remain(cred)
         try:
             if remain is None or float(remain) <= 0:
                 return False
@@ -2564,7 +2593,11 @@ class Account(object):
                     "remain": int(_num(_src, "remaining")),
                     "used": int(_num(_src, "used")),
                     "size": int(_num(_src, "cap") or _num(_src, "total")),
-                    "available": bool(_src.get("available", True)),
+                    # 缺键 = "没声明不可用" = 可用（与原 bool(_src.get("available", True)) 等价）；
+                    # 显式 null / "false" / 0 = 不可用。写成 .get(k, True) + 默认 True
+                    # 才保留原语义——只写 _truthy(_src.get("available")) 会把缺键
+                    # 变成 False，共享额度白有（issue #39 的症状原样回来）。
+                    "available": _truthy(_src.get("available", True), default=True),
                     "source": _key,
                     **_expiry_of(_src),
                 }

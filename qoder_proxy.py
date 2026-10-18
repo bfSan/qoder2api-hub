@@ -1192,7 +1192,7 @@ def credits_summary():
         remain = cred.get("remain")
         # issue #39：团队账号的套餐 may 用满而共享池仍有余额——汇总按有效余额，
         # 同时保留原始 remain 便于核对（两者都会出现在行里）。
-        eff = cred.get("remain_effective", remain)
+        eff = qoder_accounts.effective_remain(cred)
         rows.append({
             "uid": getattr(a, "uid", "") or "",
             "nickname": getattr(a, "nickname", "") or "",

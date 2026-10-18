@@ -65,7 +65,7 @@ def ledger_is_unknown(credits):
     """True = 该账本是「未知」而非「0」（判定口径见上方注释，仅用于避免误用）。"""
     if not isinstance(credits, dict):
         return False
-    if credits.get("remain") or credits.get("size"):
+    if qoder_accounts.effective_remain(credits) or credits.get("size"):
         return False
     if not credits.get("exceeded"):
         return False
@@ -171,9 +171,10 @@ def fetch_task_view(account):
         summary["energy"] = None
         summary["energy_note"] = "余额未知（上次刷新返回退化响应，等待下次成功刷新）"
     elif account.credits:
-        summary["energy"] = account.credits.get("remain", 0)
+        summary["energy"] = qoder_accounts.effective_remain(account.credits) or 0
     elif credits_res.get("ok"):
-        summary["energy"] = (account.credits or {}).get("remain", 0)
+        summary["energy"] = qoder_accounts.effective_remain(
+            account.credits) or 0
     if ok2 and elig:
         summary["travel"] = {"state": "arrived", "reward_credit": 1800}
     else:
@@ -662,7 +663,7 @@ def fetch_tasks_view(pool, realm=None, uid=None):
                 unknown_uids.append(a.uid)   # 未知不并入合计（不当作 0 累加）
                 continue
             try:
-                energy += int(((a.credits or {}).get("remain")) or 0)
+                energy += int(qoder_accounts.effective_remain(a.credits) or 0)
             except Exception:
                 pass
         summary = {"mode": "all", "realm": realm or "",
@@ -797,7 +798,7 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
     # 签到后刷新额度与套餐快照（发放有秒级延迟，失败不影响签到结果）
     time.sleep(settle)
     if account.fetch_credits().get("ok"):
-        remain = account.credits.get("remain", 0)
+        remain = qoder_accounts.effective_remain(account.credits) or 0
         logs.append(f"  当前额度余额: {remain}")
     account.fetch_plan()
     return {"ok": True, "logs": logs, "earned_credit": earned,
