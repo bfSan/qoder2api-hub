@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.1-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.2-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,21 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.2
+
+**🐛 问题修复**
+
+- **长会话工具调用复述：散文 + 双 marker + 数组 + DSML 尾**（#49）：模型在长会话里会连写两个 `LEAK_MARKER`、前面带散文、后面跟 DSML 闭标签，旧守卫要求「整段恰好是 marker + 数组」，于是四条路径全部拒绝、整段原样下发（`stop_reason=end_turn`，工具静默不执行，实测约 1.5%）。
+  现在解析取**最后一个** marker 起算、跳过连续重复 marker、剥掉尾部 DSML/围栏；前方散文作为 `clean` 保留**且不含 marker**。流式侧同步：`_leak_body_offset` 跳过重复 marker，并对「第二个 marker 还没打完」的跨帧半截保持候选（8 字符分帧也稳）。
+- **空壳循环不再完全静默**（#49 形态3）：`marker + <terminal></terminal>` ×54 这种**没有 JSON 参数**的形态无法恢复（参数根本不存在），保持 fail-open 透传；但四条路径全拒时会记一条 **WARN**（含 `markers=/dsml=/total=/suppressed=`，默认每分钟一条，避免刷屏），让发生率可观测，而不是只能靠查磁盘发现「模型说清理完成、其实没执行」。
+- **流式 tool_call.id 兜底的四条边界**（#47 复核）：
+  - `index` 为 list/dict/str 等**不可哈希值**时不再抛 `TypeError`（旧实现会让异常一路冒到 socket，客户端看到连接被掐断）；现在按帧内位置归一，并对整帧加了一层 fail-open 兜底；
+  - **并行调用都不带 index** 时不再撞同一个 id（按帧内位置区分）；
+  - **串行多个无 index 调用**（同一位置、各带 `function.name`）各得新 id，续帧沿用；
+  - 中途才收到上游真 id 时**覆盖收敛**（旧 `setdefault` 会让后续帧回落到旧补值）。
+
+**验证**：全量 **37 suites / 1321 checks / 0 failed**（新增 `tests/_test_issue47_49.py` 22 条：index 六种畸形值、并行/串行撞号、迟到的真 id、三种回声形态、流式 8/64/512 分帧、WARN 节流与严格边界回归）。
 
 ### v1.5.1
 

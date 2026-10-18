@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3304,6 +3304,43 @@ BAD_ARGS_ERROR_DETAIL = ("upstream tool-call echo contains invalid JSON "
                          "arguments; no tools were emitted")
 
 
+# issue #49 方向 C 的节流状态：一分钟最多一条 WARN，其余只计数——
+# 形态3（54 组空壳）一次会话就能刷出几十条，不节流会把日志淹掉。
+_LEAK_WARN_STATE = {"last": 0.0, "suppressed": 0, "total": 0}
+_LEAK_WARN_INTERVAL = 60.0
+
+
+def _log_unrecovered_leak(text, where="chat"):
+    """识别到「像工具协议回声、但四条回读路径都没认」时记一条 WARN（issue #49 方向 C）。
+
+    为什么必须可见：失败路径是 fail-open（原样透传），于是**协议失败**被转换成
+    **语义失真**——模型说「已清理」，工具其实没执行，客户端看到的是正常结束。
+    日志至少让发生率可观测，而不是只能靠用户去查磁盘。
+    节流：一分钟一条，其余计入 suppressed（下一条日志里带出来）。
+    """
+    try:
+        t = text or ""
+        marks = t.count(LEAK_MARKER) + t.count(LEAK_MARKER_ALT)
+        dsml = t.count("DSML")
+        if not marks and not dsml:
+            return
+        st = _LEAK_WARN_STATE
+        st["total"] += 1
+        now = time.time()
+        if now - st["last"] < _LEAK_WARN_INTERVAL:
+            st["suppressed"] += 1
+            return
+        sup = st["suppressed"]
+        st["last"] = now
+        st["suppressed"] = 0
+        log("unrecovered tool-protocol leak passed through (%d chars, "
+            "markers=%d, dsml=%d) at %s — issue #49 (total=%d, suppressed=%d)"
+            % (len(t), marks, dsml, where, st["total"], sup),
+            level="WARN", tag="chat")
+    except Exception:
+        pass
+
+
 class InvalidToolArguments(UpstreamStatus):
     """已确认是工具协议回声，但内层 arguments 不是合法 JSON（issue #37）。
 
@@ -3362,9 +3399,17 @@ def _echo_with_bad_args(text, allowed_names=None):
     while prev != t:
         prev = t
         t = _strip_json_fence(_strip_dsml_close_tail(t).strip()).strip()
-    if not t.startswith(LEAK_MARKER):
+    # issue #49：允许「散文 + 重复 marker」——取最后一个 marker，跳过连续重复。
+    _mpos = t.rfind(LEAK_MARKER)
+    if _mpos < 0:
         return False
-    rest = t[len(LEAK_MARKER):].strip()
+    t = t[_mpos:]
+    while t.startswith(LEAK_MARKER):
+        t = t[len(LEAK_MARKER):].lstrip()
+    t = _strip_dsml_close_tail(t)
+    if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
+        t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
+    rest = t.strip()
     if not (rest.startswith("[") and rest.endswith("]")):
         return False
     try:
@@ -3442,9 +3487,26 @@ def parse_leaked_tool_calls(text, allowed_names=None):
         if inner[:4].lower() == "json":
             inner = inner[4:]
         t = inner[:-3].strip()
-    if not t.startswith(LEAK_MARKER):
+    # issue #49：模型在长会话里会写成「散文 + marker + marker + 数组 + DSML 尾」。
+    # 取**最后一个** marker 起算（前面散文作为 clean 返回，由调用方补发），
+    # 再剥掉连续重复的 marker 与尾部围栏——这些都不放松后面的严格校验。
+    _mpos = t.rfind(LEAK_MARKER)
+    if _mpos < 0:
         return None, text
-    rest = t[len(LEAK_MARKER):].strip()
+    prefix = t[:_mpos]
+    # 前缀尾部可能残留 marker（「散文 + marker1 + marker2 + 数组」时，
+    # marker1 落在 prefix 里）——它绝不能当正文发给客户端。
+    prefix = prefix.rstrip()
+    for _mk in (LEAK_MARKER, LEAK_MARKER_ALT):
+        while prefix.endswith(_mk):
+            prefix = prefix[:-len(_mk)].rstrip()
+    t = t[_mpos:]
+    while t.startswith(LEAK_MARKER):
+        t = t[len(LEAK_MARKER):].lstrip()
+    t = _strip_dsml_close_tail(t)
+    if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
+        t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
+    rest = t.strip()
     if not (rest.startswith("[") and rest.endswith("]")):
         return None, text
     try:
@@ -3478,7 +3540,7 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     if allowed_names:
         if not all(c["function"]["name"] in allowed_names for c in calls):
             return None, text
-    return calls, ""
+    return calls, prefix
 
 
 def _leak_body_offset(text):
@@ -3492,7 +3554,17 @@ def _leak_body_offset(text):
     if not t or LEAK_MARKER.startswith(t):
         return "pre", None
     if t.startswith(LEAK_MARKER):
-        return "body", t[len(LEAK_MARKER):]
+        # issue #49：模型会连写两个 marker（数组在第二个之后）——跳过重复的，
+        # 否则 hold 会被判成「body 不是数组」而在流式中途证伪、整块补发。
+        body = t[len(LEAK_MARKER):]
+        b = body.lstrip()
+        while b.startswith(LEAK_MARKER):
+            b = b[len(LEAK_MARKER):].lstrip()
+        # 重复 marker 还没打完（跨帧，如 "[assista"）——仍算候选，内容留空等下一帧。
+        # 不回 "pre" 是因为此处已越过首个 marker，语义上是 body 但"暂时没内容"。
+        if b and (LEAK_MARKER.startswith(b) or LEAK_MARKER_ALT.startswith(b)):
+            return "body", ""
+        return "body", b
     # issue #36 后续：尖括号变体的**真前缀**（跨帧进行中）同样算 pre——
     # 1 字符/帧时 '<' 单独到达，不能当散文放出（否则 marker 开头丢失）。
     if LEAK_MARKER_ALT.startswith(t):
@@ -3797,7 +3869,23 @@ def _sse_fill_tool_call_ids(frames):
     放在出口而不是各产出点：流式侧有多个来源（上游原生增量 / #8 泄漏回读 /
     DSML 回放），逐个补必然漏，这是唯一合流点。
     """
-    ids = {}
+    ids = {}          # key -> 已分配的 id
+    named = set()     # 该 key 是否已经「用掉」过一次 function.name（新调用的起点）
+
+    def _key_for(tc, pos, n_calls):
+        """tool_call 的**稳定**记忆键（issue #47 补充）。
+
+        1) 有 int index -> 用它（协议正解）；
+        2) 缺 index -> 用**帧内位置**：多调用同帧各得不同键（并行不再撞号），
+           单调用恒为 0（与 index=0 归一到同一键，避免 None/0 两套记忆）；
+        3) index 是不可哈希/畸形值（list/dict/str）-> 同样按位置，
+           **绝不让它进 dict key**（否则 TypeError 会一路冒到 socket）。
+        """
+        idx = tc.get("index")
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            return ("i", idx)
+        return ("i", pos if n_calls > 1 else 0)
+
     for raw in frames:
         text = (raw.decode("utf-8", "replace")
                 if isinstance(raw, bytes) else raw)
@@ -3815,27 +3903,45 @@ def _sse_fill_tool_call_ids(frames):
             yield raw
             continue
         touched = False
-        for ch in choices:
-            if not isinstance(ch, dict):
-                continue
-            delta = ch.get("delta")
-            if not isinstance(delta, dict):
-                continue
-            calls = delta.get("tool_calls")
-            if not isinstance(calls, list):
-                continue
-            for tc in calls:
-                if not isinstance(tc, dict):
+        try:
+            for ch in choices:
+                if not isinstance(ch, dict):
                     continue
-                key = tc.get("index")
-                cur = tc.get("id")
-                if isinstance(cur, str) and cur.strip():
-                    ids.setdefault(key, cur)      # 上游给了：原样保留并记忆
+                delta = ch.get("delta")
+                if not isinstance(delta, dict):
                     continue
-                new_id = ids.get(key) or _new_id("call_")
-                ids[key] = new_id
-                tc["id"] = new_id
-                touched = True
+                calls = delta.get("tool_calls")
+                if not isinstance(calls, list):
+                    continue
+                for pos, tc in enumerate(calls):
+                    if not isinstance(tc, dict):
+                        continue
+                    key = _key_for(tc, pos, len(calls))
+                    cur = tc.get("id")
+                    fn = tc.get("function")
+                    name = str((fn or {}).get("name") or "").strip() \
+                        if isinstance(fn, dict) else ""
+                    if isinstance(cur, str) and cur.strip():
+                        # 上游给了 id：原样保留；**覆盖式**记忆让后到的真 id
+                        # 收敛（旧实现 setdefault 会让后续帧回落到旧补值）。
+                        ids[key] = cur
+                        if name:
+                            named.add(key)
+                        continue
+                    # 同一 key 第二次带 name = 无 index 场景下的**另一个**调用
+                    # （串行两次调用都落在位置 0），必须换号，否则配对断裂。
+                    if name and key in named:
+                        ids[key] = _new_id("call_")
+                    new_id = ids.get(key) or _new_id("call_")
+                    ids[key] = new_id
+                    if name:
+                        named.add(key)
+                    tc["id"] = new_id
+                    touched = True
+        except Exception:
+            # 兜底：任何意外都不得让异常冒到 socket（fail-open，与其余分支一致）
+            yield raw
+            continue
         if touched:
             yield ("data: " + json.dumps(payload, ensure_ascii=False)
                    + "\n\n").encode("utf-8")
@@ -3937,6 +4043,10 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # 当正文补发——直接升级为协议错误（提前判定，不等流末）。
             if _echo_with_bad_args(hold, allowed_names):
                 raise InvalidToolArguments()
+            # issue #49 方向 C：候选被证伪 -> 整段当正文补发，这里同样留痕
+            # （形态3「marker + <terminal></terminal> 空壳」就走这条：没有 JSON
+            # 可恢复，但必须让发生率可见，而不是静默失真）。
+            _log_unrecovered_leak(hold, "stream-falsified")
             # 证伪：暂存整段补发为普通正文
             yield _leak_chunk_frame(meta, {"content": hold})
             hold = None
@@ -4017,6 +4127,8 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(hold), level="WARN", tag="chat")
         else:
+            # issue #49 方向 C：认不出但**看起来就是协议回声**的，必须留痕。
+            _log_unrecovered_leak(hold, "stream")
             yield _leak_chunk_frame(meta, {"content": hold})
     if finished is not None:
         payload, fin = finished
@@ -5557,6 +5669,9 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                 log("dropped leaked tool-result echo (%d chars) — issue #11"
                     % len(_echo_src), level="WARN", tag="chat")
                 message["content"] = _head16
+            else:
+                # issue #49 方向 C：四条路径都没认出来 -> 至少留痕（非流式侧）
+                _log_unrecovered_leak(_echo_src, "aggregate")
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -6375,6 +6490,9 @@ def stream_responses_events(inner_lines, model, holder):
             raise InvalidToolArguments()
         else:
             calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
+            if not calls_rem:
+                # issue #49 方向 C：Responses 侧同样留痕（DSML 也解析不出来时）
+                _log_unrecovered_leak(clean_rem or text_buffer, "responses")
         if calls_rem:
             dsml_tool_calls.extend(calls_rem)
         if clean_rem:
