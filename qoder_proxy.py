@@ -26,6 +26,8 @@ OpenAI 兼容接口。上游链路：
     python qoder_proxy.py --api-key sk-local  # require a bearer token
 """
 import argparse
+import base64
+import contextvars
 import hashlib
 from collections import deque
 import re
@@ -49,6 +51,8 @@ import qoder_agents
 import qoder_anthropic
 import qoder_catalog
 import qoder_settings
+import qoder_auth
+import qoder_tenants
 import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
@@ -1072,10 +1076,53 @@ def recent_usage(limit=100, realm=None, page=1):
     }
 
 
-POOL = None
+_REQUEST_RUNTIME = contextvars.ContextVar("qoder_request_runtime", default=None)
+_LEGACY_POOL = None
+_LEGACY_ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
+_LEGACY_USAGE_DIR = USAGE_DIR
+_LEGACY_USAGE_LOG = USAGE_LOG
+_LEGACY_USAGE_SUMMARY = USAGE_SUMMARY
+class _TenantPoolProxy:
+    def _value(self):
+        runtime = _REQUEST_RUNTIME.get()
+        return runtime.pool if runtime is not None else _LEGACY_POOL
+    def __bool__(self): return self._value() is not None
+    def __getattr__(self, name):
+        value = self._value()
+        if value is None: raise AttributeError(name)
+        return getattr(value, name)
+    def __iter__(self):
+        value = self._value(); return iter(value.accounts if value is not None else ())
+class _TenantSchedulerProxy:
+    def _value(self):
+        runtime = _REQUEST_RUNTIME.get()
+        return runtime.scheduler if runtime is not None else SCHEDULER
+    def __bool__(self): return self._value() is not None
+    def __getattr__(self, name):
+        value = self._value()
+        if value is None: raise AttributeError(name)
+        return getattr(value, name)
+class _TenantPathProxy:
+    def __init__(self, legacy_name, attr): self.legacy_name, self.attr = legacy_name, attr
+    def _value(self):
+        runtime = _REQUEST_RUNTIME.get()
+        return getattr(runtime, self.attr) if runtime is not None else globals()[self.legacy_name]
+    def __fspath__(self): return self._value()
+    def __str__(self): return self._value()
+    def __repr__(self): return repr(self._value())
+    def __bool__(self): return bool(self._value())
+POOL = _TenantPoolProxy()
 SCHEDULER = None
-ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
-REALM_STATE_FILE = os.path.join(ACCOUNTS_DIR, "active_realm.json")
+TENANT_SCHEDULER = _TenantSchedulerProxy()
+ACCOUNTS_DIR = _TenantPathProxy("_LEGACY_ACCOUNTS_DIR", "root")
+USAGE_DIR = _TenantPathProxy("_LEGACY_USAGE_DIR", "usage")
+USAGE_LOG = _TenantPathProxy("_LEGACY_USAGE_LOG", "usage_log")
+USAGE_SUMMARY = _TenantPathProxy("_LEGACY_USAGE_SUMMARY", "usage_summary")
+REALM_STATE_FILE = os.path.join(_LEGACY_ACCOUNTS_DIR, "active_realm.json")
+QD_AUTH_CONFIG = {}
+TENANT_MANAGER = None
+OAUTH_TRANSACTIONS = {}
+OAUTH_LOCK = threading.RLock()
 
 
 def load_persisted_realm():
@@ -5838,6 +5885,30 @@ def _responses_failed_frame(holder, code, message):
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# AAC OAuth
+# ---------------------------------------------------------------------------
+def _cookie_map(header):
+    result = {}
+    for chunk in str(header or "").split(";"):
+        if "=" in chunk:
+            key, value = chunk.split("=", 1)
+            result[key.strip()] = value.strip()
+    return result
+
+def _oauth_principal(handler):
+    try:
+        cookies = _cookie_map(handler.headers.get("Cookie"))
+        return qoder_auth.resolve_principal(dict(handler.headers), cookies, qoder_auth._sessions)
+    except qoder_auth.AuthError:
+        return None
+
+def _oauth_enabled():
+    return bool(QD_AUTH_CONFIG.get("aac_base_url") and QD_AUTH_CONFIG.get("redirect_uri"))
+
+def _oauth_cookie_headers(session_id):
+    return {"Set-Cookie": "QD-Session=%s; Path=/; HttpOnly; SameSite=Lax" % session_id, "Cache-Control": "no-store"}
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # Which configured API key the caller used, set by _key_ok(). Its bound
@@ -6011,16 +6082,46 @@ class Handler(BaseHTTPRequestHandler):
             return ""
 
     def _key_ok(self):
-        """True when the request carries a right key (or no key is needed)."""
-        # 面板会话同时解锁管理 API，浏览器无需在 localStorage 存 API key。
+        supplied = self._supplied_key()
+        self.key_entry = None
+        self.tenant_runtime = None
         if self._panel_ok():
+            self.principal = qoder_auth.create_local_admin_session({"session_id": self._panel_token()})
+            _REQUEST_RUNTIME.set(None)
             return True
-        self.key_entry = identify_key(self._supplied_key())
+        self.principal = _oauth_principal(self)
+        if self.principal and self.principal.principal_type == "aac-user":
+            if getattr(self.principal, "role", "") == "admin":
+                _REQUEST_RUNTIME.set(None)
+                return True
+            try:
+                self.tenant_runtime = TENANT_MANAGER.get_or_create(
+                    self.principal.aac_user_id, self.principal.qoder_user_id
+                ) if TENANT_MANAGER else None
+            except Exception:
+                self.tenant_runtime = None
+            _REQUEST_RUNTIME.set(self.tenant_runtime)
+            scoped = qoder_settings.resolve_api_key(
+                supplied, "qoder2api-hub",
+                tenant_dir=self.tenant_runtime.root if self.tenant_runtime else None
+            ) if supplied and self.tenant_runtime else None
+            self.key_entry = dict(scoped.__dict__) if scoped else None
+            return self.tenant_runtime is not None
+        if supplied and TENANT_MANAGER:
+            self.tenant_runtime = TENANT_MANAGER.resolve_api_key_tenant(supplied)
+            if self.tenant_runtime is not None:
+                scoped = qoder_settings.resolve_api_key(
+                    supplied, "qoder2api-hub", tenant_dir=self.tenant_runtime.root
+                )
+                self.key_entry = dict(scoped.__dict__) if scoped else None
+                self.principal = scoped
+                _REQUEST_RUNTIME.set(self.tenant_runtime)
+                return bool(self.key_entry)
+        _REQUEST_RUNTIME.set(None)
+        self.key_entry = identify_key(supplied)
         if self.key_entry:
             return True
-        if not auth_required():
-            return True
-        return False
+        return not auth_required()
 
     def _key_realm(self):
         """Realm bound to the key this request used, or "" when unbound."""
@@ -6117,6 +6218,20 @@ class Handler(BaseHTTPRequestHandler):
     def _panel_ok(self):
         return PANEL.valid(self._panel_token())
 
+    def _management_ok(self):
+        principal = _oauth_principal(self)
+        return self._panel_ok() or bool(principal and getattr(principal, "role", "") == "admin")
+
+    def _oauth_role(self):
+        principal = _oauth_principal(self)
+        return getattr(principal, "role", "") if principal else ""
+
+    def _begin_request(self):
+        _REQUEST_RUNTIME.set(None)
+        self.key_entry = None
+        self.principal = None
+        self.tenant_runtime = None
+
     def _client_is_loopback(self):
         """agents 写配置只信 loopback：改的是网关本机的文件。"""
         try:
@@ -6153,6 +6268,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def do_OPTIONS(self):
+        self._begin_request()
         self.send_response(204)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -6163,6 +6279,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        self._begin_request()
         # #26：每个请求入口清空「本次实际出口」标注。self 在 keep-alive 连接上是
         # **复用**的，不清空的话后续非 chat 端点（/v1/models、/usage/*、/realm）
         # 会带回上一次 chat 的残留值 —— 那会让面板把「上一次的出口」当成「本次的」。
@@ -6171,9 +6288,78 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
-        if self._is_panel_route(path) and not self._panel_ok():
+        if path == "/auth/login":
+            if not _oauth_enabled():
+                return self._error(503, "AAC OAuth is not configured", "configuration_error")
+            state = secrets.token_urlsafe(24)
+            verifier = secrets.token_urlsafe(32)
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+            with OAUTH_LOCK:
+                OAUTH_TRANSACTIONS[state] = {"verifier": verifier, "created_at": time.time()}
+            location = qoder_auth.build_authorize_url(
+                QD_AUTH_CONFIG["aac_public_base_url"], QD_AUTH_CONFIG["client_id"],
+                QD_AUTH_CONFIG["redirect_uri"], state, challenge)
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/auth/callback":
+            state = (query.get("state") or [""])[0]
+            code = (query.get("code") or [""])[0]
+            with OAUTH_LOCK:
+                transaction = OAUTH_TRANSACTIONS.pop(state, None)
+            if not transaction or time.time() - transaction["created_at"] > 300 or not code:
+                return self._error(400, "invalid OAuth state", "invalid_request_error")
+            try:
+                token = qoder_auth.exchange_code(QD_AUTH_CONFIG["aac_base_url"], QD_AUTH_CONFIG["client_id"], QD_AUTH_CONFIG["redirect_uri"], code, transaction["verifier"])
+                claims = qoder_auth.introspect_access_token(QD_AUTH_CONFIG["aac_base_url"], token.get("access_token"), QD_AUTH_CONFIG["client_id"])
+                session = qoder_auth.create_oauth_session(claims)
+            except qoder_auth.AuthError as exc:
+                return self._error(exc.status, str(exc), "invalid_request_error")
+            self.send_response(302)
+            self.send_header("Location", "/")
+            for key, value in _oauth_cookie_headers(session["session_id"]).items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/auth/me":
+            principal = _oauth_principal(self)
+            if not principal:
+                return self._json(200, {"authenticated": False})
+            return self._json(200, {"authenticated": True, "principal": principal.as_dict()})
+        if path == "/auth/api-keys":
+            principal = _oauth_principal(self)
+            if not principal or principal.principal_type != "aac-user":
+                return self._error(401, "AAC login required", "invalid_request_error")
+            runtime = TENANT_MANAGER.get_or_create(principal.aac_user_id, principal.qoder_user_id) if TENANT_MANAGER else None
+            if runtime is None:
+                return self._error(503, "tenant runtime unavailable", "server_error")
+            records = qoder_settings._load_key_records(runtime.root)
+            visible = []
+            for record in records:
+                item = dict(record)
+                item.pop("key_hash", None)
+                item.pop("credential", None)
+                visible.append(item)
+            return self._json(200, {"keys": visible, "owner_user_id": principal.qoder_user_id})
+        if path == "/auth/logout":
+            sid = _cookie_map(self.headers.get("Cookie")).get("QD-Session")
+            if sid:
+                qoder_auth._sessions.pop(sid, None)
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", "QD-Session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self._is_panel_route(path) and not self._management_ok() and not _oauth_principal(self):
             return self._error(401, "panel password required",
                                "invalid_request_error")
+        if path in ("/scheduler", "/tasks", "/logs") and self._oauth_role() == "user":
+            return self._error(403, "Qoder admin required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
         if path == "/panel/status":
@@ -7439,21 +7625,40 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, result)
 
     def do_POST(self):
+        self._begin_request()
         # #26：同 do_GET —— 每次请求入口清空，避免 keep-alive 复用实例时把上一次
         # chat 的出口/原因带到别的响应上。
         self.realm_used = ""
         self.realm_reason = ""
         path = self.path.split("?")[0]
+        if path == "/auth/api-keys":
+            principal = _oauth_principal(self)
+            if not principal or principal.principal_type != "aac-user":
+                return self._error(401, "AAC login required", "invalid_request_error")
+            runtime = TENANT_MANAGER.get_or_create(principal.aac_user_id, principal.qoder_user_id) if TENANT_MANAGER else None
+            if runtime is None:
+                return self._error(503, "tenant runtime unavailable", "server_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            label = str(payload.get("label") or "default").strip()[:120]
+            try:
+                issued = TENANT_MANAGER.issue_api_key(runtime, label, payload.get("expires_at"))
+            except Exception as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            return self._json(201, issued)
         if path == "/settings/save":
-            if not self._panel_ok():
-                return self._error(401, "panel password required",
+            if not self._management_ok():
+                return self._error(401, "panel password or AAC admin required",
                                    "invalid_request_error")
             return self._handle_settings_save()
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
-        if self._is_panel_route(path) and not self._panel_ok():
-            return self._error(401, "panel password required",
+        if self._is_panel_route(path) and not self._management_ok():
+            return self._error(401, "panel password or AAC admin required",
                                "invalid_request_error")
+        if self._oauth_role() == "user":
+            return self._error(403, "Qoder admin required", "invalid_request_error")
         if path in ("/agents/apply", "/agents/restore"):
             # 写**网关所在机器**的客户端配置文件：面板会话不够，还必须来自
             # loopback（远程/容器调用按设计拒绝——那是配置器 CLI 的活）。
@@ -7725,7 +7930,7 @@ def acc_realm(account):
 
 def main():
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, \
-        USAGE_SUMMARY, SCHEDULER
+        USAGE_SUMMARY, SCHEDULER, _LEGACY_POOL, _LEGACY_ACCOUNTS_DIR, _LEGACY_USAGE_DIR, _LEGACY_USAGE_LOG, _LEGACY_USAGE_SUMMARY, QD_AUTH_CONFIG, TENANT_MANAGER
     API_KEY_GENERATED = False
     ap = argparse.ArgumentParser(
         description="Qoder (qoder.com.cn / qoder.com) -> OpenAI-compatible proxy")
@@ -7809,7 +8014,7 @@ def main():
     API_KEY = args.api_key
     SYSTEM_PROMPT = args.system_prompt
     if args.accounts_dir:
-        ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
+        _LEGACY_ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
     # LAN 模式绝不能带默认密钥：网关花的是账号自己的上游额度，
     # 可猜的默认值等于让全网段的人白嫖。首次生成一次并持久化。
     if args.lan and not API_KEY:
@@ -7834,8 +8039,12 @@ def main():
                 "Change it in the panel, or restart with --panel-password.",
                 level="WARN")
 
-    POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
-    POOL.load()
+    _LEGACY_POOL = qoder_accounts.AccountPool(_LEGACY_ACCOUNTS_DIR, log=log)
+    _LEGACY_POOL.load()
+    QD_AUTH_CONFIG = qoder_settings.oauth_config()
+    TENANT_MANAGER = qoder_tenants.TenantRuntimeManager(
+        os.environ.get("QD_DATA_ROOT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    )
     load_persisted_realm()
     # task-61：把设置里的护栏阈值 + free 名单**同批**推给池（R3）；阈值全 0 时
     # 不产生任何副作用，任一 > 0 则惰性启动后台上新线程（G1 的恢复路径）。

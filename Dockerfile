@@ -23,7 +23,7 @@ FROM python:3.11-alpine
 # （docker build 的 SecretsUsedInArgOrEnv lint 提示来自变量名，而非真实密钥内容。）
 ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
-    PORT=8790 \
+    PORT=8789 \
     API_KEY= \
     TZ=Asia/Shanghai
 
@@ -41,7 +41,7 @@ RUN apk add --no-cache tzdata ca-certificates gcompat libstdc++ libgcc && \
 # Copy application files (Zero external pip dependencies needed -
 # AES/RSA/COSY signing are pure-stdlib implementations)
 COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
-     qoder_scheduler.py qoder_settings.py qoder_sign.py qoder_tasks.py \
+     qoder_scheduler.py qoder_settings.py qoder_auth.py qoder_tenants.py qoder_sign.py qoder_tasks.py \
      qoder_anthropic.py qoder_agents.py \
      dashboard.html baseprompt.json ./
 
@@ -65,12 +65,12 @@ RUN mkdir -p /app/accounts /app/usage
 # Volume persistence for credentials and usage logs
 VOLUME ["/app/accounts", "/app/usage"]
 
-EXPOSE 8790
+EXPOSE 8789
 
 # 健康探针（wb 同款）：/ping 永远 200 且不查账号池、不需要任何密钥；URL 跟随
 # PORT，容器重映射端口后仍能正确报告健康状态。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/ping' % os.environ.get('PORT','8790'), timeout=3)" || exit 1
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/ping' % os.environ.get('PORT','8789'), timeout=3)" || exit 1
 
 # 监听参数由上面的 ENV HOST/PORT 提供（qoder_proxy.py 的 argparse 默认值直接
 # 读环境变量），所以 docker run -e PORT=9000 与 compose 的 environment 真的生效；
