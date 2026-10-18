@@ -6327,7 +6327,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/auth/me":
             principal = _oauth_principal(self)
-            if not principal:
+            if not principal or principal.principal_type == "anonymous":
                 return self._json(200, {"authenticated": False})
             return self._json(200, {"authenticated": True, "principal": principal.as_dict()})
         if path == "/auth/api-keys":
