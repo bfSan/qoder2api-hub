@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.5.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4144,14 +4144,49 @@ def _shrink_tool_result(text, keep):
     nl2 = tail.find("\n")
     if nl2 != -1 and nl2 < keep // 2:
         tail = tail[nl2 + 1:]
-    omitted = len(text) - len(head) - len(tail)
-    marker = ("\n[[qoder-proxy: 已省略 %d 字符历史工具结果；"
-              "需要完整内容请重新执行该命令]]\n" % omitted)
+    # issue #48：省略标记必须是**固定串**——带字数会让「同一条工具结果」
+    # 在不同轮次产生不同字节（内容一旦变化/重试，数字就变），直接打断上游
+    # 前缀缓存。字数信息换不来什么，去掉。
+    marker = ("\n[[qoder-proxy: 已省略中间内容；"
+              "需要完整内容请重新执行该命令]]\n")
     return head + marker + tail
+
+
+def _tool_result_scope():
+    """削减范围策略（issue #48）：返回 ("tail", N) / ("all", 0) / ("turn", 0)。
+
+    为什么需要它：旧规则 `_current_turn_start` 会随请求形态**滑动**——
+    连续工具调用时 `_cur_start=1`（全不削），用户插一句话后 `_cur_start` 跳到
+    末尾（**每条**历史工具结果全部改写成省略版）。同一条历史消息在不同轮次被
+    序列化成不同字节，上游前缀缓存从第一条被削处开始整段失效（实测命中率
+    从 95-99% 掉到 8%）。
+
+    新默认 `tail`：只保护**最后 N 条**工具结果（默认 1），更早的一律削——
+    同一结果一旦被削，字节里不再有任何随轮次变化的成分（标记已改固定串），
+    因此只有「从最后一条滑出保护窗」的那一条会变，缓存中断点被限制在一处。
+
+    环境变量 QD_TOOL_RESULT_SCOPE：
+      tail（默认） 保护最后 QD_TOOL_RESULT_KEEP_TAIL 条（默认 1）
+      all          全部削减（缓存最稳，但当轮长输出也会被截）
+      turn         旧行为（当前轮全保，形态相关——仅兼容用）
+    """
+    scope = str(os.environ.get("QD_TOOL_RESULT_SCOPE") or "tail").strip().lower()
+    if scope in ("all", "stable", "everything"):
+        return "all", 0
+    if scope in ("turn", "history", "legacy", "current"):
+        return "turn", 0
+    try:
+        n = int(os.environ.get("QD_TOOL_RESULT_KEEP_TAIL") or 1)
+    except Exception:
+        n = 1
+    return "tail", max(0, n)
 
 
 def _current_turn_start(messages):
     """返回「当前轮」起始下标（索引 >= 它的 tool 结果不削减）。
+
+    **仅 QD_TOOL_RESULT_SCOPE=turn 时使用**（issue #48：该规则随请求形态滑动，
+    会让历史工具结果在不同轮次序列化成不同字节 -> 前缀缓存每轮失效）。
 
     判定：从末尾往前找最后一条 user/system/developer 消息——它开启当前回合，
     其后的一切（assistant 工具调用 + tool 结果）都属于当前轮。找不到则返回 0
@@ -4259,7 +4294,20 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
     flat, images = [], []
     # 暴露面削减只作用于历史（当前轮的 tool 结果必须完整保留）。
     _keep = _tool_result_keep_chars()
-    _cur_start = _current_turn_start(messages) if _keep else len(messages or [])
+    # issue #48：削减范围必须**与请求形态无关**。旧规则按「当前轮起点」滑动，
+    # 用户每发一条消息就把全部历史工具结果重削一遍 -> 同一条消息在不同轮次
+    # 序列化成不同字节 -> 上游前缀缓存整段失效（实测命中率 95%+ -> 8%）。
+    # 新默认 tail：只保护最后 N 条工具结果，更早的一律削（且削后字节恒定）。
+    _scope, _tail_n = _tool_result_scope()
+    _protect = set()
+    if _keep:
+        if _scope == "turn":
+            _protect = set(range(_current_turn_start(messages) or 0,
+                                 len(messages or [])))
+        elif _scope == "tail" and _tail_n > 0:
+            _tool_idx = [i for i, m in enumerate(messages or [])
+                         if isinstance(m, dict) and m.get("role") == "tool"]
+            _protect = set(_tool_idx[-_tail_n:])
     for _idx, m in enumerate(messages or []):
         if not isinstance(m, dict):
             continue
@@ -4277,7 +4325,7 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
             if tc:
                 name = " (%s)" % tc
             body = text or ""
-            if _keep and _idx < _cur_start:
+            if _keep and _idx not in _protect:
                 body = _shrink_tool_result(body, _keep)
             if structured:
                 # 结构化直传：保留 tool 角色与配对 id；content 用空字符串而非
