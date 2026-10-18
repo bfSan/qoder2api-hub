@@ -697,9 +697,15 @@ def _epoch_or_none(value):
     return seconds if seconds >= 0 else None
 
 
+def _local_day_start(ts):
+    """任意时间戳 -> 本地自然日 0 点（epoch 秒）。"""
+    lt = time.localtime(ts)
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                            0, 0, 0, 0, 0, -1)))
+
+
 def _local_midnight(days_back=0):
-    lt = time.localtime(time.time() - days_back * 86400)
-    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    return _local_day_start(time.time() - days_back * 86400)
 
 
 def range_window(value, since=None, until=None):
@@ -1448,6 +1454,292 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
         "since": lo, "until": hi,
         "series": [buckets[key] for key in sorted(buckets)],
         "credits": credits[:50],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7 天 / 30 天 Token 用量图（日期 × 分组 两个维度）
+# ---------------------------------------------------------------------------
+# 与 /usage/timeseries 的关系：那边只有「日期」一个维度（分桶总量），这里多
+# 一个分组维度（模型 / 区域 / Key / 账号），供堆叠柱状图用。两者口径一致
+# （error 行计入 errors、token 字段与 credit 的累加方式相同）。
+# 性能：日志是单进程顺序 append 的，所以从尾部倒读、遇到早于窗口的行即停——
+# 30 天窗口不必从文件头扫起（日志实测可长到几十 MB/天）。
+DAILY_MAX_DAYS = 90
+DAILY_GROUPS = ("model", "realm", "key", "account")
+_daily_cache = {}
+_daily_lock = threading.Lock()
+
+
+def _iter_usage_rows_since(since, chunk=256 * 1024):
+    """逆序产出 usage 行，遇到早于 since 的行即停止（生成器，内存 O(1)）。
+
+    只在倒读终止时依赖时间有序性：单进程 append 保证同一时刻附近的行总在
+    相邻块内，所以按 at 截断不会漏掉窗口内的行。
+    """
+    try:
+        fh = open(USAGE_LOG, "rb")
+    except FileNotFoundError:
+        return
+    try:
+        fh.seek(0, os.SEEK_END)
+        pos = fh.tell()
+        buf = b""
+        while pos > 0:
+            step = min(chunk, pos)
+            pos -= step
+            fh.seek(pos)
+            buf = fh.read(step) + buf
+            parts = buf.split(b"\n")
+            buf = parts[0]
+            for raw in reversed(parts[1:]):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except Exception:
+                    continue
+                at = row.get("at")
+                if not isinstance(at, (int, float)) or at < since:
+                    return
+                yield row
+        raw = buf.strip()
+        if raw:
+            try:
+                row = json.loads(raw)
+            except Exception:
+                return
+            at = row.get("at")
+            if isinstance(at, (int, float)) and at >= since:
+                yield row
+    except Exception as exc:
+        log("daily usage tail read failed: %s" % exc)
+    finally:
+        fh.close()
+
+
+def _daily_group_id(row, group):
+    """一行归入哪个分组。缺失键不静默丢弃（与 by-key 视图同口径）。"""
+    if group == "model":
+        return row.get("model") or "(unknown)"
+    if group == "realm":
+        return row.get("realm") or "(unknown)"
+    if group == "key":
+        return row.get("key_id") or "(no-key)"
+    return row.get("account") or "(unattributed)"
+
+
+def usage_daily(days=7, group="model", realm=None, ttl=10):
+    """Cached wrapper：面板轮询用，同一窗口+分组 10 秒内不重复扫日志。"""
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 7
+    days = max(1, min(DAILY_MAX_DAYS, days))
+    group = str(group or "model").strip().lower()
+    if group not in DAILY_GROUPS:
+        group = "model"
+    since = _local_day_start(time.time())
+    for _ in range(days - 1):
+        # 逐个「减一天再取本地零点」而不是 once 减 (days-1)*86400：
+        # 有夏令时的时区上按秒回推会得到 01:00 而不是 00:00，随后桶键与行的
+        # 本地零点全 miss → 30 天窗口的前半段被静默丢掉（7 天档碰不到）。
+        since = _local_day_start(since - 86400)
+    key = (realm_scope(realm) or "all", days, group, since)
+    now = time.time()
+    with _daily_lock:
+        hit = _daily_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            # 命中时刷新时间戳 => 淘汰变成 LRU 而不是 FIFO。不刷新的话
+            # min(...) 挑的是「最早创建」的那个，也就是正在被轮询的热点条目。
+            _daily_cache[key] = (now, hit[1])
+            return hit[1]
+    data = _usage_daily_uncached(days, group, realm, since)
+    with _daily_lock:
+        if len(_daily_cache) > 32:
+            # 只淘汰**最旧的单个**条目。原先这里是 clear()——清空会把其它
+            # 仍在被轮询的 (realm, days, group) 组合一起作废，下一轮全部重算。
+            oldest = min(_daily_cache, key=lambda k: _daily_cache[k][0])
+            _daily_cache.pop(oldest, None)
+        _daily_cache[key] = (time.time(), data)
+    return data
+
+
+def _iter_usage_rows_forward(since, chunk=256 * 1024):
+    """顺序读整个日志，只产出 at >= since 的行（倒读失明时的兜底用）。
+
+    record_usage 是顺序 append 的，所以正常情况永远走不到这里；只有当日志
+    被外部重排、或系统时钟大幅回拨导致倒读第一行就早于 since 时才需要它。
+    """
+    try:
+        with open(USAGE_LOG, "rb") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except Exception:
+                    continue
+                at = row.get("at")
+                if isinstance(at, (int, float)) and at >= since:
+                    yield row
+    except FileNotFoundError:
+        return
+    except Exception as exc:
+        log("daily usage forward read failed: %s" % exc)
+
+
+def _usage_log_size():
+    try:
+        return os.path.getsize(USAGE_LOG)
+    except OSError:
+        return 0
+
+
+def _usage_log_head_ts(probe_bytes=4096):
+    """读 usage 日志**第一条**记录的 at（只读开头几 KB）。
+
+    用来区分「窗口内本来就没数据」与「倒读被乱序日志阻死」——倒读对这两种
+    情况都产出 0 行，正确处置却相反（前者不该扫，后者必须扫）。正常日志是
+    单进程顺序 append 的，头行 at 最小；头行落在窗口内却一行都倒读不到，
+    只能是文件被重排过。
+    """
+    try:
+        with open(USAGE_LOG, "rb") as fh:
+            chunk = fh.read(probe_bytes)
+    except OSError:
+        return None
+    for raw in chunk.split(b"\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            at = json.loads(raw).get("at")
+        except Exception:
+            return None
+        return at if isinstance(at, (int, float)) else None
+    return None
+
+
+def _usage_daily_uncached(days, group, realm, since):
+    until = since + days * 86400
+    series = []
+    index = {}
+    for i in range(days):
+        # 同 since 的理由：索引用**重算出来的本地零点**，与 fold() 里的
+        # _local_day_start(at) 同一口径；直接 since + i*86400 在 DST 时区会
+        # 错位一小时，index.get() 全 miss。
+        start = since
+        for _ in range(i):
+            # +1 天再 +12h：只加 86400 在秋季回拨那天会落在「次日 23:00」
+            # （再取零点就退回去了），加半天余量能保证跨到下一自然日。
+            start = _local_day_start(start + 86400 + 43200)
+        lt = time.localtime(start)
+        item = {
+            "at": start,
+            "day": time.strftime("%Y-%m-%d", lt),
+            "label": time.strftime("%m-%d", lt),
+            "requests": 0, "errors": 0,
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "reasoning_tokens": 0, "cached_tokens": 0,
+            "total_tokens": 0, "credit": 0.0,
+            "groups": {},
+        }
+        series.append(item)
+        index[start] = item
+    groups = {}
+    totals = {"requests": 0, "errors": 0, "total_tokens": 0, "credit": 0.0}
+    day_cache = {}
+    seen = [0]
+
+    def fold(row):
+        if realm and not row_matches_realm(row, realm):
+            return
+        at = row.get("at") or 0
+        hour = int(at // 3600)
+        day_start = day_cache.get(hour)
+        if day_start is None:
+            day_start = _local_day_start(at)
+            day_cache[hour] = day_start
+        item = index.get(day_start)
+        if item is None:
+            return
+        is_err = bool(row.get("error"))
+        if is_err:
+            item["errors"] += 1
+        else:
+            item["requests"] += 1
+        tokens = row.get("total_tokens") or 0
+        for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+                      "cached_tokens", "total_tokens"):
+            item[field] += (row.get(field) or 0)
+        credit = row.get("credit") or 0
+        item["credit"] += credit
+        gid = _daily_group_id(row, group)
+        item["groups"][gid] = item["groups"].get(gid, 0) + tokens
+        agg = groups.get(gid)
+        if agg is None:
+            agg = groups[gid] = {"id": gid, "requests": 0, "errors": 0,
+                                 "total_tokens": 0, "credit": 0.0}
+        if is_err:
+            agg["errors"] += 1
+        else:
+            agg["requests"] += 1
+        agg["total_tokens"] += tokens
+        agg["credit"] += credit
+        totals["total_tokens"] += tokens
+        totals["credit"] += credit
+        if is_err:
+            totals["errors"] += 1
+        else:
+            totals["requests"] += 1
+
+    bad_rows = [0]
+
+    def fold_safe(row):
+        # usage.jsonl 是历史追加的，_extract_usage 不做类型收敛（上游给什么写
+        # 什么），一行 "total_tokens": "123" 就足以让 += 抛 TypeError。裸调会让
+        # 整个端点永久 500（脏行通常在尾部，倒读天天先撞它）；而同口径的
+        # _usage_timeseries_uncached 是 except 住降级的——这里对齐成「跳坏行」。
+        try:
+            fold(row)
+        except Exception:
+            bad_rows[0] += 1
+
+    for row in _iter_usage_rows_since(since):
+        seen[0] += 1
+        fold_safe(row)
+    if not seen[0]:
+        # 倒读一行都没产出：要么「窗口内本来就无数据」（新装、隔很久没请求），
+        # 要么「倒读被乱序日志/时钟回拨阻死」。两者在倒读侧都是 0 行，正确处置
+        # 却完全相反。用**文件头第一条 at** 区分：正常日志从早到晚递增，头行
+        # 早于窗口起点就是合法空窗口，不必扫；头行落在窗口内却一行都读不到，
+        # 只能是文件被重排过，值得付一次顺序全扫。
+        # （曾用「文件小于 8MB 才兜底」的体积门限，那恰好只在不需要兜底的小
+        #   日志上生效，在大日志上留下静默空图。）
+        head = _usage_log_head_ts()
+        if isinstance(head, (int, float)) and head >= since:
+            log("daily usage: backward read went blind, falling back to full scan",
+                level="WARN", tag="usage")
+            for row in _iter_usage_rows_forward(since):
+                fold_safe(row)
+    if bad_rows[0]:
+        log("daily usage: skipped %d inconsistent rows" % bad_rows[0],
+            level="WARN", tag="usage")
+    ordered = sorted(groups.values(), key=lambda g: -(g["total_tokens"] or 0))
+    return {
+        "ok": True,
+        "realm": realm or "all",
+        "days": days,
+        "group_by": group,
+        "bucket_seconds": 86400,
+        "since": since,
+        "until": until,
+        "series": series,
+        "groups": ordered,
+        "totals": totals,
     }
 
 
@@ -6579,6 +6871,16 @@ class Handler(BaseHTTPRequestHandler):
                 realm=req_realm, range=req_range, since=req_since,
                 until=req_until,
                 bucket_seconds=(query.get("bucket") or [None])[0]))
+        if path == "/usage/daily":
+            if not self._authorized():
+                return
+            # 7 天 / 30 天堆叠柱状图：日期 × 分组（模型/区域/Key/账号）
+            req_realm = query.get("realm", [None])[0] \
+                or self.headers.get("X-Realm") or CURRENT_REALM
+            return self._json(200, usage_daily(
+                days=(query.get("days") or ["7"])[0],
+                group=(query.get("group") or ["model"])[0],
+                realm=req_realm))
         if path == "/tasks":
             if not self._authorized():
                 return
