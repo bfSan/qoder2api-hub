@@ -3494,7 +3494,7 @@ function renderKeyRows(){
       const options = REALM_CHOICES.map(([val, lbl]) =>
         '<option value="' + val + '"' + ((row.realm || '') === val ? ' selected' : '') + '>' + lbl + '</option>'
       ).join('');
-      return '<div class="key-card" style="border-color:var(--accent);background:#ffffff;box-shadow:0 0 0 1px var(--accent), var(--shadow-md)">'
+      return '<div class="key-card" style="border-color:var(--accent);background:var(--panel);box-shadow:0 0 0 1px var(--accent), var(--shadow-md)">'
         + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">'
         +   '<div style="font-size:14px;font-weight:700;color:var(--fg)">' + (row.id ? '编辑 API Key' : '新建 API Key') + '</div>'
         +   '<span class="badge s mini">设置出口</span>'
