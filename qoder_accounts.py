@@ -1915,6 +1915,17 @@ class Account(object):
                     "http": exc.code,
                     "error": "HTTP %d %s" % (exc.code, body[:160]),
                 }
+            if exc.code == 403:
+                # issue #40：403 多为**出口/WAF 拦截**（国际版该接口本来就不存在，
+                # 正常应 404）。不写能力缓存（下次仍重探），给出可读原因——
+                # 面板显示「上游拒绝访问」而不是一句裸 HTTP 403。
+                return False, {
+                    "unavailable": True,
+                    "reason": "上游拒绝访问（HTTP 403）：可能是出口 IP/代理被拦截，"
+                              "或本区域未开放该接口",
+                    "http": 403,
+                    "error": "HTTP 403 %s" % body[:160],
+                }
             return False, {"unavailable": False,
                            "error": "HTTP %d %s" % (exc.code, body[:160])}
         except Exception as exc:
@@ -2423,12 +2434,55 @@ class Account(object):
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
 
+    def _other_realm_quota_hint(self):
+        """issue #40 探测：令牌是否属于**另一个区域**（realm 标记错误）。
+
+        部分 403 是「账号标了 intl、令牌却是国内版」导致的——同一个 token
+        打另一区的 quota 会成功。只在 403 时探测一次，不发任何写操作。
+        返回可读提示字符串；不属于该情形返回空串。
+        """
+        other = "cn" if self.realm != "cn" else "intl"
+        try:
+            url = get_realm_config(other)["openapi"] + PATH_QUOTA
+            q = http_json(url, method="GET", headers=self.headers(),
+                          timeout=20, retries=1)
+        except Exception:
+            return ""
+        if not isinstance(q, dict):
+            return ""
+        if not any(k in q for k in ("userQuota", "addOnQuota")):
+            return ""
+        name = "国内版" if other == "cn" else "国际版"
+        return ("该账号的令牌在%s可用，本区 403 很可能是**区域标记错误**："
+                "请在面板重新扫描/导入该账号（或把 realm 改成 %s）"
+                % (name, other))
+
     def fetch_credits(self):
         """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。"""
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_QUOTA
+        hint = ""
         try:
             q = http_json(url, method="GET", headers=self.headers(), timeout=30)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                # issue #40：403 常见于 WAF/出口被拦、或令牌区域标记错误。
+                # 先用**桌面端同款头**重试一次（官方客户端会用这套），仍失败
+                # 再给出可操作说明——不再把裸 403 当唯一信息。
+                try:
+                    q = http_json(url, method="GET",
+                                  headers=self.desktop_headers(), timeout=30)
+                except Exception as exc2:
+                    hint = self._other_realm_quota_hint()
+                    return {
+                        "ok": False,
+                        "http": exc.code,
+                        "error": "HTTP %s %s%s"
+                                 % (exc.code, str(exc2)[:160],
+                                    (" ｜ " + hint) if hint else ""),
+                    }
+            else:
+                return {"ok": False, "http": exc.code, "error": str(exc)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         # #25-d：非 dict 响应（解析失败形态）直接走退化路径——旧实现会在这里
@@ -2490,6 +2544,34 @@ class Account(object):
             return self._note_quota_anomaly(
                 q, "both quota objects missing" if both_missing
                 else "exceeded=true with zero size/remain")
+        # issue #39：上游若有**共享额度池**（团队/企业/池化），原样纳入
+        # packages 与 credits.shared——此前只显示套餐内 + 赠送，共享额度被漏掉。
+        # 字段名按常见形态兼容；不存在就不编造（面板不显示该行）。
+        shared = None
+        for _key in ("sharedQuota", "teamQuota", "poolQuota",
+                     "sharedCredits", "sharedCredit"):
+            _src = q.get(_key)
+            if isinstance(_src, dict):
+                shared = {
+                    "remain": int(_num(_src, "remaining")),
+                    "used": int(_num(_src, "used")),
+                    "size": int(_num(_src, "total")),
+                    **_expiry_of(_src),
+                }
+                break
+            if isinstance(_src, (int, float)) and not isinstance(_src, bool):
+                shared = {"remain": int(_src), "used": 0, "size": int(_src)}
+                break
+        _pkgs = [
+            {"name": "基础额度", "remain": int(_num(uq, "remaining")),
+             "used": int(_num(uq, "used")), "size": int(_num(uq, "total")),
+             **_expiry_of(uq)},
+            {"name": "赠送/签到额度", "remain": int(_num(aq, "remaining")),
+             "used": int(_num(aq, "used")), "size": int(_num(aq, "total")),
+             **_expiry_of(aq)},
+        ]
+        if shared:
+            _pkgs.append({"name": "共享额度", **shared})
         self.credits = {
             "remain": remain,
             "used": used,
@@ -2497,14 +2579,8 @@ class Account(object):
             "exceeded": bool(q.get("isQuotaExceeded")),
             "usage_pct": q.get("totalUsagePercentage"),
             "expires_at": normalize_epoch(q.get("expiresAt")),
-            "packages": [
-                {"name": "基础额度", "remain": int(_num(uq, "remaining")),
-                 "used": int(_num(uq, "used")), "size": int(_num(uq, "total")),
-                 **_expiry_of(uq)},
-                {"name": "赠送/签到额度", "remain": int(_num(aq, "remaining")),
-                 "used": int(_num(aq, "used")), "size": int(_num(aq, "total")),
-                 **_expiry_of(aq)},
-            ],
+            "shared": shared,
+            "packages": _pkgs,
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }

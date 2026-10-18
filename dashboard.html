@@ -2376,7 +2376,14 @@ function accountRow(a){
               : '<span class="badge ok">可用</span>';
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
   const cred = a.credits;
-  const credText = cred ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size)) : '<span style="color:var(--dim)">未查询</span>';
+  // issue #39：共享额度（团队/企业/池化）——上游返回时显示在套餐额度之后，
+  // 不返回时保持原样（不编造）。口径：套餐内 remain/size + 共享 remain。
+  const sharedTag = (cred && cred.shared && cred.shared.remain != null)
+    ? ' <span style="color:var(--dim);font-size:11px" title="共享额度（团队/企业池）：' +
+      '已用 ' + fmt(cred.shared.used) + ' · 总量 ' + fmt(cred.shared.size) + '">共享 ' +
+      fmt(cred.shared.remain) + '</span>'
+    : '';
+  const credText = cred ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size) + sharedTag) : '<span style="color:var(--dim)">未查询</span>';
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'

@@ -564,9 +564,20 @@ def stream_anthropic_events(inner_lines, model="", holder=None):
         yield ev("content_block_stop", {"index": i})
     final = chat_usage_to_anthropic(
         holder.get("usage") if isinstance(holder, dict) else None)
+    # issue #42：新版 Anthropic 语义里 message_delta.usage 是**累计完整用量**，
+    # Claude Code / AI SDK 系客户端按它读取最终计量。此前只回 output_tokens，
+    # 输入侧（input/cache_read/cache_creation）全部缺失 -> 客户端输入 token 恒 0。
+    # 口径与非流式 chat_to_messages 完全一致（input + cache_read == prompt_tokens）。
     yield ev("message_delta", {
         "delta": {"stop_reason": _stop_reason(finish), "stop_sequence": None},
-        "usage": {"output_tokens": final["output_tokens"]}})
+        "usage": {
+            "input_tokens": final["input_tokens"],
+            "cache_read_input_tokens": final["cache_read_input_tokens"],
+            "cache_creation_input_tokens":
+                final["cache_creation_input_tokens"],
+            "output_tokens": final["output_tokens"],
+            "output_tokens_details": final["output_tokens_details"],
+        }})
     yield ev("message_stop", {})
 
 

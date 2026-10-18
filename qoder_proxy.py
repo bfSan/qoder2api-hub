@@ -55,7 +55,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2983,6 +2983,69 @@ def _dsml_tail_holdable(tail):
     return s == "<"
 
 
+# issue #37：回声块**外层数组合法、内层 arguments 非法**（未转义换行/引号、
+# 截断、尾部多余文本、非法转义）。这种块能确定是工具协议回声（marker + 数组 +
+# 已声明的工具名），只是参数坏了——绝不能当正文放出去（协议泄漏），也不能
+# 伪造一个可执行调用（会写坏文件）。统一替换为一句明确的失败说明。
+BAD_ARGS_NOTICE = ("（上游返回的工具调用参数不是合法 JSON，网关已丢弃该调用，"
+                   "未执行任何工具；请重试。）")
+
+
+def _echo_with_bad_args(text, allowed_names=None):
+    """这段正文是否是「工具协议回声 + 内层参数非法」？（issue #37）
+
+    判定链（全部满足才算）：
+      1) 整段是 marker（方/尖括号）+ JSON 数组（可带围栏、可带 DSML 尾标签）；
+      2) 外层数组能解析、非空，每项是 dict 且有非空字符串 name；
+      3) 声明了 tools 时，所有 name 都在声明集合里；
+      4) 至少一个 arguments 是**非空字符串但解析失败**。
+    普通散文 / 讨论 marker / 合法 JSON 示例都不会命中。
+    """
+    if not text:
+        return False
+    t = _normalize_leak_marker((text or "").strip())
+    t = _strip_dsml_close_tail(t).strip()
+    if t.startswith("```") and t.endswith("```") and len(t) > 6:
+        inner = t[3:]
+        if inner[:4].lower() == "json":
+            inner = inner[4:]
+        t = _strip_dsml_close_tail(inner[:-3].strip()).strip()
+    if not t.startswith(LEAK_MARKER):
+        return False
+    rest = t[len(LEAK_MARKER):].strip()
+    if not (rest.startswith("[") and rest.endswith("]")):
+        return False
+    try:
+        arr = json.loads(rest)
+    except Exception:
+        return False
+    if not isinstance(arr, list) or not arr:
+        return False
+    bad = 0
+    for item in arr:
+        if not isinstance(item, dict):
+            return False
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return False
+        if allowed_names and name.strip() not in allowed_names:
+            return False
+        if "arguments" not in item:
+            return False
+        args = item.get("arguments")
+        if isinstance(args, (dict, list)):
+            continue
+        if not isinstance(args, str):
+            return False
+        if not args.strip():
+            continue
+        try:
+            json.loads(args)
+        except Exception:
+            bad += 1
+    return bad > 0
+
+
 # issue #11：tool 角色消息被序列化进 content 时的开标记（写入侧见
 # flatten_messages）。网关只写开标记、不写闭标记；模型常自造一个
 # 「[工具结果结束]」闭标记，甚至夹带自造的 <system_warning> 残片。
@@ -3513,6 +3576,14 @@ def recover_leaked_tool_calls(frames, allowed_names=None):
             # 未闭合的截断块）——吞掉，不还原（需 tool_call_id 配对）。
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(hold), level="WARN", tag="chat")
+        elif _echo_with_bad_args(hold, allowed_names):
+            # issue #37：能确定是工具协议回声（marker + 合法外层数组 + 已声明
+            # 工具名），只是内层 arguments 坏了——不泄漏协议、也不伪造可执行
+            # 调用，改为一句明确的失败说明（客户端据此知道"没执行"）。
+            log("dropped leaked tool-call echo with invalid arguments "
+                "(%d chars) — issue #37" % len(hold),
+                level="WARN", tag="chat")
+            yield _leak_chunk_frame(meta, {"content": BAD_ARGS_NOTICE})
         else:
             yield _leak_chunk_frame(meta, {"content": hold})
     if finished is not None:
@@ -4102,6 +4173,34 @@ def extract_session_key(headers, payload):
 # 上游瞬时故障（与客户端参数无关，值得同账号快速重试）
 TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
+
+# issue #38：上游「排队」（403 + isQueued/10605 + retryAfterSeconds）时，
+# 网关**等队列放行后重试**，而不是把排队 JSON 当错误交给客户端——客户端会把
+# 它当成请求被拒（直接结束本轮）。三档都是可调的，默认值保守：
+#   单轮最长等 QUEUE_WAIT_MAX_SECS；整次请求总预算 QUEUE_WAIT_BUDGET_SECS；
+#   最多等 QUEUE_MAX_ROUNDS 轮。超出预算仍按原错误返回（fail-open 语义不变）。
+QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 3)
+QUEUE_WAIT_MAX_SECS = int(os.environ.get("QD_QUEUE_WAIT_MAX_SECS") or 180)
+QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 300)
+
+
+def _queue_wait_seconds(detail):
+    """从上游 403/排队响应体里解析「等多久」；不是排队信号则返回 0。
+
+    形如：{"code":"10605","message":"...","isQueued":true,
+           "retryAfterSeconds":30}
+    """
+    d = detail or ""
+    low = d.lower()
+    if "10605" not in d and "isqueued" not in low and "queue" not in low:
+        return 0
+    m = re.search(r'retryAfterSeconds\D+(\d+)', d)
+    if not m:
+        return 30                       # 排队但没给时长：按 30s 保守处理
+    try:
+        return max(1, int(m.group(1)))
+    except Exception:
+        return 30
 CHECKIN_MIN_GAP = 1.0              # 签到防风控：账号之间的最小间隔（秒）
 _CLIENT_FAULT_MARKERS = (
     "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
@@ -4438,7 +4537,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         resp = None
         last_exc = None
         detail = ""
-        for tries in range(TRANSIENT_MAX_RETRIES + 1):
+        tries = 0                 # 瞬时故障重试计数（1s/2s 退避）
+        queue_tries = 0           # 排队等待轮次（issue #38）
+        queue_start = time.time()
+        while True:
             try:
                 sess = SESSIONS.get(account)
                 headers = sess.headers(encoded, raw_url, model_key=model_key,
@@ -4462,6 +4564,21 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 except Exception:
                     pass
                 last_exc = exc
+                # issue #38：上游排队 -> 等放行后重试同一账号（不把排队 JSON
+                # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
+                # 既有分类（fail-open 语义不变）。
+                qwait = _queue_wait_seconds(detail)
+                if qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS \
+                        and qwait <= QUEUE_WAIT_MAX_SECS \
+                        and (time.time() - queue_start) + qwait \
+                        <= QUEUE_WAIT_BUDGET_SECS:
+                    queue_tries += 1
+                    log("upstream queued on '%s' model '%s' - waiting %ds "
+                        "(round %d/%d)"
+                        % (account.uid[:8], model, qwait, queue_tries,
+                           QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
+                    time.sleep(qwait + 1)
+                    continue
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
                     break
@@ -4473,6 +4590,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                         % (exc.code, account.uid[:8], model, tries + 1,
                            TRANSIENT_MAX_RETRIES + 1, backoff),
                         level="WARN", tag="chat")
+                    tries += 1
                     time.sleep(backoff)
                     continue
                 break
@@ -4499,7 +4617,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                                TRANSIENT_MAX_RETRIES + 1,
                                str(exc)[:120], tries + 1),
                             level="WARN", tag="chat")
-                    time.sleep(tries + 1)
+                    tries += 1
+                    time.sleep(tries)
                     continue
                 break
 
@@ -4925,6 +5044,12 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                 log("dropped leaked tool-result echo (%d chars) — issue #11"
                     % len(_echo_src), level="WARN", tag="chat")
                 message["content"] = _head16
+            elif _echo_with_bad_args(_echo_src, allowed_names):
+                # issue #37：内层参数非法的协议回声——不泄漏、不伪造调用。
+                log("dropped leaked tool-call echo with invalid arguments "
+                    "(%d chars) — issue #37" % len(_echo_src),
+                    level="WARN", tag="chat")
+                message["content"] = _head16 + BAD_ARGS_NOTICE
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -5699,6 +5824,7 @@ def stream_responses_events(inner_lines, model, holder):
         leak_calls, leak_clean = (None, text_buffer)
         dropped_leak = False
         dropped_tool_echo = False
+        dropped_bad_args = False
         # issue #16-B1：散文已先发出时 any(text_parts) 为真，但缓冲本身若以
         # 标记开头（切分后剩下的回声块）仍必须走回读/吞掉判定，否则会漏。
         if not any(text_parts) or _marker_starts_at(text_buffer):
@@ -5710,6 +5836,9 @@ def stream_responses_events(inner_lines, model, holder):
             elif leak_calls is None and _tool_echo_droppable(
                     text_buffer, holder.get("allowed_names")):
                 dropped_tool_echo = True
+            elif leak_calls is None and _echo_with_bad_args(
+                    text_buffer, holder.get("allowed_names")):
+                dropped_bad_args = True
         if leak_calls:
             dsml_tool_calls.extend(
                 {"id": c.get("id"),
@@ -5727,6 +5856,12 @@ def stream_responses_events(inner_lines, model, holder):
             log("dropped leaked tool-result echo (%d chars) — issue #11"
                 % len(text_buffer), level="WARN", tag="chat")
             calls_rem, clean_rem = None, None
+        elif dropped_bad_args:
+            # issue #37：内层参数非法的协议回声 -> 不输出协议，给明确说明。
+            log("dropped leaked tool-call echo with invalid arguments "
+                "(%d chars) — issue #37" % len(text_buffer),
+                level="WARN", tag="chat")
+            calls_rem, clean_rem = None, BAD_ARGS_NOTICE
         else:
             calls_rem, clean_rem = parse_dsml_tool_calls(text_buffer)
         if calls_rem:
@@ -6721,7 +6856,10 @@ class Handler(BaseHTTPRequestHandler):
             current = str(payload.get("current") or "")
             new = str(payload.get("new") or "")
             if not qoder_settings.verify_panel_password(ACCOUNTS_DIR, current):
-                return self._error(401, "current password is wrong",
+                # issue #41：原密码错是**业务校验失败**，不是会话失效。
+                # 401 会让前端弹回登录遮罩（用户看到「登录 UI」而不是原因）；
+                # 403 保持「已登录但不允许」的语义，前端直接显示 msg。
+                return self._error(403, "当前密码不正确",
                                    "invalid_request_error")
             if len(new) < 4:
                 return self._error(400, "new password must be at least 4 characters",

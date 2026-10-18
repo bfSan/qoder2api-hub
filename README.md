@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.4.3-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.4.4-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,23 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.4.4
+
+**🐛 问题修复**
+
+- **Anthropic 流式用量缺输入侧字段**（#42，报告者 zengzongxiong）：`message_delta.usage` 此前只回 `output_tokens`，按新版 Anthropic 语义（累计完整用量）读取的客户端（Claude Code / AI SDK 系）输入 token 恒为 0。现在回全 `input_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` / `output_tokens` / `output_tokens_details`，与非流式同口径（`input_tokens + cache_read == prompt_tokens`）。
+- **工具调用协议回声在内层参数非法时泄漏为正文**（#37，报告者 qingannn）：外层数组合法、内层 arguments 非法（未转义换行/引号、截断、尾部多余文本、非法转义）时，回读守卫拒绝恢复后整段协议被当正文放出并普通结束。现在识别这种形态为「协议回声 + 参数坏了」：**不泄漏协议、不伪造可执行调用**，改为一句明确的失败说明。散文/示例/未声明工具名不受影响。
+- **上游排队被当成错误丢给客户端**（#38）：403 + `isQueued`/`10605` + `retryAfterSeconds` 现在会在预算内**等待队列放行后重试**（默认最多 3 轮、单轮 ≤180s、总预算 300s，均可用 `QD_QUEUE_*` 环境变量调整），不再让客户端看到排队 JSON 就直接结束。
+- **国际版积分/签到 403**（#40）：403 时先用桌面端同款请求头重试一次；仍失败时给出可操作说明，并**自动探测「令牌属于另一区域」**（区域标记错误）——实测国际版 quota 接口本身可用、签到接口在 intl 不存在（404 已按「本区域无此接口」处理）；签到 403 也不再是裸错误，而是带原因的「上游拒绝访问」。
+- **改密码未先校验原密码**（#41）：原密码错现在返回 **403 +「当前密码不正确」**（此前 401 会触发前端弹回登录遮罩，用户只看到登录 UI 看不到原因）。
+- **共享额度不显示**（#39）：上游若返回共享额度池（`sharedQuota` / `teamQuota` / `poolQuota` / `sharedCredits`），现在纳入 `credits.packages`（「共享额度」行）并在账号行显示「共享 N」；不返回时不编造。套餐总额口径不变。
+
+**🎨 体验优化**：账号行在共享额度存在时显示「共享 N」徽标（悬停可见已用/总量）。
+
+**⚠️ 其他变更**：新增回归套件 `tests/_test_issues_1_4_4.py`（31 条断言，覆盖上述六个 issue 的判据）。
+
+**验证**：全量 **30 suites / 1082 checks / 0 failed**；新套件回退四个源文件后必红（#42 五条断言现场复现），恢复后全绿。
 
 ### v1.4.3
 
