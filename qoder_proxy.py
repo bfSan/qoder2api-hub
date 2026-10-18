@@ -412,8 +412,9 @@ USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                 "original_credits")
 
 # Web-panel access control. The panel is gated by its own password (default
-# "admin"), independent of the /v1 API key. Sessions live in memory only.
-PANEL = qoder_settings.PanelSessions()
+# "admin"), independent of the /v1 API key. Sessions are signed tokens whose key
+# lives in accounts/settings.json, so a restart no longer forces a re-login.
+PANEL = qoder_settings.PanelSessions(lambda: ACCOUNTS_DIR)
 API_KEY_FILE_SET = False
 
 
@@ -6852,7 +6853,11 @@ class Handler(BaseHTTPRequestHandler):
                     qoder_settings.panel_password_is_default(ACCOUNTS_DIR),
             })
         if path == "/panel/logout":
-            PANEL.revoke(self._panel_token())
+            # 退出登录不能只往内存黑名单里写一笔：那份 dict 重启即丢，已退出的
+            # token 会活到 TTL（7 天）结束——比改动前的「重启全清」更差。
+            # 直接换密钥：本 token 与其它浏览器的会话一起作废。本地单人面板无感，
+            # 多人/局域网场景反而更安全。
+            PANEL.revoke_all()
             return self._json(200, {"ok": True})
         # 之后所有路由都要面板会话
         if not self._panel_ok():
