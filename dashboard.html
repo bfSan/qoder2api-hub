@@ -3514,8 +3514,7 @@ function applyRoleUI(){
   const hide = id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; };
   if(!admin){
     hide('btnNavLogs'); hide('pageLogs');
-    ['btnTriggerSched','btnToggleSched','btnCheckin','btnScanDesktop','btnModelSync','btnModelEdit','btnModelSave'].forEach(hide);
-    document.querySelectorAll('[onclick*="openLoginModal"],[onclick*="exportAccounts"],[onclick*="openImport"],[onclick*="queryCredits"],[onclick*="setAll("]').forEach(el => el.style.display='none');
+    ['btnTriggerSched','btnToggleSched','btnModelSync','btnModelEdit','btnModelSave'].forEach(hide);
     hide('panelPasswordSection');
     hide('runtimeInfoSection');
     hide('realmModeBar');

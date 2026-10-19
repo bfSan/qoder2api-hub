@@ -7004,6 +7004,11 @@ class Handler(BaseHTTPRequestHandler):
         principal = _oauth_principal(self)
         return getattr(principal, "role", "") if principal else ""
 
+    @staticmethod
+    def _user_account_route(path):
+        """Whether an AAC user may operate their own tenant account pool."""
+        return path.startswith("/accounts/")
+
     def _begin_request(self):
         _REQUEST_RUNTIME.set(None)
         self.key_entry = None
@@ -8456,10 +8461,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_settings_save()
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
-        if self._is_panel_route(path) and not self._management_ok():
+        user_account_route = (
+            self._oauth_role() == "user" and self._user_account_route(path)
+        )
+        if self._is_panel_route(path) and not self._management_ok() \
+                and not user_account_route:
             return self._error(401, "panel password or AAC admin required",
                                "invalid_request_error")
-        if self._oauth_role() == "user":
+        if self._oauth_role() == "user" and not user_account_route:
             return self._error(403, "Qoder admin required", "invalid_request_error")
         if path in ("/agents/apply", "/agents/restore"):
             # 写**网关所在机器**的客户端配置文件：面板会话不够，还必须来自
