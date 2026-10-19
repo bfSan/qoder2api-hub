@@ -7492,11 +7492,20 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(text_content)
             return
         if path == "/settings/reveal":
-            # 看板只画掩码 Key，复制明文需要显式请求；必须面板会话。
-            if not self._panel_ok():
+            # 管理员使用本地面板会话；普通 AAC 用户只允许读取自己租户的
+            # Key。普通用户路径必须先跑 _authorized()，这样 ACCOUNTS_DIR
+            # 会绑定到当前租户，而不是落到 legacy 目录。
+            user_principal = _oauth_principal(self)
+            is_user = bool(user_principal
+                           and user_principal.principal_type == "aac-user"
+                           and user_principal.role == "user")
+            if is_user:
+                if not self._authorized():
+                    return
+            elif not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
-            if qoder_settings.panel_password_is_default(ACCOUNTS_DIR):
+            if not is_user and qoder_settings.panel_password_is_default(ACCOUNTS_DIR):
                 # 默认密码 = 局域网内任何人都能登录；明文 Key 不能这样交出去。
                 return self._error(
                     403,
@@ -7558,11 +7567,19 @@ class Handler(BaseHTTPRequestHandler):
             self._error(400, "invalid JSON body", "invalid_request_error")
             return None
 
-    def _handle_settings_save(self):
-        """Persist panel-managed settings from the web settings tab."""
+    def _handle_settings_save(self, *, include_admin=True, user_scope=False):
+        """Persist settings, optionally restricted to a user's tenant API Keys."""
         payload = self._payload_or_error()
         if payload is None:
             return
+        if user_scope:
+            unsupported = sorted(set(payload) - {"api_keys"})
+            if unsupported:
+                return self._error(
+                    403,
+                    "AAC users may only manage tenant API keys",
+                    "permission_error",
+                )
         reply = {}
         if "api_keys" in payload:
             raw = payload.get("api_keys")
@@ -7667,7 +7684,7 @@ class Handler(BaseHTTPRequestHandler):
                 SCHEDULER.stop()
                 SCHEDULER.start()
             reply["scheduler"] = "restarted"
-        reply.update(runtime_settings_view())
+        reply.update(runtime_settings_view(include_admin=include_admin))
         return self._json(200, reply)
 
     def _handle_panel(self, path):
@@ -8466,10 +8483,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc), "invalid_request_error")
             return self._json(201, issued)
         if path == "/settings/save":
-            if not self._management_ok():
+            is_admin = self._management_ok()
+            is_user = self._oauth_role() == "user"
+            if not is_admin and not is_user:
                 return self._error(401, "panel password or AAC admin required",
                                    "invalid_request_error")
-            return self._handle_settings_save()
+            if is_user and not is_admin:
+                # Bind the request context to this user's tenant before the
+                # settings handler touches ACCOUNTS_DIR or configured_keys().
+                if not self._authorized():
+                    return
+            return self._handle_settings_save(
+                include_admin=is_admin,
+                user_scope=(is_user and not is_admin),
+            )
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         user_account_route = (

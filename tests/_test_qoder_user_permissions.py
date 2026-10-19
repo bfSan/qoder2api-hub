@@ -1,5 +1,8 @@
 """Regression matrix for AAC ordinary-user Qoder permissions."""
 import http.server
+import json
+import os
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -19,18 +22,19 @@ class Principal:
     qoder_user_id = "user-1"
 
 
-def request(base, method, path):
+def request(base, method, path, payload=None):
+    body = None if payload is None else json.dumps(payload).encode()
     req = urllib.request.Request(
         base + path,
         method=method,
-        data=b"{}" if method == "POST" else None,
-        headers={"Content-Type": "application/json"},
+        data=body,
+        headers={"Content-Type": "application/json"} if body else {},
     )
     try:
         with urllib.request.urlopen(req, timeout=5) as response:
-            return response.status
+            return response.status, response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        return exc.code
+        return exc.code, exc.read().decode("utf-8", "replace")
 
 
 def main():
@@ -41,8 +45,12 @@ def main():
         P.Handler._handle_accounts,
         qoder_tasks.fetch_tasks_view,
     )
+    runtime = type("Runtime", (), {"root": tempfile.mkdtemp(prefix="qd-user-perm-")})()
     P._oauth_principal = lambda handler: Principal()
-    P.Handler._authorized = lambda self: True
+    def authorize(self):
+        P._REQUEST_RUNTIME.set(runtime)
+        return True
+    P.Handler._authorized = authorize
     P.Handler._handle_accounts = lambda self, path, payload: self._json(
         200, {"ok": True, "path": path}
     )
@@ -65,17 +73,40 @@ def main():
     ]
     failures = []
     for label, method, path, expected in checks:
-        actual = request(base, method, path)
+        actual, _ = request(base, method, path, {} if method == "POST" else None)
         print("  [%s] %s -> %s" % ("PASS" if actual == expected else "FAIL", label, actual))
         if actual != expected:
             failures.append(label)
+    key_payload = {"api_keys": [{
+        "id": "user-key-1", "name": "我的 Key", "key": "user-secret-key",
+        "realm": "cn", "enabled": True,
+    }]}
+    status, body = request(base, "POST", "/settings/save", key_payload)
+    ok = status == 200 and "api_keys_saved" in body
+    print("  [%s] ordinary user can save tenant API keys -> %s" %
+          ("PASS" if ok else "FAIL", status))
+    if not ok:
+        failures.append("ordinary user can save tenant API keys")
+    status, body = request(base, "GET", "/settings/reveal?id=user-key-1")
+    ok = status == 200 and "user-secret-key" in body
+    print("  [%s] ordinary user can reveal own tenant API key -> %s" %
+          ("PASS" if ok else "FAIL", status))
+    if not ok:
+        failures.append("ordinary user can reveal own tenant API key")
+    status, body = request(base, "POST", "/settings/save", {"limits": {}})
+    ok = status == 403
+    print("  [%s] ordinary user cannot save global limits -> %s" %
+          ("PASS" if ok else "FAIL", status))
+    if not ok:
+        failures.append("ordinary user cannot save global limits")
     server.shutdown()
     server.server_close()
     (P._oauth_principal, P.Handler._authorized,
      P.Handler._handle_accounts, qoder_tasks.fetch_tasks_view) = originals
-    passed = len(checks) - len(failures)
+    total_checks = len(checks) + 3
+    passed = total_checks - len(failures)
     print("SUMMARY: TOTAL %d checks, %d passed, %d failed" %
-          (len(checks), passed, len(failures)))
+          (total_checks, passed, len(failures)))
     print("RESULT: %s (exit %d)" % ("RED" if failures else "GREEN",
                                     1 if failures else 0))
     return 1 if failures else 0
