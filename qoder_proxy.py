@@ -7324,7 +7324,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 "accounts": account_views(realm=query.get("realm", [None])[0]
                                           or CURRENT_REALM),
-                "storage": ACCOUNTS_DIR,
+                "storage": os.fspath(ACCOUNTS_DIR),
                 "usable": POOL.count_ready() if POOL else 0,
             })
         if path == "/accounts/export":
