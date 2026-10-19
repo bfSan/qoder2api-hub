@@ -327,45 +327,165 @@ def set_banned_models(accounts_dir, value):
     return patterns
 
 
-class PanelSessions(object):
-    """In-memory bearer tokens handed out after a successful panel login.
+# ------------------------------------------------------- panel sessions
+PANEL_SECRET_KEY = "panel_session_secret"
+_SAFE_TOKEN_PART = re.compile(r"^[A-Za-z0-9_-]+$")
 
-    Deliberately not persisted: restarting the gateway logs browsers out, which
-    is the safer default for a LAN tool that people expose behind a port map.
+
+def _settings_is_rewritable(accounts_dir):
+    """settings.json 是否「不存在、或现有内容可解析」。
+
+    不存在 -> True（首次安装，可以新建）；
+    存在且能 json.load -> True（含合法的空对象）；
+    存在但解析失败 -> False。
+
+    为什么要分开：`load()` 把「文件不存在」与「解析失败/瞬时读错」都吐成 {}，
+    而 save() 写的是**整个 dict**。拿一个读失败得到的 {} 去 save，就会把
+    panel_password_hash / api_keys / limits 全部抹掉——面板回到默认口令 admin，
+    所有 API Key 失效。一次瞬时 EIO 就能造成这种不可逆破坏。
+    """
+    path = settings_path(accounts_dir)
+    if not os.path.exists(path):
+        return True
+    try:
+        with open(path, encoding="utf-8") as fh:
+            json.load(fh)
+        return True
+    except Exception:
+        return False
+
+
+def panel_session_secret(accounts_dir):
+    """面板会话签名密钥：首次生成后持久化，重启后旧 token 仍能验证。
+
+    早期 PanelSessions 把 token 存在进程内存里，网关一重启（launchd 拉活、
+    崩溃自愈、升级后 restart）浏览器就得重新登录——「更安全」的默认值在
+    本机托管 + 频繁重启的场景下只换来重复登录。密钥与其它凭证同存
+    accounts/settings.json（该目录本来就是 0600 级的凭证库），不降低等级。
+
+    settings.json 存在但解析不了时**拒绝回写**（抛异常，由调用方退到进程内
+    临时密钥）：宁可面板多登一次，也不能把密码哈希和 API Key 一起抹掉。
+    """
+    with _lock:
+        if not _settings_is_rewritable(accounts_dir):
+            raise OSError("settings.json unreadable; refusing to overwrite it")
+        data = load(accounts_dir)
+        secret = str(data.get(PANEL_SECRET_KEY) or "")
+        if len(secret) >= 32:
+            return secret
+        secret = secrets.token_urlsafe(48)
+        data[PANEL_SECRET_KEY] = secret
+        save(accounts_dir, data)
+        return secret
+
+
+class PanelSessions(object):
+    """签名式面板会话 token，**重启后仍然有效**。
+
+    token 自校验，服务端不存会话表：`<过期秒>.<nonce>.<hmac_sha256>`。
+    验证时用持久化密钥重算签名，所以网关重启/升级不强制重新登录；
+    revoke_all() 换密钥即让所有浏览器的旧 token 一次性失效（改密码时用）。
+
+    已知取舍：revoke(token) 的黑名单只在**本进程**生效。因此「退出登录」端点
+    改调 revoke_all()（换密钥）——否则重启后那个已退出的 token 会复活到 TTL
+    结束（比旧实现更差：旧实现重启把所有 token 一起作废）。
     """
 
-    def __init__(self, ttl=SESSION_TTL):
+    def __init__(self, accounts_dir=None, ttl=SESSION_TTL):
+        # accounts_dir 接受 callable：qoder_proxy 在模块顶层就能构造 PANEL，
+        # 而 ACCOUNTS_DIR 要到后面解析 --accounts-dir 才定下来。
         self.ttl = ttl
-        self._tokens = {}
+        self._dir = accounts_dir
+        self._secret = None
+        self._revoked = {}
+        self._ephemeral = False     # 密钥未能落盘（退到进程内临时密钥）
         self._lock = threading.RLock()
 
-    def create(self):
-        token = secrets.token_urlsafe(24)
+    def _accounts_dir(self):
+        d = self._dir
+        if callable(d):
+            d = d()
+        return d or ""
+
+    def _key(self):
+        if self._secret:
+            return self._secret
         with self._lock:
-            self._tokens[token] = time.time() + self.ttl
-        return token
+            if not self._secret:
+                try:
+                    self._secret = panel_session_secret(self._accounts_dir())
+                except Exception:
+                    # settings.json 读不出/写不进（解析损坏、只读目录、磁盘满）：
+                    # 退回**进程内**临时密钥。面板退化成「重启需重新登录」，
+                    # 而不是所有登录都 500，也不是把凭证文件抹掉。
+                    self._secret = secrets.token_urlsafe(48)
+                    self._ephemeral = True
+            return self._secret
+
+    def _sign(self, expiry, nonce):
+        return hmac.new(self._key().encode("utf-8"),
+                        ("%d.%s" % (expiry, nonce)).encode("utf-8"),
+                        hashlib.sha256).hexdigest()
+
+    def create(self):
+        expiry = int(time.time()) + self.ttl
+        nonce = secrets.token_urlsafe(12)
+        return "%d.%s.%s" % (expiry, nonce, self._sign(expiry, nonce))
 
     def valid(self, token):
         if not token:
             return False
+        parts = str(token).split(".")
+        if len(parts) != 3:
+            return False
+        expiry_s, nonce, signature = parts
+        # 先做字符/长度白名单：hmac.compare_digest 遇到非 ASCII 会抛
+        # TypeError（"comparing strings with non-ASCII characters…"），
+        # 一个粘贴坏掉的 token 就能把连接打断 500/断连，而不是干净地 401。
+        if not expiry_s.isdigit() or len(expiry_s) > 12:
+            return False
+        if not (1 <= len(nonce) <= 64 and _SAFE_TOKEN_PART.match(nonce)):
+            return False
+        if len(signature) != 64 or not _SAFE_TOKEN_PART.match(signature):
+            return False
+        expiry = int(expiry_s)
+        if expiry < time.time():
+            return False
+        if not hmac.compare_digest(signature, self._sign(expiry, nonce)):
+            return False
         with self._lock:
-            expiry = self._tokens.get(token)
-            if not expiry:
-                return False
-            if expiry < time.time():
-                self._tokens.pop(token, None)
-                return False
-            return True
+            return token not in self._revoked
 
     def revoke(self, token):
         if not token:
             return
         with self._lock:
-            self._tokens.pop(token, None)
+            now = time.time()
+            if len(self._revoked) > 256:      # 惰性清理，避免无限增长
+                self._revoked = {k: v for k, v in self._revoked.items() if v > now}
+            self._revoked[token] = now + self.ttl
 
     def revoke_all(self):
+        """换密钥 -> 所有已发 token 立即失效（改密码后的踢出语义靠这个）。
+
+        文件 IO 放在锁外：这把锁的语义是「保护几微秒的内存查询」，而 save()
+        要 mkdir+write+replace（还再取一次模块级 _lock）。带着它做磁盘写会让
+        并发进来的每个 valid() 排队等 IO。新密钥先算好、锁内只换内存里的值，
+        落盘失败也不影响本次进程内的作废效果。
+        """
+        new_secret = secrets.token_urlsafe(48)
+        accounts_dir = self._accounts_dir()
         with self._lock:
-            self._tokens.clear()
+            self._secret = new_secret
+            self._revoked.clear()
+        try:
+            data = load(accounts_dir)
+            data[PANEL_SECRET_KEY] = new_secret
+            save(accounts_dir, data)
+        except Exception:
+            # 写盘失败：本进程已换密钥（旧 token 立即作废）；重启后读回旧密钥
+            # 会让旧 token 复活，但这已经优于「改密码却踢不掉任何会话」。
+            pass
 
 
 # ---------------------------------------------------------------- limits

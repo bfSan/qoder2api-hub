@@ -2900,7 +2900,16 @@ check("削减：历史工具结果被截断（首尾保留 + 省略标记）",
 check("削减：信封前缀逐字节不变（历史与当前轮都是）",
       _hist29.startswith(_PREF29) and _cur29.startswith(_PREF29)
       and _short29.startswith(P.TOOL_RESULT_MARKER + " (cat)]\n"))
-check("削减：当前轮的 tool 结果全文保留", _cur29 == _PREF29 + _LONG29)
+# issue #48：默认策略改为「只保护最后 N 条工具结果」（与请求形态无关）。
+# 旧断言锁的是「当前轮 protected」——那正是缓存每轮失效的根因，已废。
+check("削减：默认只保护最后一条 tool 结果（更早的历史一律削）",
+      _cur29.startswith(_PREF29) and len(_cur29) < len(_LONG29)
+      and "已省略" in _cur29, (len(_LONG29), len(_cur29)))
+check("削减：保护窗内的最后一条结果全文保留",
+      P.flatten_messages([{"role": "user", "content": "u"},
+                          {"role": "tool", "name": "terminal",
+                           "content": _LONG29}])[1][-1]["content"]
+      == _PREF29 + _LONG29)
 check("削减：短结果不动", _short29.endswith("ok: 3 passed"))
 check("削减：完整 JSON 不削且仍可解析",
       isinstance(json.loads(P._shrink_tool_result(

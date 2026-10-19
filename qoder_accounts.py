@@ -838,6 +838,36 @@ def normalize_epoch(value):
     return int(number)
 
 
+def effective_remain(credits):
+    """有效余额 = 套餐 remain + 可用的共享池 remain（issue #39）。
+
+    团队账号「套餐已用满（remain=0）+ 共享池仍有余额」时，只看 remain 会把
+    可用账号误判成余额耗尽（护栏停号、402 不解除、汇总显示 0）——所以额度
+    判定与展示一律走本函数。快照里没有 remain_effective 的（旧数据 / 非 dict）
+    回退 remain，与本字段引入前的行为完全一致。
+    """
+    if not isinstance(credits, dict):
+        return None
+    value = credits.get("remain_effective")
+    return credits.get("remain") if value is None else value
+
+
+def _truthy(value, default=False):
+    """上游布尔字段的防御性解读：字符串 "false" / "0" / "no" 也算假。
+
+    `bool("false")` 是 True——共享池的 available 若从 JSON 布尔漂移成字符串，
+    就会把「不可用」当成「可用」，凭空多算额度（issue #39 的字段形态）。
+    value 为 None（显式 null）时取 default：**缺键语义必须由调用方决定**，
+    因为「没这个字段」和「字段是 null」在额度语义上并不等价。
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in (
+            "", "0", "false", "no", "off", "none", "null")
+    return bool(value)
+
+
 # ---------------------------------------------------------------------------
 # 每日签到的「下次可签到时间」
 # ---------------------------------------------------------------------------
@@ -937,6 +967,15 @@ def _scope_limit_value(scope, realm):
 DEFAULT_CREDITS_REFRESH_HOURS = 12.0    # §2.5：与 wb 同默认
 _QUOTA_REFRESHER_INTERVAL = 1800        # 每 tick 只刷一个账号 -> 每天 ≤48 次计费调用
 _QUOTA_REFRESHER_PARK = 6 * 3600        # 刷新失败的账号停放 6h（§2.5）
+
+# issue #43：**使用驱动**的余额刷新（与额度护栏解耦）。
+# 护栏刷新器只在「某条护栏阈值 > 0」时惰性启动、且 30min/tick + 12h TTL，
+# 阈值全 0（默认）时根本没有线程——持续使用两三个小时面板余额也不会变。
+# 这里只刷新**本窗口内真正用过**的账号，默认 5 分钟合并一次、空闲不轮询。
+_CREDITS_USAGE_INTERVAL = int(os.environ.get("QD_CREDITS_USAGE_INTERVAL") or 300)
+_CREDITS_USAGE_BACKOFF_BASE = 60        # 失败退避：60s 起
+_CREDITS_USAGE_BACKOFF_MAX = 900        # 上限 15min
+_CREDITS_USAGE_MAX_PER_TICK = 8         # 单 tick 最多查几个号（限制上游调用）
 
 
 # 测试/CLI 可显式指定 usage.jsonl（优先于环境变量）：注入夹具用。
@@ -1208,6 +1247,15 @@ class Account(object):
         # #25-d：最近一次「不可信 quota 响应」的记录（含截断 raw 摘要）——
         # 供事后区分「上游真说超额」与「解析失败」（报告者最贵的教训）。
         self.last_quota_anomaly = data.get("lastQuotaAnomaly") or None
+        # issue #43：使用驱动的余额刷新状态（**transient，不落盘**）——
+        # 面板据此显示「待刷新 / 查询中 / 失败 + 最后成功时间」。
+        self.credits_pending = False
+        self.credits_refresh_state = "idle"     # idle|pending|refreshing|failed
+        self.credits_refresh_error = ""
+        self.credits_refresh_failures = 0
+        self.credits_refresh_next = 0.0
+        # issue #40 后续：最近一次「上游返回全 0 退化体」的降级标记（面板显示 0*）
+        self.credits_degraded = data.get("creditsDegraded") or None
         # ---- task-61：账号级预算护栏状态（默认全关；计数 None = 未知 -> fail-open）----
         self.reserve_credits = 0            # G1 余额地板（<=0 关）
         self.daily_token_limit = 0          # G2 当日 token 总额（<=0 关）
@@ -1272,6 +1320,7 @@ class Account(object):
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
             "lastQuotaAnomaly": self.last_quota_anomaly,
+            "creditsDegraded": self.credits_degraded,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
             "campaignCodes": self.campaign_codes,
@@ -1302,6 +1351,15 @@ class Account(object):
             "addedAt": self.added_at,
             "file": os.path.basename(self.path) if self.path else None,
             "credits": self.credits,
+            # issue #43：余额新鲜度（面板显示「最后成功查询时间 + 刷新状态」）
+            "creditsUpdatedAt": (self.credits.get("updated_at")
+                                 if isinstance(self.credits, dict) else None),
+            "creditsUpdatedIso": (self.credits.get("updated_iso")
+                                  if isinstance(self.credits, dict) else None),
+            "creditsRefreshState": self.credits_refresh_state,
+            "creditsRefreshError": self.credits_refresh_error,
+            "creditsPending": bool(self.credits_pending),
+            "creditsDegraded": self.credits_degraded,
             # task-61 护栏状态（面板三态：没开 / 开了但未知 / 已超额）
             "reserveCredits": self.reserve_credits,
             "reserveBlocked": self.reserve_blocked(),
@@ -1397,7 +1455,9 @@ class Account(object):
         cred = self.credits
         if not isinstance(cred, dict):
             return False
-        remain = cred.get("remain")
+        # issue #39：团队账号「套餐已用满 + 共享池仍有余额」按有效余额判定，
+        # 否则共享额度白有、账号被误停。
+        remain = effective_remain(cred)
         if remain is None:
             return False
         try:
@@ -1573,7 +1633,8 @@ class Account(object):
         if not self.balance_until:
             return False
         cred = self.credits
-        remain = cred.get("remain") if isinstance(cred, dict) else None
+        # issue #39：团队账号可能套餐 remain=0 但共享池仍有余额——按有效余额解封。
+        remain = effective_remain(cred)
         try:
             if remain is None or float(remain) <= 0:
                 return False
@@ -1915,6 +1976,17 @@ class Account(object):
                     "http": exc.code,
                     "error": "HTTP %d %s" % (exc.code, body[:160]),
                 }
+            if exc.code == 403:
+                # issue #40：403 多为**出口/WAF 拦截**（国际版该接口本来就不存在，
+                # 正常应 404）。不写能力缓存（下次仍重探），给出可读原因——
+                # 面板显示「上游拒绝访问」而不是一句裸 HTTP 403。
+                return False, {
+                    "unavailable": True,
+                    "reason": "上游拒绝访问（HTTP 403）：可能是出口 IP/代理被拦截，"
+                              "或本区域未开放该接口",
+                    "http": 403,
+                    "error": "HTTP 403 %s" % body[:160],
+                }
             return False, {"unavailable": False,
                            "error": "HTTP %d %s" % (exc.code, body[:160])}
         except Exception as exc:
@@ -1982,12 +2054,14 @@ class Account(object):
             # 上游并发/重复领取返回 409 ALREADY_CLAIMED —— 归一化为“已签”
             if "ALREADY_CLAIMED" in body:
                 self._stamp_checkin()
+                self._refresh_credits_quietly()
                 return {"ok": True, "already": True, "msg": "今日已签到"}
             return {"ok": False, "error": "HTTP %d %s" % (exc.code, body[:160])}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         if str(res.get("result") or "") == "ALREADY_CLAIMED" or res.get("success") is False and "ALREADY" in str(res.get("error") or ""):
             self._stamp_checkin()
+            self._refresh_credits_quietly()
             return {"ok": True, "already": True, "msg": "今日已签到"}
         if res.get("success") is False:
             # 复查一次：上游可能已记账
@@ -1998,8 +2072,19 @@ class Account(object):
             return {"ok": False, "error": str(res.get("error") or res)[:160]}
         reward = int(res.get("rewardCredits") or 0)
         self._stamp_checkin()
+        # issue #40 后续：签到发的积分要**立刻反映到面板**。上游把奖励记进
+        # addOnQuota，不刷余额的话面板仍显示旧值（报告者看到的
+        # 「提示 +100 积分但余额不显示」）。失败不影响签到结果本身。
+        self._refresh_credits_quietly()
         return {"ok": True, "msg": "签到成功 +%d 积分" % reward,
                 "reward_credits": reward}
+
+    def _refresh_credits_quietly(self):
+        """签到/领奖后顺手刷新余额（best-effort，绝不抛）。"""
+        try:
+            return self.fetch_credits()
+        except Exception:
+            return {"ok": False, "error": "credits refresh after checkin failed"}
 
     def _campaigns_get(self):
         """一次活动列表请求（桌面端头 → 401/403 回退普通头）。
@@ -2411,6 +2496,14 @@ class Account(object):
         anomaly = {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "reason": reason, "raw": raw_digest}
         self.last_quota_anomaly = anomaly
+        # issue #40 后续：全 0 退化体（团队/免费号常见）此前只在日志里留痕，
+        # 面板一片空白看不出"上游确实返回了 0"。这里单独记一个**降级标记**，
+        # 面板据此显示「0*（上游返回空额度）」而不是假装没查过。
+        self.credits_degraded = {
+            "at": anomaly["at"],
+            "reason": str(reason or ""),
+            "raw": raw_digest[:200],
+        }
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
         return {"ok": False,
@@ -2423,12 +2516,55 @@ class Account(object):
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
 
+    def _other_realm_quota_hint(self):
+        """issue #40 探测：令牌是否属于**另一个区域**（realm 标记错误）。
+
+        部分 403 是「账号标了 intl、令牌却是国内版」导致的——同一个 token
+        打另一区的 quota 会成功。只在 403 时探测一次，不发任何写操作。
+        返回可读提示字符串；不属于该情形返回空串。
+        """
+        other = "cn" if self.realm != "cn" else "intl"
+        try:
+            url = get_realm_config(other)["openapi"] + PATH_QUOTA
+            q = http_json(url, method="GET", headers=self.headers(),
+                          timeout=20, retries=1)
+        except Exception:
+            return ""
+        if not isinstance(q, dict):
+            return ""
+        if not any(k in q for k in ("userQuota", "addOnQuota")):
+            return ""
+        name = "国内版" if other == "cn" else "国际版"
+        return ("该账号的令牌在%s可用，本区 403 很可能是**区域标记错误**："
+                "请在面板重新扫描/导入该账号（或把 realm 改成 %s）"
+                % (name, other))
+
     def fetch_credits(self):
         """GET /api/v2/quota/usage -> 聚合基础额度 + 赠送/签到额度。"""
         cfg = get_realm_config(self.realm)
         url = cfg["openapi"] + PATH_QUOTA
+        hint = ""
         try:
             q = http_json(url, method="GET", headers=self.headers(), timeout=30)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                # issue #40：403 常见于 WAF/出口被拦、或令牌区域标记错误。
+                # 先用**桌面端同款头**重试一次（官方客户端会用这套），仍失败
+                # 再给出可操作说明——不再把裸 403 当唯一信息。
+                try:
+                    q = http_json(url, method="GET",
+                                  headers=self.desktop_headers(), timeout=30)
+                except Exception as exc2:
+                    hint = self._other_realm_quota_hint()
+                    return {
+                        "ok": False,
+                        "http": exc.code,
+                        "error": "HTTP %s %s%s"
+                                 % (exc.code, str(exc2)[:160],
+                                    (" ｜ " + hint) if hint else ""),
+                    }
+            else:
+                return {"ok": False, "http": exc.code, "error": str(exc)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
         # #25-d：非 dict 响应（解析失败形态）直接走退化路径——旧实现会在这里
@@ -2490,25 +2626,66 @@ class Account(object):
             return self._note_quota_anomaly(
                 q, "both quota objects missing" if both_missing
                 else "exceeded=true with zero size/remain")
+        # issue #39：上游若有**共享额度池**（团队/企业/池化），原样纳入
+        # packages 与 credits.shared——此前只显示套餐内 + 赠送，共享额度被漏掉。
+        # 字段名按常见形态兼容；不存在就不编造（面板不显示该行）。
+        # 实测字段（issue #39 报告者提供）：团队账号返回
+        #   "orgResourcePackage": {"used":1548,"remaining":952,"percentage":0.62,
+        #                          "unit":"credits","cap":2500,"available":true}
+        # 注意它用 cap（不是 total），且带 available——不可用时不计入有效余额。
+        shared = None
+        for _key in ("orgResourcePackage", "sharedQuota", "teamQuota",
+                     "poolQuota", "sharedCredits", "sharedCredit"):
+            _src = q.get(_key)
+            if isinstance(_src, dict):
+                shared = {
+                    "remain": int(_num(_src, "remaining")),
+                    "used": int(_num(_src, "used")),
+                    "size": int(_num(_src, "cap") or _num(_src, "total")),
+                    # 缺键 = "没声明不可用" = 可用（与原 bool(_src.get("available", True)) 等价）；
+                    # 显式 null / "false" / 0 = 不可用。写成 .get(k, True) + 默认 True
+                    # 才保留原语义——只写 _truthy(_src.get("available")) 会把缺键
+                    # 变成 False，共享额度白有（issue #39 的症状原样回来）。
+                    "available": _truthy(_src.get("available", True), default=True),
+                    "source": _key,
+                    **_expiry_of(_src),
+                }
+                break
+            if isinstance(_src, (int, float)) and not isinstance(_src, bool):
+                shared = {"remain": int(_src), "used": 0, "size": int(_src),
+                          "available": True, "source": _key}
+                break
+        _pkgs = [
+            {"name": "基础额度", "remain": int(_num(uq, "remaining")),
+             "used": int(_num(uq, "used")), "size": int(_num(uq, "total")),
+             **_expiry_of(uq)},
+            {"name": "赠送/签到额度", "remain": int(_num(aq, "remaining")),
+             "used": int(_num(aq, "used")), "size": int(_num(aq, "total")),
+             **_expiry_of(aq)},
+        ]
+        if shared:
+            _pkgs.append({"name": "共享额度", **shared})
+        # issue #39：团队账号的 userQuota 可能已用满（remain=0）而共享池仍有余额
+        # ——有效余额 = 套餐 remain + 可用的共享 remain。护栏与汇总按它判断，
+        # 否则「套餐用满但共享池还有 952」会被误判为余额耗尽。
+        _shared_avail = (shared.get("remain") or 0) \
+            if (shared and shared.get("available", True)) else 0
+        remain_effective = int(remain + _shared_avail)
         self.credits = {
             "remain": remain,
+            "remain_effective": remain_effective,
             "used": used,
             "size": size,
             "exceeded": bool(q.get("isQuotaExceeded")),
             "usage_pct": q.get("totalUsagePercentage"),
             "expires_at": normalize_epoch(q.get("expiresAt")),
-            "packages": [
-                {"name": "基础额度", "remain": int(_num(uq, "remaining")),
-                 "used": int(_num(uq, "used")), "size": int(_num(uq, "total")),
-                 **_expiry_of(uq)},
-                {"name": "赠送/签到额度", "remain": int(_num(aq, "remaining")),
-                 "used": int(_num(aq, "used")), "size": int(_num(aq, "total")),
-                 **_expiry_of(aq)},
-            ],
+            "shared": shared,
+            "packages": _pkgs,
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self.last_quota_anomaly = None    # 正常体：清掉上次异常标记
+        self.credits_degraded = None
         # task-61：余额刷新是 402 停放的**唯一**解封路径（remain > 0 才解）。
         self.revive_balance_cooldown()
         if self.path and os.path.exists(os.path.dirname(self.path)):
@@ -2783,6 +2960,154 @@ class CreditsRefresher(object):
             except Exception as exc:
                 self._log_msg("quota refresher tick failed: %s" % exc,
                               level="WARN")
+            self._wake.wait(self.interval_seconds)
+            self._wake.clear()
+
+
+class CreditsUsageRefresher(object):
+    """使用驱动的余额刷新（issue #43）——**与额度护栏完全解耦**。
+
+    为什么需要它：护栏刷新器（CreditsRefresher）只在某个阈值 > 0 时才启动，
+    且 30min/tick + 12h TTL；阈值全 0（默认）时线程根本不存在，于是连续使用
+    两三个小时后面板余额一直是旧快照，界面上也没有「最后成功查询时间」。
+
+    语义（报告者的验收口径）：
+      · mark_used(uid)：请求线程只做一次轻量打标（dict 写 + Event.set），
+        **绝不**在请求路径上等余额接口；
+      · 同一窗口内多次使用 -> 合并成一次查询；
+      · 无待刷新 -> 不发请求（空闲不轮询）；用完之后仍会补完最后一次；
+      · 失败保留旧快照与最后成功时间，退避重试（60s 起，翻倍到 15min）；
+      · 手动刷新覆盖到了同一账号 -> 清 pending，避免紧接着重复查询。
+    """
+
+    def __init__(self, pool, interval_seconds=None, log=None, fetcher=None):
+        self.pool = pool
+        self.interval_seconds = max(30, int(interval_seconds
+                                            or _CREDITS_USAGE_INTERVAL))
+        self._log = log or (lambda *a, **k: None)
+        self._fetcher = fetcher or (lambda acc: self._default_fetch(acc))
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = None
+
+    @staticmethod
+    def _default_fetch(acc):
+        return acc.fetch_credits()
+
+    # -- 生命周期 ---------------------------------------------------------
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return False
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run,
+                                        name="credits-usage-refresher",
+                                        daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self, timeout=2.0):
+        self._stop.set()
+        self._wake.set()
+        th = self._thread
+        if th and th.is_alive():
+            th.join(timeout=timeout)
+        self._thread = None
+
+    def wake(self):
+        self._wake.set()
+
+    def running(self):
+        return bool(self._thread and self._thread.is_alive())
+
+    # -- 打标 / 选择 -------------------------------------------------------
+    def _find(self, uid):
+        for a in (self.pool.accounts if self.pool else []):
+            if a.uid == uid:
+                return a
+        return None
+
+    def mark_used(self, uid, now=None):
+        """请求线程调用：只打标，不联网。返回是否真的产生了待刷新。"""
+        if not uid:
+            return False
+        a = self._find(uid)
+        if a is None or not a.enabled or not a.access_token:
+            return False
+        if getattr(a, "credits_pending", False):
+            return False          # 已待刷新：本窗口内多次使用合并成一次
+        a.credits_pending = True
+        a.credits_refresh_state = "pending"
+        self._wake.set()
+        return True
+
+    def mark_manual(self, uid, at=None):
+        """手动查询成功后调用：清掉 pending 与失败计数（避免立刻重复查）。"""
+        a = self._find(uid)
+        if a is None:
+            return False
+        a.credits_pending = False
+        a.credits_refresh_state = "idle"
+        a.credits_refresh_error = ""
+        a.credits_refresh_failures = 0
+        a.credits_refresh_next = 0.0
+        return True
+
+    def due_accounts(self, now=None):
+        """本 tick 该刷新的账号（到期 + 启用 + 有凭证）。"""
+        now = time.time() if now is None else now
+        out = []
+        for a in (self.pool.accounts if self.pool else []):
+            if not getattr(a, "credits_pending", False):
+                continue
+            if not a.enabled or not a.access_token:
+                continue
+            if float(getattr(a, "credits_refresh_next", 0) or 0) > now:
+                continue
+            out.append(a)
+            if len(out) >= _CREDITS_USAGE_MAX_PER_TICK:
+                break
+        return out
+
+    def tick_once(self, now=None):
+        """刷新一批待处理账号；返回 {"refreshed": n, "failed": n}。"""
+        now = time.time() if now is None else now
+        stats = {"refreshed": 0, "failed": 0}
+        for a in self.due_accounts(now):
+            a.credits_refresh_state = "refreshing"
+            try:
+                res = self._fetcher(a)
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            ok = bool(isinstance(res, dict) and res.get("ok"))
+            if ok:
+                a.credits_pending = False
+                a.credits_refresh_state = "idle"
+                a.credits_refresh_error = ""
+                a.credits_refresh_failures = 0
+                a.credits_refresh_next = 0.0
+                stats["refreshed"] += 1
+            else:
+                failures = int(getattr(a, "credits_refresh_failures", 0) or 0) + 1
+                a.credits_refresh_failures = failures
+                a.credits_refresh_state = "failed"
+                err = ""
+                if isinstance(res, dict):
+                    err = str(res.get("error") or "")
+                a.credits_refresh_error = err[:200]
+                delay = min(_CREDITS_USAGE_BACKOFF_MAX,
+                            _CREDITS_USAGE_BACKOFF_BASE * (2 ** (failures - 1)))
+                a.credits_refresh_next = time.time() + delay
+                stats["failed"] += 1
+                self._log("credits refresh failed for %s (try %d): %s - retry in %ds"
+                          % (a.uid[:8], failures, err[:120], delay))
+        return stats
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self.tick_once()
+            except Exception as exc:
+                self._log("credits usage refresher tick failed: %s" % exc)
             self._wake.wait(self.interval_seconds)
             self._wake.clear()
 

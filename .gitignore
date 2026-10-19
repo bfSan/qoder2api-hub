@@ -26,3 +26,4 @@ Thumbs.db
 # ---- 内嵌便携 Python 运行时（可选，体积大；脚本会自动回退系统 Python）----
 python/
 .tmp_*
+_acc/

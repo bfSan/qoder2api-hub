@@ -84,6 +84,14 @@ tbody tr:last-child td{border-bottom:none}
 tbody tr:hover{background:rgba(241,245,249,.6)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 .bar-fill{height:6px;border-radius:3px;background:var(--accent);min-width:2px;display:inline-block;vertical-align:middle}
+/* 用量占比列：条占剩余宽度，数字固定 44px 右对齐——位数不同的百分比
+   （5% / 35% / 100%）右边缘对齐才看得成列。 */
+.pct-num{display:inline-block;width:44px;padding-left:4px;text-align:right;
+  font-size:11px;color:var(--dim);vertical-align:middle;
+  font-variant-numeric:tabular-nums}
+/* 只给占比列 nowrap + min-width：这一列是「条 + 固定宽数字」，折行会散架；
+   其余数字列仍靠内容自己折行（不给整表 nowrap，否则窄屏只能横向滚动）。 */
+.pct-cell{min-width:150px;text-align:right;white-space:nowrap}
 .bar-fill.think{background:var(--think)}
 .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;border-radius:8px}
 .table-wrap table{min-width:720px}
@@ -223,8 +231,12 @@ a:hover{text-decoration:underline}
 .main-nav-btn:hover{color:var(--fg);background:#fff}
 .main-nav-btn.active{background:#fff;color:var(--fg);border-color:var(--line);box-shadow:var(--shadow-sm);font-weight:600}
 .range-btn{background:transparent;border:none;color:var(--dim);padding:4px 12px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;transition:all .15s ease}
-.range-btn:hover{color:var(--fg)}
+.range-btn:hover{background:transparent;color:var(--fg)}
 .range-btn.active{background:var(--accent);color:#fff;font-weight:600;box-shadow:var(--shadow-sm)}
+/* hover 必须分状态给底色：通用 button:hover 会给**非 active** 的 range-btn 套上
+   蓝底（--accent-hover），而文字又被 .range-btn:hover 改成 --fg（浅色主题下是
+   深色）——蓝底深字，对比度极差。active 的 hover 保持蓝底白字。 */
+.range-btn.active:hover{background:var(--accent);color:#fff}
 #analyticsKpiCards .card{padding:12px 16px;min-width:0;overflow:hidden;border-radius:12px;background:#fff;border:1px solid var(--line);box-shadow:var(--shadow)}
 #analyticsKpiCards .card .v{font-size:19px;font-weight:700;white-space:nowrap}
 #analyticsKpiCards .card .k{font-size:11px;white-space:nowrap;margin-bottom:3px;font-weight:600;color:var(--dim)}
@@ -369,6 +381,46 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   button.page-nav-top{width:auto;flex:0 0 auto;margin-bottom:0;padding:7px 12px;border-radius:999px;
     white-space:nowrap}
 }
+
+/* ---- 7/30 天 Token 用量堆叠柱状图（纯 DOM，无图表库） ---- */
+.daily-legend{display:flex;flex-wrap:wrap;gap:6px 16px;margin:0 0 10px;font-size:12px}
+.daily-legend .lg{display:inline-flex;align-items:center;gap:6px;color:var(--dim);max-width:100%}
+.daily-legend .sw{width:10px;height:10px;border-radius:2px;flex:0 0 auto}
+/* padding-top 给顶部刻度标签留位置：标签是 translateY(-100%) 的绝对定位，
+   不留白就会整块压进上方图例行（浅色主题下白底直接抹掉图例文字）。
+   右侧 44px gutter 给刻度数字：柱子区域内它们会被柱子盖掉一半。 */
+.daily-chart-wrap{position:relative;padding-top:15px}
+.daily-grid{position:absolute;left:0;right:0;top:15px;bottom:18px;pointer-events:none}
+.daily-grid .gl{position:absolute;left:0;right:0;border-top:1px dashed var(--line)}
+.daily-grid .gt{position:absolute;right:2px;font-size:10px;color:var(--dim);
+  transform:translateY(-100%);background:var(--panel);padding:0 2px}
+.daily-cols{display:flex;align-items:stretch;gap:2px;height:220px;padding:0 44px 0 10px}
+.daily-col{flex:1 1 0;min-width:0;display:flex;flex-direction:column;height:100%}
+.daily-plot{position:relative;flex:1 1 auto;min-height:0}
+.daily-stack{position:absolute;left:0;right:0;bottom:0;display:flex;flex-direction:column-reverse}
+.daily-peak{position:absolute;left:50%;transform:translateX(-50%);
+  font-size:10px;line-height:1.2;color:var(--dim);white-space:nowrap;
+  font-variant-numeric:tabular-nums;pointer-events:none}
+.daily-cols.is-dense .daily-peak{font-size:9px}
+.daily-seg{min-height:0;transition:filter .12s ease}
+/* 只有最上面那段配圆角：每段都给会在堆叠接缝两侧切出白缺口（8 段 = 7 组） */
+.daily-seg-top{border-radius:2px 2px 0 0}
+.daily-col:hover .daily-seg{filter:brightness(1.12)}
+.daily-x{height:18px;line-height:18px;font-size:10px;color:var(--dim);text-align:center;
+  white-space:nowrap;position:relative;overflow:visible}
+/* 列宽可能窄于日期文字（30 天时约 22px）：标签必须允许向两侧溢出并按列中心对齐。
+   给 .daily-x 写 overflow:hidden 会把 "09-21" 剪成 "09-2"。 */
+.daily-x-in{position:absolute;left:50%;transform:translateX(-50%)}
+.daily-cols.is-dense .daily-x{font-size:9px}
+
+/* 指标矩阵（模型性能 / 按 Key）：字号略降不溢宽，**断行交给内容自己决定**。
+   不给 nowrap + min-width：那样窄屏会被撑出横向滚动，右侧列反而看不到。
+   长数字列（TTFT 的 P50、思考 Token）用显式 <br> 换到第二行，短标签
+   （区域/账号/tok/s）单独锁 nowrap，避免浏览器把「全部账 / 号」或
+   「825 / ms)」这种切断。 */
+#perfMatrix table,#keyMatrix table{font-size:12px}
+.cell-nowrap{white-space:nowrap}
+.cell-sub{display:block;font-size:10px;color:var(--dim);line-height:1.35}
 </style>
 <script>
 /* 主题初始化：在 <body> 解析前运行（wb 同款）——内联且零依赖是有意的，
@@ -834,6 +886,34 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <div class="s" id="kpiReqSuccess">成功率 100% · 失败 0</div>
       </div>
     </div>
+
+    <!-- Token 用量趋势：近 7 / 30 天堆叠柱，颜色按模型或区域区分 -->
+    <section>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">Token 用量趋势 <em id="dailyChartState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px">按自然日汇总：柱高＝当日总 Token，颜色＝消耗来源；悬停看当日明细</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div style="display:flex;gap:4px;background:var(--panel2);padding:3px;border-radius:8px;border:1px solid var(--line)">
+            <button id="btnDaily7" class="range-btn active" onclick="setDailyDays(7)">近 7 天</button>
+            <button id="btnDaily30" class="range-btn" onclick="setDailyDays(30)">近 30 天</button>
+          </div>
+          <div style="display:flex;gap:4px;background:var(--panel2);padding:3px;border-radius:8px;border:1px solid var(--line)">
+            <button id="btnDailyGroupModel" class="range-btn active" onclick="setDailyGroup('model')">按模型</button>
+            <button id="btnDailyGroupRealm" class="range-btn" onclick="setDailyGroup('realm')">按区域</button>
+          </div>
+        </div>
+      </div>
+      <div id="dailyChartLegend" class="daily-legend"></div>
+      <div class="daily-chart-wrap">
+        <div class="daily-grid" id="dailyGrid"></div>
+        <div class="daily-cols" id="dailyChartBody">
+          <div style="color:var(--dim);font-size:12px;padding:20px">加载中…</div>
+        </div>
+      </div>
+      <div class="hint" style="margin:10px 0 0" id="dailyChartHint"></div>
+    </section>
 
     <!-- 表格 1：各账号用量透视与各模型消耗明细 -->
     <section>
@@ -1397,6 +1477,15 @@ function setRealmMode(mode){
   setGatewayRealm(mode);
 }
 
+// issue #39：账号的**有效余额** = 套餐 remain + 可用共享池（团队账号套餐用满时
+// 仍有共享额度可用）。没有共享字段时等价于 remain；两者都缺 → null（未知）。
+function credRemain(a){
+  const c = a && a.credits;
+  if(!c) return null;
+  if(c.remain_effective != null) return c.remain_effective;
+  return (c.remain != null) ? c.remain : null;
+}
+
 function updateUI(){
   const isIntlView = (window.VIEW_REALM === "intl");
   const tIntl = document.getElementById("tabIntl");
@@ -1453,9 +1542,9 @@ function updateUI(){
   const cnAccts = allAccts.filter(a => a.realm === 'cn');
 
   let intlCred = 0, hasIntlCred = false;
-  intlAccts.forEach(a => { if(a.credits && a.credits.remain != null){ intlCred += a.credits.remain; hasIntlCred = true; } });
+  intlAccts.forEach(a => { const _r = credRemain(a); if(_r != null){ intlCred += _r; hasIntlCred = true; } });
   let cnCred = 0, hasCnCred = false;
-  cnAccts.forEach(a => { if(a.credits && a.credits.remain != null){ cnCred += a.credits.remain; hasCnCred = true; } });
+  cnAccts.forEach(a => { const _r = credRemain(a); if(_r != null){ cnCred += _r; hasCnCred = true; } });
 
   const elIntlCred = document.getElementById("tabIntlCredits");
   if(elIntlCred) elIntlCred.textContent = hasIntlCred ? fmt(intlCred) : "—";
@@ -2383,7 +2472,36 @@ function accountRow(a){
               : '<span class="badge ok">可用</span>';
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
   const cred = a.credits;
-  const credText = cred ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size)) : '<span style="color:var(--dim)">未查询</span>';
+  // issue #39：共享额度（团队/企业/池化）——上游返回时显示在套餐额度之后，
+  // 不返回时保持原样（不编造）。口径：套餐内 remain/size + 共享 remain。
+  const sharedTag = (cred && cred.shared && cred.shared.remain != null)
+    ? ' <span style="color:var(--dim);font-size:11px" title="共享额度（团队/企业池）：' +
+      '已用 ' + fmt(cred.shared.used) + ' · 总量 ' + fmt(cred.shared.size) + '">共享 ' +
+      fmt(cred.shared.remain) + '</span>'
+    : '';
+  // issue #40 后续：上游返回「全 0 退化体」时不再一片空白——显示 0* 并说明原因
+  const degraded = a.creditsDegraded || null;
+  const credText = cred
+    ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size) + sharedTag)
+    : (degraded
+       ? '<b style="color:var(--dim)">0*</b> <span style="color:var(--dim);font-size:11px" title="上游返回全 0 额度：' + esc(degraded.reason || '') + '（' + esc(degraded.at || '') + '）">空额度</span>'
+       : '<span style="color:var(--dim)">未查询</span>');
+  // issue #43：余额新鲜度——最后**成功**查询时间 + 刷新状态。查不到就写未知，
+  // 不把旧快照伪装成刚更新；失败/待刷新/查询中分别给状态。
+  let freshLine = '';
+  if(!cred){
+    freshLine = '<div class="mono" style="font-size:10px;color:var(--dim);margin-top:2px">' +
+      (degraded ? ('上游返回空额度（' + esc(degraded.at || '') + '）') : '尚未成功查询') +
+      '</div>';
+  } else {
+    const st = a.creditsRefreshState || 'idle';
+    let txt;
+    if(st === 'refreshing') txt = '<span style="color:var(--accent)">查询中…</span>';
+    else if(st === 'failed') txt = '<span style="color:var(--warn)" title="' + esc(a.creditsRefreshError || '') + '">查询失败，显示旧快照</span>';
+    else if(a.creditsPending) txt = '<span style="color:var(--dim)">待刷新</span>';
+    else txt = '更新于 ' + esc((a.creditsUpdatedIso || '').slice(5,16) || '未知');
+    freshLine = '<div class="mono" style="font-size:10px;color:var(--dim);margin-top:2px">' + txt + '</div>';
+  }
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
@@ -2393,7 +2511,7 @@ function accountRow(a){
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
-    + '<td style="text-align:left;white-space:nowrap">' + credText + '</td>'
+    + '<td style="text-align:left;white-space:nowrap">' + credText + freshLine + '</td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.total_tokens) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.cached_tokens) + '</td>'
@@ -3027,7 +3145,7 @@ async function refreshInner(){
   let totRemain = 0, totSize = 0, hasCreds = false;
   window.ACCOUNTS.forEach(a => {
     if(a.credits){
-      totRemain += (a.credits.remain || 0);
+      totRemain += (credRemain(a) || 0);
       totSize += (a.credits.size || 0);
       hasCreds = true;
     }
@@ -3077,33 +3195,54 @@ async function refreshInner(){
   if(!models.length){
     matrixEl.innerHTML = '<div class="empty">当前版本暂无模型请求或性能数据</div>';
   } else {
-    const maxTok = Math.max(1, ...models.map(m => m.total_tokens));
+    // 进度条按「占窗口总量的比例」画，不是「相对最大的那个模型」：之前用
+    // maxTok 归一化，于是最大的模型永远 100%、而它实际可能只占总量的 35%——
+    // 列名叫「用量占比」，读起来就是错的。小比例保留一位小数（3.2% 比 3% 准），
+    // 条宽给 2% 地板，否则 0.4% 的行看不见。
+    // 分母用**表内可见行之和**而不是 t.total_tokens：models 已被过滤掉
+    // 「不在当前目录的模型 / 以 -model 结尾 / requests=0」这几类行，拿未过滤的
+    // 总量当分母会让行内百分比加起来不到汇总行的 100%，读者一验算就发现对不上。
+    const rowTotalTok = models.reduce((s2, m) => s2 + (Number(m.total_tokens) || 0), 0);
+    const pctOf = (v) => {
+      if(!rowTotalTok) return null;
+      return (Number(v) || 0) / rowTotalTok * 100;
+    };
+    const pctText = pctLabel;
     // 汇总行 (Total / All Models)
-    const totTtft = perf.ttft_ms ? (ms(perf.ttft_ms.avg) + " (P50 " + ms(perf.ttft_ms.p50) + ")") : "-";
-    const totTps = perf.tokens_per_sec ? (perf.tokens_per_sec.avg.toFixed(1) + " tok/s") : "-";
+    // TTFT / 输入输出这类双值列用显式 <br> 断行：交给浏览器自动折行会在
+    // "P50 825" 和 "ms)" 之间断开，"ms)" 孤零零一行。
+    const ttftCell = (blk) => blk
+      ? (ms(blk.avg) + '<span class="cell-sub">P50 ' + ms(blk.p50) + '</span>')
+      : '-'
+    const ioCell = (prompt, completion, reasoning) =>
+      (fmt(prompt) + ' / ' + fmt(completion)
+        + (Number(reasoning)
+            ? '<span class="cell-sub" style="color:var(--think)">思考 ' + fmt(reasoning) + '</span>'
+            : ''))
+    const totTtft = ttftCell(perf.ttft_ms);
+    const totTps = perf.tokens_per_sec ? (perf.tokens_per_sec.avg.toFixed(1)) : "-";
     const totWall = perf.wall_ms ? ms(perf.wall_ms.avg) : "-";
     const totCache = perf.cache_hit_pct ? (perf.cache_hit_pct.avg.toFixed(1) + "%") : "-";
     const summaryRow = '<tr style="background:rgba(37,99,235,.06);font-weight:600">'
       + '<td style="text-align:left"><b>全部模型合计 (Total)</b></td>'
       + '<td style="text-align:center"><span style="color:var(--dim)">—</span></td>'
-      + '<td style="text-align:left"><span style="color:var(--dim)">全部账号</span></td>'
+      + '<td style="text-align:left"><span class="cell-nowrap" style="color:var(--dim)">全部账号</span></td>'
       + '<td>' + fmt(t.requests) + '</td>'
       + '<td><b style="color:var(--accent)">' + fmt(t.total_tokens) + '</b></td>'
-      + '<td>' + fmt(t.prompt_tokens) + ' / ' + fmt(t.completion_tokens) + (t.reasoning_tokens ? (' (<span style="color:var(--think)">' + fmt(t.reasoning_tokens) + '</span>)') : '') + '</td>'
+      + '<td>' + ioCell(t.prompt_tokens, t.completion_tokens, t.reasoning_tokens) + '</td>'
       + '<td>' + totTtft + '</td>'
-      + '<td><b style="color:var(--accent2)">' + totTps + '</b></td>'
+      + '<td><b style="color:var(--accent2)">' + totTps + '</b><span class="cell-sub">tok/s</span></td>'
       + '<td>' + totWall + '</td>'
       + '<td>' + totCache + '</td>'
-      + '<td>100%</td>'
+      + '<td class="pct-cell"><span class="pct-num">100%</span></td>'
       + '</tr>';
-
     const rows = models.map(m => {
       const mp = bmPerf[m.id] || {};
-      const m_ttft = mp.ttft_ms ? (ms(mp.ttft_ms.avg) + " <span style='color:var(--dim);font-size:11px'>(P50 " + ms(mp.ttft_ms.p50) + ")</span>") : "-";
-      const m_tps = mp.tokens_per_sec ? ('<b style="color:var(--accent2)">' + mp.tokens_per_sec.avg.toFixed(1) + '</b> <span style="font-size:11px;color:var(--dim)">tok/s</span>') : "-";
+      const m_ttft = ttftCell(mp.ttft_ms);
+      const m_tps = mp.tokens_per_sec ? ('<b style="color:var(--accent2)">' + mp.tokens_per_sec.avg.toFixed(1) + '</b><span class="cell-sub">tok/s</span>') : "-";
       const m_wall = mp.wall_ms ? ms(mp.wall_ms.avg) : "-";
       const m_cache = (m.prompt_tokens > 0) ? pct(m.cached_tokens / m.prompt_tokens * 100) : (mp.cache_hit_pct ? mp.cache_hit_pct.avg.toFixed(1) + "%" : "-");
-      const pctTok = Math.round(m.total_tokens / maxTok * 100);
+      const pctTok = pctOf(m.total_tokens);
       const errText = mp.errors ? (' <span class="badge bad" style="font-size:10px">' + mp.errors + ' 失败</span>') : '';
       const acctsMap = t.accounts_map || {};
       const mAccts = m.accounts || {};
@@ -3137,17 +3276,21 @@ async function refreshInner(){
         }).join('');
       }
       return '<tr>'
-        + '<td style="text-align:left" class="mono"><b>' + esc(m.id) + '</b>' + errText + '</td>'
+        + '<td style="text-align:left" class="mono cell-nowrap"><b>' + esc(m.id) + '</b>' + errText + '</td>'
         + '<td style="text-align:center;white-space:nowrap">' + realmCell + '</td>'
         + '<td style="text-align:left">' + acctCell + '</td>'
         + '<td>' + fmt(m.requests) + '</td>'
         + '<td><b>' + fmt(m.total_tokens) + '</b></td>'
-        + '<td>' + fmt(m.prompt_tokens) + ' / ' + fmt(m.completion_tokens) + (m.reasoning_tokens ? (' (<span style="color:var(--think)">' + fmt(m.reasoning_tokens) + '</span>)') : '') + '</td>'
+        + '<td>' + ioCell(m.prompt_tokens, m.completion_tokens, m.reasoning_tokens) + '</td>'
         + '<td>' + m_ttft + '</td>'
         + '<td>' + m_tps + '</td>'
         + '<td>' + m_wall + '</td>'
         + '<td>' + m_cache + '</td>'
-        + '<td style="min-width:90px"><span class="bar-fill" style="width:' + Math.max(3, pctTok) + '%"></span> <span style="font-size:11px;color:var(--dim)">' + pctTok + '%</span></td>'
+        + '<td class="pct-cell">'
+        +   ((pctTok == null || pctTok <= 0) ? '' :
+              '<span class="bar-fill" style="width:calc((100% - 48px) * '
+              + Math.min(100, pctTok) / 100 + ')"></span>')
+        +   '<span class="pct-num">' + pctText(pctTok) + '</span></td>'
         + '</tr>';
     }).join('');
 
@@ -3156,7 +3299,7 @@ async function refreshInner(){
       + '<th style="text-align:center;width:76px">区域</th>'
       + '<th style="text-align:left">账号</th>'
       + '<th>请求数</th><th>总 Token</th><th>输入 / 输出 (思考)</th>'
-      + '<th>首字延迟 (TTFT)</th><th>生成速度</th><th>端到端耗时</th><th>缓存命中率</th><th>用量占比</th>'
+      + '<th>首字延迟 (TTFT)</th><th>生成速度</th><th>端到端耗时</th><th>缓存命中率</th><th class="pct-cell">用量占比</th>'
       + '</tr></thead><tbody>' + summaryRow + rows + '</tbody></table>';
   }
 
@@ -3512,7 +3655,7 @@ function renderKeyRows(){
       const options = REALM_CHOICES.map(([val, lbl]) =>
         '<option value="' + val + '"' + ((row.realm || '') === val ? ' selected' : '') + '>' + lbl + '</option>'
       ).join('');
-      return '<div class="key-card" style="border-color:var(--accent);background:#ffffff;box-shadow:0 0 0 1px var(--accent), var(--shadow-md)">'
+      return '<div class="key-card" style="border-color:var(--accent);background:var(--panel);box-shadow:0 0 0 1px var(--accent), var(--shadow-md)">'
         + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">'
         +   '<div style="font-size:14px;font-weight:700;color:var(--fg)">' + (row.id ? '编辑 API Key' : '新建 API Key') + '</div>'
         +   '<span class="badge s mini">设置出口</span>'
@@ -4676,15 +4819,18 @@ function renderByKey(data){
     box.innerHTML = '<div class="empty">当前窗口没有按 Key 的用量数据</div>';
     return;
   }
-  const maxTok = Math.max(1, ...keys.map(k => Number(k.total_tokens) || 0));
+  // 同模型表：占比 = 占本窗口全部 Key 总 Token 的比，而不是相对最大 Key
+  const keyTotalTok = keys.reduce((s, k) => s + (Number(k.total_tokens) || 0), 0);
+  const keyPct = (v) => keyTotalTok ? (Number(v) || 0) / keyTotalTok * 100 : null;
+  const keyPctText = pctLabel;
   box.innerHTML = '<table><thead><tr>'
     + '<th style="text-align:left;min-width:190px">Key（仅标识）</th>'
-    + '<th>请求数</th><th>输入</th><th>输出 (思考)</th><th>缓存</th><th>总 Token</th><th>用量占比</th><th>积分</th>'
+    + '<th>请求数</th><th>输入</th><th>输出 (思考)</th><th>缓存</th><th>总 Token</th><th class="pct-cell">用量占比</th><th>积分</th>'
     + '<th style="text-align:left">模型（前 5）</th>'
     + '</tr></thead><tbody>'
     + keys.map(k => {
         const d = keyDisplay(k.key_id);
-        const pctTok = Math.round((Number(k.total_tokens) || 0) / maxTok * 100);
+        const pctTok = keyPct(k.total_tokens);
         const pills = (Array.isArray(k.models) ? k.models : []).map(m => {
           const name = Array.isArray(m) ? m[0] : m;
           const hits = Array.isArray(m) ? m[1] : '';
@@ -4706,8 +4852,11 @@ function renderByKey(data){
           +   (Number(k.reasoning_tokens) ? ' <span style="color:var(--think);font-size:11px">(' + fmt(k.reasoning_tokens) + ')</span>' : '') + '</td>'
           + '<td>' + fmt(k.cached_tokens) + '</td>'
           + '<td><b style="color:var(--accent)">' + fmt(k.total_tokens) + '</b></td>'
-          + '<td style="min-width:90px"><span class="bar-fill" style="width:' + Math.max(3, pctTok) + '%"></span>'
-          +   ' <span style="font-size:11px;color:var(--dim)">' + pctTok + '%</span></td>'
+          + '<td class="pct-cell">'
+          +   ((pctTok == null || pctTok <= 0) ? '' :
+                '<span class="bar-fill" style="width:calc((100% - 48px) * '
+                + Math.min(100, pctTok) / 100 + ')"></span>')
+          +   '<span class="pct-num">' + keyPctText(pctTok) + '</span></td>'
           + '<td>' + credit + orig + '</td>'
           + '<td style="text-align:left;max-width:420px">' + pills + '</td>'
           + '</tr>';
@@ -4771,6 +4920,273 @@ function renderEffortByKey(){
     + ((shifted || dropped) ? '' : '<div class="hint" style="margin:8px 0 0">这一页样本里没有出现挪档或丢弃。</div>');
 }
 
+/* ---- 近 7 / 30 天 Token 用量图（堆叠柱，纯 DOM，无第三方图表库） ----
+   y 轴＝当日总 Token；x 轴＝自然日（无请求的日期补 0，保证时间轴连续）；
+   颜色＝分组（模型 / 区域），前 N 名独立着色、其余归「其它」——模型可能十几
+   个，全部上色会无法分辨。数据源 /usage/daily（后端按本地自然日分桶、倒读
+   日志），只读本地 usage.jsonl，不触发上游调用。 */
+const DAILY_COLORS = ['#2563eb','#16a34a','#d97706','#dc2626','#7c3aed',
+                      '#0891b2','#db2777','#65a30d','#ea580c','#0369a1'];
+const DAILY_OTHER_COLOR = '#94a3b8';
+const DAILY_TOP_N = 8;
+const DAILY_REFRESH_MS = 60000;   // 图按天聚合，不必跟着 5 秒轮询重算
+let dailyDays = 7;
+let dailyGroup = 'model';
+let dailySeq = 0;
+// 节流键必须是「档位」而不是单一时间戳：用 lastAt 的话，切区域/切 7-30 天
+// 都会在 60 秒内被直接吞掉（一个请求都不发），图表于是**自信地**显示另一个
+// 区域的数据，还会在状态行里自称是那个区域。
+let dailyLastKey = '';
+let dailyLastAt = 0;
+
+function setDailyDays(n){
+  if(dailyDays === n) return;
+  dailyDays = n;
+  syncDailyButtons();
+  loadDailyChart(true);
+}
+
+function setDailyGroup(g){
+  if(dailyGroup === g) return;
+  dailyGroup = g;
+  syncDailyButtons();
+  loadDailyChart(true);
+}
+
+function syncDailyButtons(){
+  const dayId = (dailyDays === 7) ? 'btnDaily7' : 'btnDaily30';
+  const groupId = (dailyGroup === 'model') ? 'btnDailyGroupModel' : 'btnDailyGroupRealm';
+  ['btnDaily7','btnDaily30','btnDailyGroupModel','btnDailyGroupRealm'].forEach(id => {
+    const el = document.getElementById(id);
+    if(el) el.classList.toggle('active', id === dayId || id === groupId);
+  });
+}
+
+async function loadDailyChart(force){
+  const realm = (typeof window.VIEW_REALM === 'string') ? window.VIEW_REALM : '';
+  const key = realm + '|' + dailyDays + '|' + dailyGroup;
+  const now = Date.now();
+  if(!force && key === dailyLastKey && (now - dailyLastAt) < DAILY_REFRESH_MS) return;
+  const seq = ++dailySeq;
+  let data;
+  try {
+    data = await getJSON('/usage/daily?days=' + dailyDays + '&group=' + dailyGroup
+      + (realm ? '&realm=' + encodeURIComponent(realm) : ''));
+  } catch(err) {
+    if(seq !== dailySeq) return;   // 已经切到别的档位，过期的错误不要盖最新图
+    // 失败不要占满整个刷新窗口：15 秒后允许重试（原本是把 lastAt 在 await
+    // 之前就写好，失败后 60 秒内永不再试，而轮询周期本来只有 5 秒）。
+    dailyLastKey = '';
+    dailyLastAt = Date.now() - DAILY_REFRESH_MS + 15000;
+    const body = document.getElementById('dailyChartBody');
+    if(body){
+      body.innerHTML = '<div style="color:var(--bad);font-size:12px;padding:20px">读取失败，'
+        + esc(err.message) + '</div>';
+    }
+    return;
+  }
+  if(seq !== dailySeq) return;
+  dailyLastKey = key;
+  dailyLastAt = Date.now();
+  renderDailyChart(data);
+}
+
+/* 把峰值抬到「好看」的整刻度，并给顶部留出余量：柱子贴着顶部网格线难看出
+   峰值与量程，留空后趋势更清楚；刻度也是 1/1.2/1.5/2/2.5/3/4/5/6/8/10 这类
+   可读值，而不是精确到个位的峰值。 */
+function niceCeil(v){
+  if(!(v > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const norm = v / mag;
+  const steps = [1, 1.2, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+  for(let i = 0; i < steps.length; i++){
+    if(norm <= steps[i] + 1e-9) return steps[i] * mag;
+  }
+  return 10 * mag;
+}
+
+/* 图表里的 Token 数字统一用紧凑格式（K / M / B）。
+
+   forceShort=true 用于 y 轴与柱顶：四条口径（轴刻度、柱顶、图例、状态行）
+   必须同一种写法，否则会出现「柱顶 8,000 而轴写 10k」这种要自己心算的断裂。
+   非 forceShort 时万以下保持精确（图例看 7,925 比 8k 有用）。
+
+   进位必须按**四舍五入后**的档位判：999,999 / 1e3 = 999.999 → toFixed(0)
+   是 "1000"，直接拼单位会得到「1000k」；同理 999,999,999 →「1000M」。 */
+function fmtCompact(v, forceShort){
+  const n = Number(v);
+  if(!isFinite(n)) return '—';
+  const abs = Math.abs(n);
+  if(abs < (forceShort ? 1e3 : 1e4)) return fmt(n);
+  const UNITS = [[1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'k']];
+  for(let i = 0; i < UNITS.length; i++){
+    const base = UNITS[i][0], suffix = UNITS[i][1];
+    if(abs < base) continue;
+    const digits = Math.abs(n / base) >= 10 ? 0 : 1;
+    const txt = (n / base).toFixed(digits).replace(/\.0+$/, '');
+    if(Math.abs(Number(txt)) >= 1000 && i > 0){
+      const up = UNITS[i - 1];
+      const d2 = Math.abs(n / up[0]) >= 10 ? 0 : 1;
+      return (n / up[0]).toFixed(d2).replace(/\.0+$/, '') + up[1];
+    }
+    return txt + suffix;
+  }
+  return fmt(n);
+}
+
+/* 百分比标签：>=10% 取整，否则一位小数（3.2% 比 3% 准）。模型表与 Key 表共用。 */
+function pctLabel(p){
+  if(p == null) return '—';
+  return p >= 10 ? Math.round(p) + '%' : p.toFixed(1) + '%';
+}
+
+function renderDailyChart(d){
+  const body = document.getElementById('dailyChartBody');
+  const legend = document.getElementById('dailyChartLegend');
+  const grid = document.getElementById('dailyGrid');
+  const state = document.getElementById('dailyChartState');
+  if(!body || !d || !d.series) return;
+  const series = d.series;
+  const totals = d.totals || {};
+  if(state){
+    state.textContent = '（近 ' + d.days + ' 天 · ' + fmtCompact(totals.total_tokens || 0)
+      + ' tokens · ' + fmtCompact(totals.requests || 0) + ' 次请求）';
+  }
+
+  // 分组着色：前 N 名独立色，其余归「其它」
+  const named = (d.groups || []).filter(g => (g.total_tokens || 0) > 0);
+  const top = named.slice(0, DAILY_TOP_N);
+  const colorOf = {};
+  top.forEach((g, i) => { colorOf[g.id] = DAILY_COLORS[i % DAILY_COLORS.length]; });
+  const otherIds = {};
+  named.slice(DAILY_TOP_N).forEach(g => { otherIds[g.id] = true; });
+  const otherTotal = named.slice(DAILY_TOP_N)
+    .reduce((s, g) => s + (g.total_tokens || 0), 0);
+
+  // 逐日拆成堆叠段
+  const cols = series.map(day => {
+    const groups = day.groups || {};
+    const parts = [];
+    let sum = 0;
+    top.forEach(g => {
+      const v = groups[g.id] || 0;
+      if(v > 0){ parts.push([g.id, v, colorOf[g.id]]); sum += v; }
+    });
+    let ov = 0;
+    Object.keys(groups).forEach(id => { if(otherIds[id]) ov += (groups[id] || 0); });
+    if(ov > 0){ parts.push(['其它', ov, DAILY_OTHER_COLOR]); sum += ov; }
+    return {day: day, parts: parts, total: sum};
+  });
+  const peak = cols.reduce((m, c) => Math.max(m, c.total), 0);
+  const max = niceCeil(peak * 1.08);      // 8% 顶部余量 + 整刻度
+  if(!peak){
+    body.classList.remove('is-dense');
+    body.innerHTML = '<div style="color:var(--dim);font-size:12px;padding:24px 0">'
+      + '这个窗口内还没有消耗 Token 的请求。</div>';
+    if(legend) legend.innerHTML = '';
+    if(grid) grid.innerHTML = '';
+    const hint = document.getElementById('dailyChartHint');
+    if(hint) hint.textContent = '';
+    return;
+  }
+
+  // y 轴：3 条参考线（0 / 50% / 100%）。强制缩写模式：三条刻度必须同一个写法，
+  // 否则 max/2 落在一万以下时会出现「0 | 5,000 | 10k」，同一根柱子三种口径。
+  if(grid){
+    grid.innerHTML = [0, 0.5, 1].map(p => {
+      const topPct = ((1 - p) * 100).toFixed(2);
+      return '<div class="gl" style="top:' + topPct + '%"></div>'
+           + '<div class="gt" style="top:' + topPct + '%">'
+           + fmtCompact(Math.round(max * p), true) + '</div>';
+    }).join('');
+  }
+
+  // x 轴标签：窗口越长越稀疏（否则 30 天会挤成一团）；从最后一天往前推，
+  // 保证「今天」总有标签、且相邻标签间隔均匀。首列也标注（窗口起点可读）。
+  const labelEvery = cols.length > 14 ? Math.ceil(cols.length / 10) : 1;
+  const lastIdx = cols.length - 1;
+  body.classList.toggle('is-dense', cols.length > 14);
+  // 列宽太窄时放弃柱顶标签（只留 tooltip）：按列宽而不是凭列数判断，
+  // 因为同一个 30 天档在 1400px 和 700px 下可读性完全不同。
+  const colWidth = (body.getBoundingClientRect().width || 0) / Math.max(1, cols.length);
+  const peakLabelsFit = colWidth >= 26;
+  // 先决定哪些列带柱顶数字，再渲染：
+  //   1) 峰值列**优先**占位（并列峰值按间距取舍）；
+  //   2) x 轴同频列其次，只避让「紧挨着已占位」的（距离 < 2 列）。
+  // 之前是「按 x 轴顺序贪心 + 距离 < labelEvery 就跳过」，结果是峰值柱
+  // 只要紧邻一个 x 轴标签列就被丢掉——最该读的那个数反倒没有。
+  const labeledCols = new Set();
+  if(peakLabelsFit){
+    let prevPeak = -999;
+    cols.forEach((c, i) => {
+      if(c.total === peak && (i - prevPeak) >= labelEvery){
+        labeledCols.add(i);
+        prevPeak = i;
+      }
+    });
+    cols.forEach((c, i) => {
+      const onGrid = ((lastIdx - i) % labelEvery === 0) || i === 0;
+      if(!onGrid) return;
+      for(const j of labeledCols){
+        if(Math.abs(i - j) < 2) return;
+      }
+      labeledCols.add(i);
+    });
+  }
+  body.innerHTML = cols.map((c, i) => {
+    const segCount = c.parts.length;
+    const segs = c.parts.map((p, j) => {
+      const h = (p[1] / max) * 100;
+      const title = c.day.day + ' · ' + p[0] + '：' + fmt(p[1]) + ' tokens';
+      // 只有最上面那段配圆角：每段都加会在堆叠接缝处切出白缺口
+      const cls = 'daily-seg' + (j === segCount - 1 ? ' daily-seg-top' : '');
+      return '<div class="' + cls + '" style="height:' + h.toFixed(3)
+        + '%;background:' + p[2] + '" title="' + esc(title) + '"></div>';
+    }).join('');
+    const onGrid = ((lastIdx - i) % labelEvery === 0) || i === 0;
+    const label = onGrid ? c.day.label : '';
+    const colTitle = c.day.day + ' 合计 ' + fmt(c.total) + ' tokens · '
+      + (c.day.requests || 0) + ' 次请求';
+    const barPct = (c.total / max) * 100;
+    const showPeak = labeledCols.has(i);
+    return '<div class="daily-col" title="' + esc(colTitle) + '">'
+      + '<div class="daily-plot">'
+      +   '<div class="daily-stack" style="height:' + barPct.toFixed(3) + '%">' + segs + '</div>'
+      +   (showPeak
+            ? '<div class="daily-peak" style="bottom:calc(' + barPct.toFixed(3) + '% + 1px)">'
+              + fmtCompact(c.total, true) + '</div>'
+            : '')
+      + '</div>'
+      + '<div class="daily-x">'
+      +   (label ? '<span class="daily-x-in">' + label + '</span>' : '')
+      + '</div>'
+      + '</div>';
+  }).join('');
+
+  const GROUP_LABEL = {cn: '国内版', intl: '国际版', '(unknown)': '未知'};
+  const groupLabel = (id) => GROUP_LABEL[id] || id;
+  if(legend){
+    const items = top.map(g => '<span class="lg"><span class="sw" style="background:'
+      + colorOf[g.id] + '"></span>' + esc(groupLabel(g.id)) + ' · ' + fmtCompact(g.total_tokens) + '</span>');
+    if(otherTotal > 0){
+      items.push('<span class="lg"><span class="sw" style="background:'
+        + DAILY_OTHER_COLOR + '"></span>其它（' + (named.length - top.length)
+        + ' 项） · ' + fmtCompact(otherTotal) + '</span>');
+    }
+    legend.innerHTML = items.join('');
+  }
+
+  const hint = document.getElementById('dailyChartHint');
+  if(hint){
+    const realmLabel = (d.realm === 'intl') ? '国际版'
+      : (d.realm === 'cn') ? '国内版' : '全部区域';
+    hint.textContent = '当前视图：' + realmLabel + '；颜色按'
+      + (d.group_by === 'realm' ? '区域' : '模型') + '堆叠'
+      + (otherTotal > 0 ? '，前 ' + DAILY_TOP_N + ' 名之外的归入「其它」' : '')
+      + '；数据来自本机 usage 日志，不触发任何上游调用。';
+  }
+}
+
 async function loadAnalytics(){
   try {
     // 两个端点并行：矩阵有自己的 §range，失败也不影响 KPI（loadByKey 内部自吞异常）
@@ -4780,6 +5196,8 @@ async function loadAnalytics(){
   } catch(err) {
     console.error('loadAnalytics failed:', err);
   }
+  // 图表按天聚合，5 秒轮询没有意义：内部 60 秒节流，切档时才强制刷新
+  loadDailyChart();
 }
 
 function renderAnalytics(data){
@@ -4854,11 +5272,15 @@ function renderAnalytics(data){
           : '<span class="badge s" style="font-size:10px">国际版</span>';
 
         let creditStr = '<span style="color:var(--dim)">—</span>';
-        if(a.credits && a.credits.remain != null){
+        const _eff = credRemain(a);
+        if(a.credits && _eff != null){
+          const _shared = (a.credits.shared && a.credits.shared.remain != null)
+            ? ' <span style="color:var(--dim);font-size:11px" title="共享额度（团队/企业池）剩余">共享 ' + fmt(a.credits.shared.remain) + '</span>'
+            : '';
           if(a.credits.size){
-            creditStr = '<b style="color:var(--accent2)">' + fmt(a.credits.remain) + '</b> <span style="color:var(--dim);font-size:11px">/ ' + fmt(a.credits.size) + ' 积分</span>';
+            creditStr = '<b style="color:var(--accent2)">' + fmt(a.credits.remain) + '</b> <span style="color:var(--dim);font-size:11px">/ ' + fmt(a.credits.size) + ' 积分</span>' + _shared;
           } else {
-            creditStr = '<b style="color:var(--accent2)">' + fmt(a.credits.remain) + '</b> <span style="color:var(--dim);font-size:11px">积分</span>';
+            creditStr = '<b style="color:var(--accent2)">' + fmt(a.credits.remain) + '</b> <span style="color:var(--dim);font-size:11px">积分</span>' + _shared;
           }
         }
 
