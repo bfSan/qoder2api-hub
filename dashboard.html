@@ -951,7 +951,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <h2 style="margin:0;font-size:16px;color:var(--fg)">网关设置</h2>
     </div>
 
-    <section>
+    <section id="panelPasswordSection">
       <h2>面板访问密码 <em id="setPwdState"></em></h2>
       <div style="font-size:12px;color:var(--dim);margin-bottom:12px">用于打开本看板。默认密码为 <b>admin</b>，建议立即修改。</div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
@@ -1006,7 +1006,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       </table></div>
     </section>
 
-    <section>
+    <section id="runtimeInfoSection">
       <h2>运行信息</h2>
       <table>
         <tbody>
@@ -1370,6 +1370,10 @@ function renderRealmActual(){
   el.style.color = (note.tone === 'warn') ? 'var(--warn)' : 'var(--dim)';
 }
 async function setGatewayRealm(realm){
+  if(typeof AAC_IS_ADMIN !== 'undefined' && !AAC_IS_ADMIN && !PANEL_TOKEN){
+    toast('普通用户不能更改网关出口', 'warn');
+    return;
+  }
   try {
     const res = await postJSON('/realm', {realm: realm});
     window.ACTIVE_GATEWAY_REALM = res.current || realm;
@@ -2215,6 +2219,7 @@ let PANEL_TOKEN = '';
 try { PANEL_TOKEN = sessionStorage.getItem(PANEL_STORE) || ''; } catch(e) { PANEL_TOKEN = ''; }
 let PANEL_STATUS = {};
 let AAC_ROLE = '';
+let AAC_IS_ADMIN = false;
 (function initKey(){
   try {
     const fromUrl = new URLSearchParams(window.location.search).get('key');
@@ -3362,12 +3367,15 @@ async function bootPanel(){
 
 function applyRoleUI(){
   const admin = AAC_ROLE === 'admin' || !!PANEL_TOKEN;
+  AAC_IS_ADMIN = admin;
   const hide = id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; };
   if(!admin){
     hide('btnNavLogs'); hide('pageLogs');
     ['btnTriggerSched','btnToggleSched','btnCheckin','btnScanDesktop','btnModelSync','btnModelEdit','btnModelSave'].forEach(hide);
     document.querySelectorAll('[onclick*="openLoginModal"],[onclick*="exportAccounts"],[onclick*="openImport"],[onclick*="queryCredits"],[onclick*="setAll("]').forEach(el => el.style.display='none');
-    const pwd = document.getElementById('panelPasswordSection'); if(pwd) pwd.style.display='none';
+    hide('panelPasswordSection');
+    hide('runtimeInfoSection');
+    hide('realmModeBar');
   }
 }
  

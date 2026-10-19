@@ -929,7 +929,10 @@ def _usage_snapshot_uncached(realm=None):
         log("usage snapshot read failed: %s" % exc)
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S",
                                   time.localtime(snap.get("started", time.time())))
-    snap["log_file"] = USAGE_LOG
+    # Tenant path proxies are filesystem-compatible, but they are not JSON
+    # values. Convert them at the response boundary so dashboard polling
+    # cannot fail with ``_TenantPathProxy is not JSON serializable``.
+    snap["log_file"] = os.fspath(USAGE_LOG)
     snap["realm"] = r
     snap["accounts_map"] = {a.uid: {"nickname": a.nickname, "realm": a.realm}
                             for a in POOL.accounts} if POOL else {}
@@ -1740,8 +1743,14 @@ def gateway_models_for_agents(realm=None):
     return {"models": out[:80]}
 
 
-def runtime_settings_view():
-    """Current panel-visible settings (never returns the password or the key)."""
+def runtime_settings_view(include_admin=True):
+    """Current panel-visible settings (never returns the password or the key).
+
+    AAC users share the dashboard UI with local/AAC administrators, but must
+    not receive panel-password or host-runtime details. Keep tenant API-key
+    metadata available for its own dashboard while adding administrative
+    fields only for an administrator session.
+    """
     key = API_KEY or ""
     if len(key) > 8:
         masked = key[:4] + "*" * 6 + key[-4:]
@@ -1760,23 +1769,27 @@ def runtime_settings_view():
             "source": entry.get("source") or "panel",
             "created_at": entry.get("created_at") or "",
         })
-    return {
-        "panel_password_is_default":
-            qoder_settings.panel_password_is_default(ACCOUNTS_DIR),
-        "api_key_set": bool(key),
-        "api_key_set_by_panel": API_KEY_FILE_SET,
-        "api_key_masked": masked,
-        "auth_required": auth_required(),
+    view = {
         "api_keys": keys,
         # limits 与保存分支同源：limits_data 返回**完整形状**（每个守卫都补齐
         # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
         # 把已有阈值覆盖成默认值。
         "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
-        "accounts_dir": ACCOUNTS_DIR,
-        "usage_dir": USAGE_DIR,
-        "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
-        "version": VERSION,
     }
+    if include_admin:
+        view.update({
+            "panel_password_is_default":
+                qoder_settings.panel_password_is_default(ACCOUNTS_DIR),
+            "api_key_set": bool(key),
+            "api_key_set_by_panel": API_KEY_FILE_SET,
+            "api_key_masked": masked,
+            "auth_required": auth_required(),
+            "accounts_dir": os.fspath(ACCOUNTS_DIR),
+            "usage_dir": os.fspath(USAGE_DIR),
+            "settings_file": os.fspath(qoder_settings.settings_path(ACCOUNTS_DIR)),
+            "version": VERSION,
+        })
+    return view
 
 
 def current_account():
@@ -6256,6 +6269,8 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/settings"):
             return True
+        if path == "/realm":
+            return True
         if path.startswith("/logs"):
             return True
         if path.startswith("/diag"):
@@ -6645,7 +6660,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/settings":
             if not self._authorized():
                 return
-            return self._json(200, runtime_settings_view())
+            return self._json(200, runtime_settings_view(
+                include_admin=self._management_ok()))
         if path == "/logs":
             if not self._authorized():
                 return
