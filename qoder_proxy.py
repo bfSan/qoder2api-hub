@@ -7009,6 +7009,15 @@ class Handler(BaseHTTPRequestHandler):
         """Whether an AAC user may operate their own tenant account pool."""
         return path.startswith("/accounts/")
 
+    @staticmethod
+    def _user_task_route(path):
+        """Whether an AAC user may use tenant-scoped growth tasks.
+
+        The task endpoints operate on the request's tenant pool.  Scheduler
+        control remains a separate, administrator-only surface.
+        """
+        return path == "/tasks" or path.startswith("/tasks/")
+
     def _begin_request(self):
         _REQUEST_RUNTIME.set(None)
         self.key_entry = None
@@ -7143,7 +7152,9 @@ class Handler(BaseHTTPRequestHandler):
         if self._is_panel_route(path) and not self._management_ok() and not _oauth_principal(self):
             return self._error(401, "panel password required",
                                "invalid_request_error")
-        if path in ("/scheduler", "/tasks", "/logs") and self._oauth_role() == "user":
+        if (path == "/scheduler" or path.startswith("/scheduler/")
+                or path == "/logs" or path.startswith("/logs/")) \
+                and self._oauth_role() == "user":
             return self._error(403, "Qoder admin required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
@@ -8464,11 +8475,15 @@ class Handler(BaseHTTPRequestHandler):
         user_account_route = (
             self._oauth_role() == "user" and self._user_account_route(path)
         )
+        user_task_route = (
+            self._oauth_role() == "user" and self._user_task_route(path)
+        )
         if self._is_panel_route(path) and not self._management_ok() \
-                and not user_account_route:
+                and not user_account_route and not user_task_route:
             return self._error(401, "panel password or AAC admin required",
                                "invalid_request_error")
-        if self._oauth_role() == "user" and not user_account_route:
+        if self._oauth_role() == "user" and not user_account_route \
+                and not user_task_route:
             return self._error(403, "Qoder admin required", "invalid_request_error")
         if path in ("/agents/apply", "/agents/restore"):
             # 写**网关所在机器**的客户端配置文件：面板会话不够，还必须来自

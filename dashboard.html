@@ -1049,7 +1049,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       </div>
     </section>
 
-    <section>
+    <section id="sectionApiKeys">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
         <div>
           <h2 style="margin:0">API Key 与出口绑定 <em id="setKeyState"></em></h2>
@@ -1626,7 +1626,7 @@ async function switchViewRealm(r){
     loadAccounts(),
     loadModels(),
     loadGrowthTasks(),
-    loadSchedulerStatus(),
+    ...(AAC_IS_ADMIN ? [loadSchedulerStatus()] : []),
     loadAnalytics(),
     refresh(),
   ]);
@@ -2133,6 +2133,11 @@ async function triggerCatTravel(btn){
 }
 
 async function loadSchedulerStatus(){
+  if(!AAC_IS_ADMIN){
+    const bar = document.getElementById("schedulerBar");
+    if(bar) bar.style.display = "none";
+    return;
+  }
   try{
     const s = await getJSON("/scheduler");
     const bar = document.getElementById("schedulerBar");
@@ -3514,8 +3519,12 @@ function applyRoleUI(){
   const hide = id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; };
   if(!admin){
     hide('btnNavLogs'); hide('pageLogs');
+    hide('btnNavAgents'); hide('pageAgents');
+    hide('schedulerBar');
     ['btnTriggerSched','btnToggleSched','btnModelSync','btnModelEdit','btnModelSave'].forEach(hide);
     hide('panelPasswordSection');
+    hide('sectionApiKeys');
+    hide('sectionLimits');
     hide('runtimeInfoSection');
     hide('realmModeBar');
   }
@@ -3533,14 +3542,16 @@ async function startDashboard(){
   await loadAccounts();
   await loadModels();
   await loadGrowthTasks();
-  await loadSchedulerStatus();
+  if(AAC_IS_ADMIN) await loadSchedulerStatus();
   await refresh();
   updateRecentLimitButtons();
   const tabFromUrl = new URLSearchParams(window.location.search).get('tab');
   let tabPick = null;
   try { tabPick = localStorage.getItem('qd-main-tab'); } catch(e){}
-  const tabTarget = MAIN_TABS.includes(tabFromUrl) ? tabFromUrl
+  const requestedTab = MAIN_TABS.includes(tabFromUrl) ? tabFromUrl
     : (MAIN_TABS.includes(tabPick) ? tabPick : 'gateway');
+  const tabTarget = (!AAC_IS_ADMIN && (requestedTab === 'logs' || requestedTab === 'agents'))
+    ? 'gateway' : requestedTab;
   switchMainTab(tabTarget);
   restorePageNavHash();
   // Polling only starts after the panel is unlocked, so a locked browser
@@ -3552,7 +3563,7 @@ async function startDashboard(){
       if(currentMainTab === 'analytics') loadAnalytics();
     }, 5000),
     setInterval(refresh, 5000),
-    setInterval(loadSchedulerStatus, 30000),
+    ...(AAC_IS_ADMIN ? [setInterval(loadSchedulerStatus, 30000)] : []),
     setInterval(loadAccounts, 15000),
   ];
 }
