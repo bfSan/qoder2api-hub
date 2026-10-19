@@ -169,6 +169,12 @@ def _clean_key_entry(entry):
         "realm": realm,
         "enabled": entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
+        # API Key 账号白名单；None/缺失表示管理员 Key 不限制，空列表
+        # 对普通用户表示当前没有可用账号（由请求层保持 fail-closed）。
+        "accounts": ([str(x).strip() for x in entry.get("accounts")
+                       if str(x).strip()]
+                      if isinstance(entry.get("accounts"), (list, tuple))
+                      else None),
         # P1-4：每 Key 模型白名单（空列表 = 不限制）。**必须显式保留**——
         # 本函数是白名单式重建，漏掉即「保存时被静默丢弃」（limits 同型坑）。
         "models": _clean_model_patterns(entry.get("models")),
@@ -203,6 +209,7 @@ def api_keys(accounts_dir):
                 "key": legacy,
                 "realm": "",
                 "enabled": True,
+                "accounts": None,
             }]
     return []
 

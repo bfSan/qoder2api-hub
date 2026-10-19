@@ -3330,22 +3330,33 @@ class AccountPool(object):
         return self.quota_refresher
 
     # -- 选择与健康 --------------------------------------------------------
-    def count_ready(self, realm=None, model=None):
+    def count_ready(self, realm=None, model=None, allow=None):
+        allow = set(allow) if allow is not None else None
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allow is None or a.uid in allow)]
         return sum(1 for a in snapshot if a.enabled and a.access_token and
                    a.ready(model=model))
 
-    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
+    def pick_for_session(self, realm=None, session_key=None, exclude=None,
+                         model=None, allow=None):
         exclude = exclude or set()
+        allow = set(allow) if allow is not None else None
         if session_key:
             bound_uid = self.affinity.get(session_key)
-            if bound_uid and bound_uid not in exclude:
+            if bound_uid and bound_uid not in exclude \
+                    and (allow is None or bound_uid in allow):
                 account = self.get(bound_uid)
                 if account and account.realm == realm and account.ready(model=model):
                     return account
                 self.affinity.unbind(session_key)
-        account = self.pick(realm=realm, exclude=exclude, model=model)
+            elif bound_uid and allow is not None and bound_uid not in allow:
+                # A prior request may have bound this conversation to an
+                # account that this Key is no longer allowed to use.
+                self.affinity.unbind(session_key)
+        account = self.pick(realm=realm, exclude=exclude, model=model,
+                            allow=allow)
         if account and session_key:
             self.affinity.bind(session_key, account.uid)
         return account
@@ -3392,11 +3403,15 @@ class AccountPool(object):
                     state.pop(uid, None)
         return winner
 
-    def _pick_expiring_first(self, realm=None, exclude=None, model=None):
+    def _pick_expiring_first(self, realm=None, exclude=None, model=None,
+                             allow=None):
         """窗口内（临期）的可用账号里做加权轮询；没有候选 -> None（由 pick 回落）。"""
         exclude = exclude or set()
+        allow = set(allow) if allow is not None else None
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allow is None or a.uid in allow)]
         cands = [a for a in snapshot
                  if a.uid not in exclude and a.ready(model=model)
                  and a.in_expiring_window()]
@@ -3404,7 +3419,7 @@ class AccountPool(object):
             return None
         return self._weighted_pick(cands)
 
-    def _rotate_pick(self, realm=None, exclude=None, model=None):
+    def _rotate_pick(self, realm=None, exclude=None, model=None, allow=None):
         """纯 round-robin + 两轮降权扫描（task-74 三族之三）。
 
         第一轮先跳过降权窗口内的账号（degraded()），第二轮不跳过——降权号仍然
@@ -3412,8 +3427,11 @@ class AccountPool(object):
         的池行为与原实现逐字节一致。
         """
         exclude = exclude or set()
+        allow = set(allow) if allow is not None else None
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            snapshot = [a for a in self.accounts
+                        if (not realm or a.realm == realm)
+                        and (allow is None or a.uid in allow)]
             start = self._cursor
         total = len(snapshot)
         if total == 0:
@@ -3433,21 +3451,25 @@ class AccountPool(object):
                     return account
         return None
 
-    def pick(self, realm=None, exclude=None, model=None):
+    def pick(self, realm=None, exclude=None, model=None, allow=None):
         """选号：临期积分优先（平滑加权），否则回落普通轮转。
 
         `expiring_window_days` 默认 0（R7）-> in_expiring_window() 恒 False ->
         _pick_expiring_first 返回 None -> 与旧的纯 round-robin **完全一致**。
         """
         account = self._pick_expiring_first(realm=realm, exclude=exclude,
-                                            model=model)
+                                            model=model, allow=allow)
         if account is not None:
             return account
-        return self._rotate_pick(realm=realm, exclude=exclude, model=model)
+        return self._rotate_pick(realm=realm, exclude=exclude, model=model,
+                                 allow=allow)
 
-    def representative(self, realm=None):
+    def representative(self, realm=None, allow=None):
+        allow = set(allow) if allow is not None else None
         with self._lock:
-            candidates = [a for a in self.accounts if not realm or a.realm == realm]
+            candidates = [a for a in self.accounts
+                          if (not realm or a.realm == realm)
+                          and (allow is None or a.uid in allow)]
             for account in candidates:
                 if account.access_token:
                     return account

@@ -2072,6 +2072,9 @@ def runtime_settings_view(include_admin=True):
             "name": entry.get("name") or "",
             "realm": entry.get("realm") or "",
             "enabled": entry.get("enabled", True) is not False,
+            "accounts": (list(entry.get("accounts"))
+                         if isinstance(entry.get("accounts"), (list, tuple))
+                         else None),
             "masked": (raw[:4] + "*" * 6 + raw[-4:]) if len(raw) > 8
             else "*" * len(raw),
             "source": entry.get("source") or "panel",
@@ -4735,7 +4738,7 @@ class RateLimited(Exception):
 ERROR_COOLDOWN_WAIT_MAX = 10.0
 
 
-def _realm_ready_total(realm, model=None):
+def _realm_ready_total(realm, model=None, allow=None):
     """本区域当前可轮换的就绪账号数 —— **唯一口径**（#29 的成因就是两处口径分叉）。
 
     冷却函数曾用 len(POOL.accounts)（全局），open_upstream 用 count_ready(realm)。
@@ -4747,12 +4750,14 @@ def _realm_ready_total(realm, model=None):
         # （= 单号池语义：冷却压短）。绝不因为「判不出区域」而误判成多号池。
         return 1
     try:
-        return max(1, POOL.count_ready(realm, model=model))
+        if allow is None:
+            return max(1, POOL.count_ready(realm, model=model))
+        return max(1, POOL.count_ready(realm, model=model, allow=allow))
     except Exception:
         return 1
 
 
-def _short_error_cooldown_wait(realm, model, exclude=None):
+def _short_error_cooldown_wait(realm, model, exclude=None, allow=None):
     """账号级短冷却（含**预算内**的模型级频控窗）的最短剩余秒数；不适用返回 0。
 
     两条冷却来源**一起收集、取最小值**（#29 起）：
@@ -4769,10 +4774,13 @@ def _short_error_cooldown_wait(realm, model, exclude=None):
     if not POOL:
         return 0.0
     exclude = exclude or set()
+    allow = set(allow) if allow is not None else None
     now = time.time()
     waits = []
     for a in POOL.accounts:
         if a.realm != realm or not a.enabled or not a.access_token:
+            continue
+        if allow is not None and a.uid not in allow:
             continue
         if a.uid in exclude:
             continue
@@ -5053,7 +5061,7 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
 
 
 def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
-                                  holder, account):
+                                  holder, account, allow=None):
     """非流式：流内瞬时错误信封 / 传输抖动 -> 重开上游重新聚合。
 
     仅用于客户端尚未收到任何字节的非流式路径。返回 (chat_obj, account)：
@@ -5080,8 +5088,11 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                        TRANSIENT_MAX_RETRIES + 1), level="WARN", tag="chat")
                 time.sleep(attempt + 1)
                 try:
-                    new_resp, account, _ = open_upstream(
-                        payload, session_key=session_key, target_realm=realm)
+                    reopen_args = {"session_key": session_key,
+                                   "target_realm": realm}
+                    if allow is not None:
+                        reopen_args["allow"] = allow
+                    new_resp, account, _ = open_upstream(payload, **reopen_args)
                 except Exception as reopen_exc:
                     log("reopen after envelope error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -5102,8 +5113,11 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                        str(exc)[:120]), level="WARN", tag="chat")
                 time.sleep(attempt + 1)
                 try:
-                    new_resp, account, _ = open_upstream(
-                        payload, session_key=session_key, target_realm=realm)
+                    reopen_args = {"session_key": session_key,
+                                   "target_realm": realm}
+                    if allow is not None:
+                        reopen_args["allow"] = allow
+                    new_resp, account, _ = open_upstream(payload, **reopen_args)
                 except Exception as reopen_exc:
                     log("reopen after transport error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -5122,7 +5136,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 pass
 
 
-def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
+def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
+                  allow=None):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
 
     usage_ctx：可选**出参** dict。传入时回填本次请求的推理档位审计信息
@@ -5151,7 +5166,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
     model_key = qoder_catalog.resolve_upstream_key(model, realm=realm)
 
-    representative = POOL.pick(realm=realm) if POOL else None
+    if POOL:
+        representative = (POOL.representative(realm=realm)
+                          if allow is None else
+                          POOL.representative(realm=realm, allow=allow))
+    else:
+        representative = None
     body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
@@ -5170,7 +5190,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(body_obj.get("messages") or [])))
 
-    total = _realm_ready_total(realm, model)   # #29：与冷却函数共用同一口径
+    total = _realm_ready_total(realm, model, allow=allow)   # #29：与冷却函数共用同一口径
     tried = set()
     last_error = None
     last_429 = None
@@ -5180,12 +5200,21 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
     for _ in range(total + 2):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                        exclude=tried, model=model) if POOL else None
+        if POOL:
+            if allow is None:
+                account = POOL.pick_for_session(
+                    realm=realm, session_key=session_key,
+                    exclude=tried, model=model)
+            else:
+                account = POOL.pick_for_session(
+                    realm=realm, session_key=session_key,
+                    exclude=tried, model=model, allow=allow)
+        else:
+            account = None
         if account is None:
             if not waited_cool:
                 wait = _short_error_cooldown_wait(realm, model,
-                                                  exclude=tried)
+                                                  exclude=tried, allow=allow)
                 if wait > 0:
                     waited_cool = True
                     log("accounts in short error-cooldown for '%s' "
@@ -6913,6 +6942,31 @@ class Handler(BaseHTTPRequestHandler):
         """
         return str((self.key_entry or {}).get("id") or "")
 
+    def _key_allowed_uids(self):
+        """Return the account UID scope for this request's API Key.
+
+        Explicit ``accounts`` on a configured key wins.  AAC ordinary-user
+        keys (including issued tenant keys with no explicit list) are scoped
+        to the current tenant pool.  Administrator/legacy keys keep the
+        historical unrestricted behavior.
+        """
+        entry = self.key_entry or {}
+        raw = entry.get("accounts")
+        if isinstance(raw, (list, tuple, set)):
+            return {str(uid).strip() for uid in raw if str(uid).strip()}
+        principal = getattr(self, "principal", None)
+        role = getattr(principal, "role", "")
+        if not role:
+            role = self._oauth_role()
+        if role == "user" and self.tenant_runtime is not None:
+            try:
+                accounts = list(POOL.accounts)
+            except Exception:
+                accounts = []
+            return {str(account.uid) for account in accounts
+                    if getattr(account, "uid", "")}
+        return None
+
     def _cross_realm_error(self, model, realm):
         """解释模型/出口错配，替代上游晦涩的 403。"""
         if not realm or not model:
@@ -7588,6 +7642,13 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             # 面板只画掩码 Key：空值表示“保留原值”，不是“清空”。
             existing = {entry.get("id"): entry for entry in configured_keys()}
+            if user_scope:
+                try:
+                    tenant_uids = {str(account.uid) for account in POOL.accounts}
+                except Exception:
+                    tenant_uids = set()
+            else:
+                tenant_uids = set()
             cleaned = []
             for index, item in enumerate(raw):
                 if not isinstance(item, dict):
@@ -7616,6 +7677,27 @@ class Handler(BaseHTTPRequestHandler):
                     or (existing.get(entry_id, {}).get("created_at")
                         if entry_id in existing else None) \
                     or time.strftime("%Y/%m/%d %H:%M")
+                if "accounts" in item:
+                    raw_accounts = item.get("accounts")
+                    if not isinstance(raw_accounts, (list, tuple)):
+                        return self._error(400, "accounts must be a list",
+                                           "invalid_request_error")
+                    accounts = [str(uid).strip() for uid in raw_accounts
+                                if str(uid).strip()]
+                elif user_scope:
+                    # 普通用户新建/更新 Key 默认绑定自己租户当前全部账号；
+                    # 不能把缺省值解释成管理员语义的「不限账号」。
+                    previous = existing.get(entry_id, {}).get("accounts")
+                    accounts = ([str(uid).strip() for uid in previous
+                                 if str(uid).strip()]
+                                if isinstance(previous, (list, tuple))
+                                else sorted(tenant_uids))
+                else:
+                    previous = existing.get(entry_id, {}).get("accounts")
+                    accounts = ([str(uid).strip() for uid in previous
+                                 if str(uid).strip()]
+                                if isinstance(previous, (list, tuple))
+                                else None)
                 cleaned.append({
                     "id": entry_id,
                     "name": str(item.get("name") or "").strip(),
@@ -7626,6 +7708,7 @@ class Handler(BaseHTTPRequestHandler):
                     # P1-4：每 Key 模型白名单（原样透传；规范化统一在
                     # qoder_settings._clean_key_entry 一处完成）。
                     "models": item.get("models"),
+                    "accounts": accounts,
                 })
             qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
             reply["api_keys_saved"] = len(cleaned)
@@ -8147,6 +8230,7 @@ class Handler(BaseHTTPRequestHandler):
             messages=chat_req.get("messages"))
         holder = {"usage": None,
                   "allowed_names": _tool_names_from_payload(chat_req)}
+        allowed_uids = self._key_allowed_uids()
         log("anthropic: model=%s stream=%s msgs=%d effort=%r structured=%s"
             % (model, want_stream, len(chat_req.get("messages") or []),
                chat_req.get("reasoning_effort"),
@@ -8158,7 +8242,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account, _ = open_upstream(
                 chat_req, session_key=session_key, target_realm=req_realm,
-                usage_ctx=usage_ctx)
+                usage_ctx=usage_ctx, allow=allowed_uids)
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
@@ -8246,7 +8330,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, allow=allowed_uids)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000))
@@ -8283,6 +8367,7 @@ class Handler(BaseHTTPRequestHandler):
                sorted(custom_names) or "-"))
         holder = {"usage": None, "custom_names": custom_names,
                   "allowed_names": _tool_names_from_payload(chat_req)}
+        allowed_uids = self._key_allowed_uids()
         try:
             req_realm = self._request_realm() or CURRENT_REALM
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
@@ -8291,7 +8376,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account, _ = open_upstream(
                 chat_req, session_key=session_key, target_realm=req_realm,
-                usage_ctx=usage_ctx)
+                usage_ctx=usage_ctx, allow=allowed_uids)
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
@@ -8385,7 +8470,8 @@ class Handler(BaseHTTPRequestHandler):
                                     cur2, account, _ = open_upstream(
                                         chat_req, session_key=session_key,
                                         target_realm=req_realm,
-                                        usage_ctx=usage_ctx)
+                                        usage_ctx=usage_ctx,
+                                        allow=allowed_uids)
                                 except Exception as rex:
                                     log("responses reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -8437,7 +8523,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, allow=allowed_uids)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000))
@@ -8594,6 +8680,7 @@ class Handler(BaseHTTPRequestHandler):
         fp = prompt_fingerprint(payload.get("messages"))
         t_start = time.time()
         effort = requested_effort(payload)   # 与 usage 记账、请求体构造同源
+        allowed_uids = self._key_allowed_uids()
         log("chat: model=%s client_effort=%r stream=%s msgs=%d"
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))
@@ -8605,7 +8692,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account, _ = open_upstream(payload, session_key=session_key,
                                                  target_realm=req_realm,
-                                                 usage_ctx=usage_ctx)
+                                                 usage_ctx=usage_ctx,
+                                                 allow=allowed_uids)
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
@@ -8687,7 +8775,8 @@ class Handler(BaseHTTPRequestHandler):
                                     cur2, account, _ = open_upstream(
                                         payload, session_key=session_key,
                                         target_realm=req_realm,
-                                        usage_ctx=usage_ctx)
+                                        usage_ctx=usage_ctx,
+                                        allow=allowed_uids)
                                 except Exception as rex:
                                     log("chat reopen failed: %s"
                                         % str(rex)[:160], level="WARN")
@@ -8745,7 +8834,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result, account = aggregate_with_envelope_retry(
                     upstream, payload, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, allow=allowed_uids)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000))
