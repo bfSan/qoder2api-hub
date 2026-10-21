@@ -59,8 +59,6 @@ class Scheduler(object):
         self.startup_claim_date = str(st.get("startup_claim_date") or "")
         self.last_cycle_date = str(st.get("last_cycle_date") or "")
         self._calc_next_fire()
-        # 把任务层失败（死端点、上游结构变化）也打进看板日志。
-        set_logger(self.log)
         if st:
             self.log("调度器状态已从 %s 恢复（enabled=%s，上次运行 %s）"
                      % (self._state_path(), self.enabled,
@@ -190,6 +188,8 @@ class Scheduler(object):
             self.log("跳过本次巡检 (%s)：上一轮仍在执行" % trigger_reason)
             return
         try:
+            # 日志器按线程绑定：租户 Scheduler 并行运行时，详情不能串到其他租户。
+            set_logger(self.log)
             self._run_cycle(trigger_reason, cycle_kind)
         finally:
             self._run_lock.release()
@@ -269,8 +269,14 @@ class Scheduler(object):
             checkin_count = res["accounts_count"]
             earned = res.get("credit_added") or 0
             for line in res["logs"]:
-                if line.startswith("✓") or line.startswith("!"):
-                    self.log(line)
+                detail = line.strip()
+                if detail.startswith(("✓", "!", "⚠", "—")):
+                    self.log(detail)
+            self.log("签到结果：新签 %d 个，已签 %d 个，未开放/跳过 %d 个，失败 %d 个"
+                     % (res.get("succeeded_count", 0),
+                        res.get("already_count", 0),
+                        res.get("unavailable_count", 0),
+                        res.get("failed_count", 0)))
         elif checkin_due:
             self.log("所有账号今日已签到")
 
@@ -282,7 +288,7 @@ class Scheduler(object):
                 pass
             time.sleep(0.5)
 
-        self.log("巡检完成：Token 保活 %d 个，签到 %d 个，本次新增积分 +%d"
+        self.log("巡检完成：Token 保活 %d 个，签到尝试 %d 个，本次新增积分 +%d"
                  % (ka["refreshed"], checkin_count, earned))
         self._save_state()
 

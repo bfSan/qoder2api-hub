@@ -17,7 +17,14 @@ import time
 import qoder_accounts
 from qoder_accounts import get_realm_config
 
-_log = lambda msg: None
+_default_log = lambda msg: None
+_logger_local = threading.local()
+
+
+def _log(msg):
+    """Route task diagnostics to the logger bound to the current worker thread."""
+    logger = getattr(_logger_local, "fn", None) or _default_log
+    logger(msg)
 
 # ---------------------------------------------------------------------------
 # 面板读路径短缓存
@@ -43,9 +50,12 @@ def invalidate_panel_cache(uid=None):
 
 
 def set_logger(fn):
-    """把任务诊断路由到调用方的日志器（端点吞错时依然可见）。"""
-    global _log
-    _log = fn or (lambda msg: None)
+    """把任务诊断路由到当前线程的日志器（端点吞错时依然可见）。
+
+    多个租户 Scheduler 会在各自的后台线程并行执行。日志器若用进程级全局变量，
+    后启动的租户会覆盖前一个租户，导致签到详情串到别人的状态文件。
+    """
+    _logger_local.fn = fn or (lambda msg: None)
 
 
 # ---------------------------------------------------------------------------
@@ -748,7 +758,10 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
     else:
         logs.append(f"! [{name}] 活动平台查询失败：{camp.get('error')}")
 
-    if camp.get("claimed") or camp.get("already") or camp.get("ok"):
+    # 活动列表查询成功不等于签到已完成。上游可能返回 ok=True 但没有任何
+    # CLAIMABLE 活动；此时必须继续走旧 sash 签到接口，否则会被这里短路，
+    # 表现为「调度器执行了签到，但余额和 lastCheckin 都没变化」。
+    if camp.get("claimed") or camp.get("already"):
         for item in camp.get("pending") or []:
             logs.append("⏳ [%s] %s：今日名额已发完，次日 10:00 后自动重试"
                         % (name, qoder_accounts.campaign_label(item)))
@@ -778,6 +791,7 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
     # --- 2) 旧 sash 签到接口兜底 ---
     # Account.checkin() 内部已带状态前置与 DISABLED 守卫（不硬 claim）
     res2 = account.checkin()
+    already = False
     if res2.get("ok"):
         if res2.get("unavailable") or res2.get("disabled"):
             logs.append(f"— [{name}] {res2.get('msg')}，本次跳过")
@@ -786,6 +800,7 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
                     "unavailable": bool(res2.get("unavailable")),
                     "disabled": bool(res2.get("disabled"))}
         if res2.get("already"):
+            already = True
             logs.append(f"✓ [{name}] {res2.get('msg')}")
         else:
             earned = int(res2.get("reward_credits") or 0)
@@ -802,7 +817,7 @@ def run_checkin(account, gap=1.0, only_daily=False, claim_gap=None):
         logs.append(f"  当前额度余额: {remain}")
     account.fetch_plan()
     return {"ok": True, "logs": logs, "earned_credit": earned,
-            "credits": account.credits}
+            "already": already, "credits": account.credits}
 
 
 # Pro 升级包一次性奖励面额：上游 eligibility/claim 目前不回传金额，故此处兜底；
@@ -864,15 +879,35 @@ def run_pro_claim(account):
 # 批量：看板「一键签到领积分」/「领取福利包」
 # ---------------------------------------------------------------------------
 def run_batch_checkin(targets, gap=1.0, inter_gap=1.5):
-    """批量签到。返回 {ok, logs, credit_added, accounts_count}。"""
+    """批量签到。返回执行日志、新增积分及分类计数。"""
     combined, total, done = [], 0, 0
+    succeeded = already = unavailable = failed = 0
+    results = []
     for i, acc in enumerate(targets):
         nick = acc.nickname or acc.uid[:8]
         combined.append("====== 正在为账号 [%s (%s)] 执行每日签到 (%d/%d) ======"
                         % (nick, acc.uid, i + 1, len(targets)))
         res = run_checkin(acc, gap=gap)
         total += res.get("earned_credit") or 0
-        done += 1 if res.get("ok") else 0
+        if res.get("ok"):
+            done += 1
+            if res.get("already"):
+                already += 1
+            elif res.get("unavailable") or res.get("disabled"):
+                unavailable += 1
+            else:
+                succeeded += 1
+        else:
+            failed += 1
+        results.append({
+            "uid": acc.uid,
+            "nickname": acc.nickname,
+            "ok": bool(res.get("ok")),
+            "earned_credit": res.get("earned_credit") or 0,
+            "already": bool(res.get("already")),
+            "unavailable": bool(res.get("unavailable") or res.get("disabled")),
+            "error": res.get("error") or "",
+        })
         for line in res.get("logs") or []:
             combined.append("  " + line)
         if i < len(targets) - 1:
@@ -881,8 +916,17 @@ def run_batch_checkin(targets, gap=1.0, inter_gap=1.5):
                     % (len(targets), total))
     for line in combined:
         _log(line)
-    return {"ok": done > 0, "logs": combined, "credit_added": total,
-            "accounts_count": len(targets)}
+    return {
+        "ok": done > 0,
+        "logs": combined,
+        "credit_added": total,
+        "accounts_count": len(targets),
+        "succeeded_count": succeeded,
+        "already_count": already,
+        "unavailable_count": unavailable,
+        "failed_count": failed,
+        "results": results,
+    }
 
 
 def run_batch_pro_claim(targets, gap=1.0, inter_gap=1.5):
