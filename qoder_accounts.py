@@ -3557,6 +3557,18 @@ class AccountPool(object):
             "invalid": invalid,
         }
 
+    def import_desktop_credential(self, path=None, realm=None):
+        """Import scanned local credentials into this exact pool."""
+        return import_desktop_credential(path=path, realm=realm, pool=self)
+
+    def refresh_account(self, account):
+        """Refresh and persist an account through its owning pool."""
+        if account is None:
+            return False
+        ok = account.refresh()
+        account.save(self.dir)
+        return ok
+
     # -- OAuth 设备授权登录 ------------------------------------------------
     @staticmethod
     def _local_machine_id(realm):
@@ -3935,8 +3947,11 @@ def scan_desktop_credentials():
     return found
 
 
-def import_desktop_credential(path=None, realm=None):
+def import_desktop_credential(path=None, realm=None, pool=None):
     """把扫描到的凭证导入账号池。path=None 时导入扫描到的全部有效项。"""
+    target_pool = pool or _ACTIVE_POOL
+    if target_pool is None:
+        raise RuntimeError("account pool not initialised")
     if not path:
         imported, errors = [], []
         for item in scan_desktop_credentials():
@@ -3944,7 +3959,7 @@ def import_desktop_credential(path=None, realm=None):
                 continue
             try:
                 imported.append(import_desktop_credential(
-                    path=item["path"], realm=item["realm"]))
+                    path=item["path"], realm=item["realm"], pool=target_pool))
             except Exception as exc:
                 errors.append("%s/%s: %s" % (item["realm"], item["file"], exc))
         if errors:
@@ -4013,7 +4028,7 @@ def import_desktop_credential(path=None, realm=None):
         "source": "desktop-app",
         "enabled": True,
     })
-    return add_to_pool(account)
+    return target_pool.add(account)
 
 
 # ---------------------------------------------------------------------------

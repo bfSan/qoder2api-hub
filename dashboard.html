@@ -2512,6 +2512,7 @@ function accountRow(a){
     + '<td style="text-align:left">'
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
+    + (a.owner_label ? ('<div style="color:var(--dim);font-size:10px;margin-top:2px">归属: ' + esc(a.owner_label) + '</div>') : '')
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
@@ -3570,6 +3571,9 @@ async function startDashboard(){
 async function loadSettings(showToast){
   try {
     const data = await getJSON('/settings');
+    window.API_KEY_MANAGE_ALL = data.api_key_manage_all === true;
+    window.API_KEY_SCOPES = Array.isArray(data.api_key_scopes)
+      ? data.api_key_scopes : [];
     const pwdState = document.getElementById('setPwdState');
     if(pwdState){
       pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
@@ -3594,6 +3598,10 @@ async function loadSettings(showToast){
       realm: k.realm || '',
       enabled: k.enabled !== false,
       created_at: k.created_at || '',
+      accounts: Array.isArray(k.accounts) ? k.accounts : null,
+      scope: k.scope || '',
+      tenant_id: k.tenant_id || '',
+      owner_label: k.owner_label || '',
       _editing: false,
     }));
     window.API_KEY_ROWS = API_KEY_ROWS;
@@ -3709,6 +3717,9 @@ function renderKeyRows(){
 
     const displayKey = row.masked || (row.key ? (row.key.slice(0, 4) + '******' + row.key.slice(-4)) : '未设置');
     const createdStr = row.created_at ? ('创建时间 ' + esc(row.created_at)) : '';
+    const ownerBadge = row.owner_label
+      ? '<span class="badge s" style="font-size:11px">' + esc(row.owner_label) + '</span>'
+      : '';
 
     return '<div class="key-card' + (row.enabled ? '' : ' disabled') + '">'
       + '<div class="key-card-main">'
@@ -3717,6 +3728,7 @@ function renderKeyRows(){
       +       '<span style="font-size:15px;font-weight:700;color:var(--fg)">' + esc(row.name || '未命名') + '</span>'
       +       statusBadge
       +       realmBadge
+      +       ownerBadge
       +     '</div>'
       +     '<div style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
       +       '<span>Key: <span class="mono" style="color:var(--fg);font-weight:500">' + esc(displayKey) + '</span></span>'
@@ -3820,6 +3832,10 @@ function addApiKeyRow(){
     realm: '',
     enabled: true,
     masked: '',
+    accounts: null,
+    scope: 'global',
+    tenant_id: '',
+    owner_label: '全局',
     _editing: true
   });
   renderKeyRows();
@@ -3883,6 +3899,10 @@ async function saveApiKeys(btn){
     enabled: row.enabled !== false,
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
+    created_at: row.created_at || '',
+    accounts: row.accounts || undefined,
+    scope: row.scope || 'global',
+    tenant_id: row.tenant_id || '',
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){
@@ -3893,7 +3913,11 @@ async function saveApiKeys(btn){
   // toggleKeyRow, removeKeyRow), so a missing button must not abort the save.
   if(btn) btn.disabled = true;
   try {
-    await postJSON('/settings/save', {api_keys: payload});
+    const body = {api_keys: payload};
+    if(window.API_KEY_MANAGE_ALL){
+      body.api_key_scopes = window.API_KEY_SCOPES || [];
+    }
+    await postJSON('/settings/save', body);
     toast('已保存 ' + payload.length + ' 个 Key', 'ok');
     loadSettings();
   } catch(e) {

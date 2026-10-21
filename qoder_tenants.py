@@ -118,6 +118,47 @@ class TenantRuntimeManager:
             while len(self._cache) > self.max_cached: self._cache.pop(next(iter(self._cache)))
             return runtime
 
+    def list_runtimes(self):
+        """Return every persisted tenant runtime."""
+        runtimes = []
+        try:
+            names = sorted(os.listdir(self.tenants_root))
+        except OSError:
+            return runtimes
+        for aac_user_id in names:
+            if aac_user_id.startswith("."):
+                continue
+            root = os.path.join(self.tenants_root, aac_user_id)
+            if not os.path.isdir(root):
+                continue
+            user = TenantFileStore(
+                os.path.join(root, "user.json"), "unknown", self.app_id
+            ).load()
+            qoder_user_id = str(user.get("qoder_user_id") or "")
+            if not qoder_user_id:
+                continue
+            try:
+                runtimes.append(self.get_or_create(aac_user_id, qoder_user_id))
+            except ValueError:
+                continue
+        return runtimes
+
+    def ensure_scheduler(self, runtime):
+        """Start a tenant's scheduler once, including tenants created at runtime."""
+        if runtime is None:
+            return None
+        return runtime.scheduler
+
+    def start_schedulers(self):
+        """Start every persisted tenant scheduler at process startup."""
+        started = []
+        for runtime in self.list_runtimes():
+            try:
+                started.append(self.ensure_scheduler(runtime))
+            except Exception:
+                continue
+        return started
+
     def _load_index(self):
         try:
             with open(self.index_path, encoding="utf-8") as fh:
@@ -191,6 +232,265 @@ class TenantRuntimeManager:
         if str(resource_owner_id or "") != str(getattr(principal, "qoder_user_id", "")):
             raise TenantError("QD_TENANT_FORBIDDEN", "resource belongs to another tenant", 403)
         return None
+
+
+class AggregateAccountPool:
+    """Admin view across global and tenant pools without losing ownership."""
+
+    def __init__(self, pools, metadata=None, log=None):
+        import qoder_accounts
+        self.pools = [pool for pool in pools if pool is not None]
+        self.log = log or (lambda msg: None)
+        self.affinity = qoder_accounts.SessionAffinity()
+        self._lock = threading.RLock()
+        self._cursor = 0
+        self.accounts = []
+        self._owners = {}
+        self._owner_meta = {}
+        self._metadata = list(metadata or [])
+        while len(self._metadata) < len(self.pools):
+            self._metadata.append({})
+        self._rebuild()
+
+    @property
+    def dir(self):
+        return self.pools[0].dir if self.pools else ""
+
+    def _rebuild(self):
+        accounts = []
+        owners = {}
+        owner_meta = {}
+        for index, pool in enumerate(self.pools):
+            meta = dict(self._metadata[index] or {})
+            for account in pool.accounts:
+                uid = str(account.uid or "")
+                if not uid or uid in owners:
+                    continue
+                owners[uid] = pool
+                owner_meta[uid] = meta
+                accounts.append(account)
+        with self._lock:
+            self.accounts = accounts
+            self._owners = owners
+            self._owner_meta = owner_meta
+
+    def reload(self):
+        for pool in self.pools:
+            pool.load()
+        self._rebuild()
+
+    def list_public(self, realm=None):
+        rows = []
+        for account in self.accounts:
+            if realm and realm != "all" and account.realm != realm:
+                continue
+            row = account.public()
+            row.update(self._owner_meta.get(account.uid) or {})
+            rows.append(row)
+        return rows
+
+    def get(self, uid):
+        with self._lock:
+            for account in self.accounts:
+                if account.uid == uid:
+                    return account
+        return None
+
+    def add(self, account):
+        if not self.pools:
+            raise TenantError("QD_ACCOUNT_POOL_EMPTY",
+                              "no account pool available", 503)
+        result = self.pools[0].add(account)
+        self._rebuild()
+        return result
+
+    def remove(self, uid):
+        pool = self._owners.get(uid)
+        if pool is None:
+            return False
+        removed = pool.remove(uid)
+        self._rebuild()
+        return removed
+
+    def preview_import_rows(self, rows, realm=None, overwrite=False):
+        import qoder_accounts
+        preview = {"added": [], "updated": [], "skipped": [], "invalid": []}
+        seen = set()
+        for index, row in enumerate(rows):
+            try:
+                parsed = qoder_accounts.normalise_import_row(row, realm=realm)
+            except Exception as exc:
+                preview["invalid"].append({
+                    "index": index + 1, "reason": str(exc)
+                })
+                continue
+            uid = parsed["uid"]
+            if uid in seen:
+                preview["skipped"].append({
+                    "uid": uid, "reason": "duplicate inside the document"
+                })
+            elif uid in self._owners and not overwrite:
+                preview["skipped"].append({
+                    "uid": uid, "reason": "already exists"
+                })
+            elif uid in self._owners:
+                preview["updated"].append(uid)
+            else:
+                preview["added"].append(uid)
+            seen.add(uid)
+        return preview
+
+    def import_rows(self, rows, realm=None, overwrite=False):
+        import qoder_accounts
+        report = {"added": [], "updated": [], "skipped": [], "invalid": []}
+        seen = set()
+        for index, row in enumerate(rows):
+            try:
+                parsed = qoder_accounts.normalise_import_row(row, realm=realm)
+            except Exception as exc:
+                report["invalid"].append({
+                    "index": index + 1, "reason": str(exc)
+                })
+                continue
+            uid = parsed["uid"]
+            if uid in seen:
+                report["skipped"].append({
+                    "uid": uid, "reason": "duplicate inside the document"
+                })
+                continue
+            seen.add(uid)
+            pool = self._owners.get(uid) or (
+                self.pools[0] if self.pools else None
+            )
+            if pool is None:
+                report["invalid"].append({
+                    "index": index + 1, "reason": "no account pool available"
+                })
+                continue
+            if uid in self._owners and not overwrite:
+                report["skipped"].append({
+                    "uid": uid, "reason": "already exists"
+                })
+                continue
+            result = pool.import_rows([row], realm=realm, overwrite=overwrite)
+            for field in report:
+                report[field].extend(result.get(field) or [])
+        self._rebuild()
+        return report
+
+    def set_enabled(self, uid, enabled):
+        pool = self._owners.get(uid)
+        return pool.set_enabled(uid, enabled) if pool is not None else None
+
+    def set_all_enabled(self, enabled, realm=None):
+        for pool in self.pools:
+            pool.set_all_enabled(enabled, realm=realm)
+        self._rebuild()
+
+    def refresh_account(self, account):
+        pool = self._owners.get(getattr(account, "uid", ""))
+        return pool.refresh_account(account) if pool is not None else False
+
+    def apply_settings(self, limits_data=None, free_models=None):
+        target = self.pools[0] if self.pools else None
+        if target is None:
+            return []
+        return target.apply_settings(
+            limits_data=limits_data, free_models=free_models
+        )
+
+    def count_ready(self, realm=None, model=None, allow=None):
+        allowance = set(allow) if allow is not None else None
+        return sum(
+            1 for account in self.accounts
+            if (not realm or account.realm == realm)
+            and (allowance is None or account.uid in allowance)
+            and account.enabled and account.access_token
+            and account.ready(model=model)
+        )
+
+    def realm_health(self, model=None, allow=None):
+        allowance = set(allow) if allow is not None else None
+        health = {}
+        for account in self.accounts:
+            if account.realm not in ("intl", "cn"):
+                continue
+            if allowance is not None and account.uid not in allowance:
+                continue
+            if account.ready(model=model):
+                health[account.realm] = health.get(account.realm, 0) + 1
+        return health
+
+    def pick_for_session(self, realm=None, session_key=None, exclude=None,
+                         model=None, allow=None):
+        exclude = exclude or set()
+        allowance = set(allow) if allow is not None else None
+        if session_key:
+            bound_uid = self.affinity.get(session_key)
+            if bound_uid and bound_uid not in exclude:
+                account = self.get(bound_uid)
+                if (account and account.realm == realm
+                        and (allowance is None or account.uid in allowance)
+                        and account.ready(model=model)):
+                    return account
+                self.affinity.unbind(session_key)
+        account = self.pick(
+            realm=realm, exclude=exclude, model=model, allow=allowance
+        )
+        if account and session_key:
+            self.affinity.bind(session_key, account.uid)
+        return account
+
+    def pick(self, realm=None, exclude=None, model=None, allow=None):
+        exclude = exclude or set()
+        allowance = set(allow) if allow is not None else None
+        candidates = [
+            account for account in self.accounts
+            if (not realm or account.realm == realm)
+            and (allowance is None or account.uid in allowance)
+        ]
+        if not candidates:
+            return None
+        with self._lock:
+            start = self._cursor
+        for offset in range(len(candidates)):
+            index = (start + offset) % len(candidates)
+            account = candidates[index]
+            if account.uid in exclude:
+                continue
+            if account.ready(model=model):
+                with self._lock:
+                    self._cursor = (index + 1) % len(candidates)
+                return account
+        return None
+
+    def representative(self, realm=None, allow=None):
+        allowance = set(allow) if allow is not None else None
+        candidates = [
+            account for account in self.accounts
+            if (not realm or account.realm == realm)
+            and (allowance is None or account.uid in allowance)
+        ]
+        for account in candidates:
+            if account.access_token:
+                return account
+        return candidates[0] if candidates else None
+
+    def start_login(self, realm="cn", platform="CLI"):
+        return self.pools[0].start_login(realm=realm, platform=platform)
+
+    def poll_login(self, state):
+        return self.pools[0].poll_login(state)
+
+    def cancel_login(self, state):
+        return self.pools[0].cancel_login(state)
+
+    def import_desktop_credential(self, path=None, realm=None, source="file"):
+        result = self.pools[0].import_desktop_credential(
+            path=path, realm=realm
+        )
+        self._rebuild()
+        return result
 
 
 def migrate_legacy_accounts(source_dir, target_tenant_dir, owner_user_id, *, dry_run=False):

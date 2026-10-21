@@ -426,6 +426,9 @@ API_KEY_FILE_SET = False
 def configured_keys():
     """Panel-managed API keys, always read fresh so panel edits apply at once."""
     try:
+        runtime = _REQUEST_RUNTIME.get()
+        if getattr(runtime, "is_admin_aggregate", False):
+            return runtime.api_keys()
         return qoder_settings.api_keys(ACCOUNTS_DIR)
     except Exception as exc:
         log("could not read api keys: %s" % exc)
@@ -1100,6 +1103,79 @@ _LEGACY_ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 _LEGACY_USAGE_DIR = USAGE_DIR
 _LEGACY_USAGE_LOG = USAGE_LOG
 _LEGACY_USAGE_SUMMARY = USAGE_SUMMARY
+
+
+class _AdminAggregateRuntime:
+    """Admin request view over the global workspace and every tenant."""
+
+    is_admin_aggregate = True
+
+    def __init__(self, pool, global_accounts_dir, tenant_runtimes):
+        self.root = global_accounts_dir
+        self.usage = _LEGACY_USAGE_DIR
+        self.usage_log = _LEGACY_USAGE_LOG
+        self.usage_summary = _LEGACY_USAGE_SUMMARY
+        self.pool = pool
+        self.scheduler = SCHEDULER
+        self.global_accounts_dir = global_accounts_dir
+        self.tenant_runtimes = list(tenant_runtimes)
+
+    @staticmethod
+    def _owner_label(runtime):
+        identity = runtime.qoder_user_id or runtime.aac_user_id
+        return "租户 " + str(identity)[-8:]
+
+    @staticmethod
+    def _scoped_keys(directory, scope, tenant_id, owner_label):
+        entries = []
+        for index, entry in enumerate(qoder_settings.api_keys(directory)):
+            item = dict(entry)
+            storage_id = str(item.get("id") or "")
+            item["storage_id"] = storage_id
+            item["scope"] = scope
+            item["tenant_id"] = tenant_id
+            item["owner_label"] = owner_label
+            item["id"] = "%s:%s:%d:%s" % (
+                scope, tenant_id or "global", index, storage_id
+            )
+            entries.append(item)
+        return entries
+
+    def api_keys(self):
+        entries = self._scoped_keys(
+            self.global_accounts_dir, "global", "", "全局"
+        )
+        for runtime in self.tenant_runtimes:
+            entries.extend(self._scoped_keys(
+                runtime.root,
+                "tenant",
+                runtime.aac_user_id,
+                self._owner_label(runtime),
+            ))
+        return entries
+
+    def api_key_scopes(self):
+        scopes = [{"scope": "global", "tenant_id": "", "label": "全局"}]
+        for runtime in self.tenant_runtimes:
+            if not qoder_settings.api_keys(runtime.root):
+                continue
+            scopes.append({
+                "scope": "tenant",
+                "tenant_id": runtime.aac_user_id,
+                "label": self._owner_label(runtime),
+            })
+        return scopes
+
+    def api_key_dir(self, scope, tenant_id=""):
+        if scope == "global":
+            return self.global_accounts_dir
+        if scope == "tenant":
+            for runtime in self.tenant_runtimes:
+                if runtime.aac_user_id == tenant_id:
+                    return runtime.root
+        return None
+
+
 class _TenantPoolProxy:
     def _value(self):
         runtime = _REQUEST_RUNTIME.get()
@@ -1143,6 +1219,126 @@ QD_AUTH_CONFIG = {}
 TENANT_MANAGER = None
 OAUTH_TRANSACTIONS = {}
 OAUTH_LOCK = threading.RLock()
+
+
+def _admin_aggregate_runtime():
+    if _LEGACY_POOL is None:
+        return None
+    runtimes = TENANT_MANAGER.list_runtimes() if TENANT_MANAGER else []
+    pools = [_LEGACY_POOL] + [runtime.pool for runtime in runtimes]
+    metadata = [{
+        "scope": "global",
+        "tenant_id": "",
+        "owner_label": "全局",
+    }]
+    for runtime in runtimes:
+        metadata.append({
+            "scope": "tenant",
+            "tenant_id": runtime.aac_user_id,
+            "owner_label": _AdminAggregateRuntime._owner_label(runtime),
+        })
+    pool = qoder_tenants.AggregateAccountPool(
+        pools, metadata=metadata, log=log
+    )
+    pool.reload()
+    return _AdminAggregateRuntime(
+        pool, _LEGACY_ACCOUNTS_DIR, runtimes
+    )
+
+
+def _save_admin_api_keys(runtime, rows, requested_scopes=None):
+    """Write an aggregate key list back to each row's owning settings file."""
+    existing = {entry.get("id"): entry for entry in runtime.api_keys()}
+    grouped = {}
+    for scope in runtime.api_key_scopes():
+        grouped[(scope.get("scope"), scope.get("tenant_id") or "")] = []
+
+    if requested_scopes is not None:
+        if not isinstance(requested_scopes, list):
+            raise ValueError("api_key_scopes must be a list")
+        for scope in requested_scopes:
+            if not isinstance(scope, dict):
+                raise ValueError("each api key scope must be an object")
+            scope_name = str(scope.get("scope") or "").strip()
+            tenant_id = str(scope.get("tenant_id") or "").strip()
+            if scope_name == "global":
+                tenant_id = ""
+            elif scope_name != "tenant":
+                raise ValueError("invalid api key scope")
+            if runtime.api_key_dir(scope_name, tenant_id) is None:
+                raise ValueError("unknown api key tenant")
+            grouped.setdefault((scope_name, tenant_id), [])
+
+    for item in rows:
+        if not isinstance(item, dict):
+            raise ValueError("each api key must be an object")
+        entry_id = str(item.get("id") or "").strip()
+        previous = existing.get(entry_id)
+        if previous is not None:
+            scope_name = previous.get("scope") or "global"
+            tenant_id = previous.get("tenant_id") or ""
+            storage_id = previous.get("storage_id") or ""
+        else:
+            scope_name = str(item.get("scope") or "global").strip()
+            tenant_id = str(item.get("tenant_id") or "").strip()
+            storage_id = "k" + secrets.token_hex(6)
+        if scope_name == "global":
+            tenant_id = ""
+        elif scope_name != "tenant":
+            raise ValueError("invalid api key scope")
+        if runtime.api_key_dir(scope_name, tenant_id) is None:
+            raise ValueError("unknown api key tenant")
+
+        value = str(item.get("key") or "").strip()
+        if not value and previous is not None:
+            value = previous.get("key") or ""
+        if value and len(value) < 4:
+            raise ValueError("api key must be at least 4 characters")
+        if not value:
+            raise ValueError(
+                "a key entry is empty - fill it in or remove the row"
+            )
+        realm = str(item.get("realm") or "").strip().lower()
+        if realm not in ("", "intl", "cn"):
+            raise ValueError("realm must be intl, cn or empty")
+        if item.get("accounts") is not None:
+            raw_accounts = item.get("accounts")
+            if not isinstance(raw_accounts, (list, tuple)):
+                raise ValueError("accounts must be a list")
+            accounts = [
+                str(uid).strip() for uid in raw_accounts if str(uid).strip()
+            ]
+        else:
+            accounts = (
+                previous.get("accounts") if previous is not None else None
+            )
+        created_at = (
+            item.get("created_at")
+            or (previous.get("created_at") if previous is not None else None)
+            or time.strftime("%Y/%m/%d %H:%M")
+        )
+        grouped.setdefault((scope_name, tenant_id), []).append({
+            "id": storage_id,
+            "name": str(item.get("name") or "").strip(),
+            "key": value,
+            "realm": realm,
+            "enabled": item.get("enabled", True) is not False,
+            "created_at": created_at,
+            "models": item.get(
+                "models",
+                previous.get("models") if previous is not None else None,
+            ),
+            "accounts": accounts,
+        })
+
+    saved = 0
+    for (scope_name, tenant_id), entries in grouped.items():
+        settings_dir = runtime.api_key_dir(scope_name, tenant_id)
+        if settings_dir is None:
+            continue
+        cleaned = qoder_settings.set_api_keys(settings_dir, entries)
+        saved += len(cleaned)
+    return saved
 
 
 def load_persisted_realm():
@@ -2079,9 +2275,18 @@ def runtime_settings_view(include_admin=True):
             else "*" * len(raw),
             "source": entry.get("source") or "panel",
             "created_at": entry.get("created_at") or "",
+            "scope": entry.get("scope") or "",
+            "tenant_id": entry.get("tenant_id") or "",
+            "owner_label": entry.get("owner_label") or "",
         })
+    runtime = _REQUEST_RUNTIME.get()
+    manage_all_keys = bool(getattr(runtime, "is_admin_aggregate", False))
     view = {
         "api_keys": keys,
+        "api_key_manage_all": manage_all_keys,
+        "api_key_scopes": (
+            runtime.api_key_scopes() if manage_all_keys else []
+        ),
         # limits 与保存分支同源：limits_data 返回**完整形状**（每个守卫都补齐
         # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
         # 把已有阈值覆盖成默认值。
@@ -6892,14 +7097,11 @@ class Handler(BaseHTTPRequestHandler):
         supplied = self._supplied_key()
         self.key_entry = None
         self.tenant_runtime = None
-        if self._panel_ok():
-            self.principal = qoder_auth.create_local_admin_session({"session_id": self._panel_token()})
-            _REQUEST_RUNTIME.set(None)
-            return True
         self.principal = _oauth_principal(self)
         if self.principal and self.principal.principal_type == "aac-user":
             if getattr(self.principal, "role", "") == "admin":
-                _REQUEST_RUNTIME.set(None)
+                self.tenant_runtime = _admin_aggregate_runtime()
+                _REQUEST_RUNTIME.set(self.tenant_runtime)
                 return True
             try:
                 self.tenant_runtime = TENANT_MANAGER.get_or_create(
@@ -6907,6 +7109,13 @@ class Handler(BaseHTTPRequestHandler):
                 ) if TENANT_MANAGER else None
             except Exception:
                 self.tenant_runtime = None
+            if TENANT_MANAGER and self.tenant_runtime is not None:
+                try:
+                    TENANT_MANAGER.ensure_scheduler(self.tenant_runtime)
+                except Exception as exc:
+                    log("tenant scheduler start failed for %s: %s"
+                        % (self.tenant_runtime.aac_user_id, exc),
+                        level="WARN", tag="scheduler")
             _REQUEST_RUNTIME.set(self.tenant_runtime)
             scoped = qoder_settings.resolve_api_key(
                 supplied, "qoder2api-hub",
@@ -6914,6 +7123,12 @@ class Handler(BaseHTTPRequestHandler):
             ) if supplied and self.tenant_runtime else None
             self.key_entry = dict(scoped.__dict__) if scoped else None
             return self.tenant_runtime is not None
+        if self._panel_ok():
+            self.principal = qoder_auth.create_local_admin_session(
+                {"session_id": self._panel_token()}
+            )
+            _REQUEST_RUNTIME.set(None)
+            return True
         if supplied and TENANT_MANAGER:
             self.tenant_runtime = TENANT_MANAGER.resolve_api_key_tenant(supplied)
             if self.tenant_runtime is not None:
@@ -7553,13 +7768,17 @@ class Handler(BaseHTTPRequestHandler):
             is_user = bool(user_principal
                            and user_principal.principal_type == "aac-user"
                            and user_principal.role == "user")
-            if is_user:
+            is_admin = bool(user_principal
+                            and user_principal.principal_type == "aac-user"
+                            and user_principal.role == "admin")
+            if is_user or is_admin:
                 if not self._authorized():
                     return
             elif not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
-            if not is_user and qoder_settings.panel_password_is_default(ACCOUNTS_DIR):
+            if (not is_user and not is_admin
+                    and qoder_settings.panel_password_is_default(ACCOUNTS_DIR)):
                 # 默认密码 = 局域网内任何人都能登录；明文 Key 不能这样交出去。
                 return self._error(
                     403,
@@ -7640,9 +7859,23 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(raw, list):
                 return self._error(400, "api_keys must be a list",
                                    "invalid_request_error")
+            if getattr(self.tenant_runtime, "is_admin_aggregate", False):
+                try:
+                    saved = _save_admin_api_keys(
+                        self.tenant_runtime,
+                        raw,
+                        payload.get("api_key_scopes"),
+                    )
+                except ValueError as exc:
+                    return self._error(400, str(exc),
+                                       "invalid_request_error")
+                reply["api_keys_saved"] = saved
+                raw = None
             # 面板只画掩码 Key：空值表示“保留原值”，不是“清空”。
-            existing = {entry.get("id"): entry for entry in configured_keys()}
-            if user_scope:
+            existing = ({entry.get("id"): entry
+                         for entry in configured_keys()}
+                        if raw is not None else {})
+            if user_scope and raw is not None:
                 try:
                     tenant_uids = {str(account.uid) for account in POOL.accounts}
                 except Exception:
@@ -7650,7 +7883,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 tenant_uids = set()
             cleaned = []
-            for index, item in enumerate(raw):
+            for index, item in enumerate(raw or []):
                 if not isinstance(item, dict):
                     return self._error(400, "each api key must be an object",
                                        "invalid_request_error")
@@ -7710,8 +7943,9 @@ class Handler(BaseHTTPRequestHandler):
                     "models": item.get("models"),
                     "accounts": accounts,
                 })
-            qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
-            reply["api_keys_saved"] = len(cleaned)
+            if raw is not None:
+                qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
+                reply["api_keys_saved"] = len(cleaned)
         if "banned_models" in payload:
             # P1-4：全局封禁列表（逗号/分号/换行分隔均可，清洗在 qoder_settings）。
             reply["banned_models"] = qoder_settings.set_banned_models(
@@ -8024,8 +8258,9 @@ class Handler(BaseHTTPRequestHandler):
             if target_path:
                 realm = payload.get("realm")
                 try:
-                    account = qoder_accounts.import_desktop_credential(
-                        path=target_path, realm=realm)
+                    account = POOL.import_desktop_credential(
+                        path=target_path, realm=realm
+                    )
                 except Exception as exc:
                     return self._error(400, "import failed: %s" % exc)
                 log("imported %s (%s) from local client credential"
@@ -8037,7 +8272,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if payload.get("all"):
                 try:
-                    imported = qoder_accounts.import_desktop_credential()
+                    imported = POOL.import_desktop_credential()
                 except Exception as exc:
                     return self._error(400, "import failed: %s" % exc)
                 for account in imported:
@@ -8066,8 +8301,12 @@ class Handler(BaseHTTPRequestHandler):
             targets, skipped = _refreshable_accounts(targets)
             results = []
             for account in targets:
-                ok = account.refresh()
-                account.save(ACCOUNTS_DIR)
+                refresh_account = getattr(POOL, "refresh_account", None)
+                if callable(refresh_account):
+                    ok = refresh_account(account)
+                else:
+                    ok = account.refresh()
+                    account.save(ACCOUNTS_DIR)
                 results.append({"uid": account.uid, "ok": ok,
                                 "error": account.last_error})
             return self._json(200, {"results": results, "skipped": skipped})
@@ -8086,7 +8325,11 @@ class Handler(BaseHTTPRequestHandler):
             }
             t0 = time.time()
             try:
-                resp, acc, _ = open_upstream(test_payload, target_realm=acc_realm(account))
+                resp, acc, _ = open_upstream(
+                    test_payload,
+                    target_realm=acc_realm(account),
+                    allow={str(account.uid)},
+                )
                 with resp:
                     chat_obj = aggregate_stream(resp, test_model, None)
                 wall_ms = int((time.time() - t0) * 1000)
@@ -8574,11 +8817,11 @@ class Handler(BaseHTTPRequestHandler):
             if not is_admin and not is_user:
                 return self._error(401, "panel password or AAC admin required",
                                    "invalid_request_error")
-            if is_user and not is_admin:
-                # Bind the request context to this user's tenant before the
-                # settings handler touches ACCOUNTS_DIR or configured_keys().
-                if not self._authorized():
-                    return
+            # Bind the request context before the settings handler touches
+            # ACCOUNTS_DIR or configured_keys(). AAC admins need the aggregate
+            # runtime; ordinary users need their own tenant runtime.
+            if not self._authorized():
+                return
             return self._handle_settings_save(
                 include_admin=is_admin,
                 user_scope=(is_user and not is_admin),
@@ -8987,6 +9230,14 @@ def main():
     TENANT_MANAGER = qoder_tenants.TenantRuntimeManager(
         os.environ.get("QD_DATA_ROOT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     )
+    try:
+        tenant_schedulers = TENANT_MANAGER.start_schedulers()
+        if tenant_schedulers:
+            log("tenant schedulers started: %d" % len(tenant_schedulers),
+                tag="scheduler")
+    except Exception as exc:
+        log("tenant scheduler startup failed: %s" % exc,
+            level="WARN", tag="scheduler")
     load_persisted_realm()
     # task-61：把设置里的护栏阈值 + free 名单**同批**推给池（R3）；阈值全 0 时
     # 不产生任何副作用，任一 > 0 则惰性启动后台上新线程（G1 的恢复路径）。
