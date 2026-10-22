@@ -256,13 +256,33 @@ class AggregateAccountPool:
     def dir(self):
         return self.pools[0].dir if self.pools else ""
 
-    def _rebuild(self):
+    def _snapshot_pools(self):
+        """Copy every child pool atomically.
+
+        An AccountPool.load() clears and repopulates its ``accounts`` list while
+        holding its own lock.  Admin requests share those pool objects, so
+        iterating ``pool.accounts`` without the lock can observe a half-loaded
+        list and make the aggregate account count fluctuate (1/3/5 rows).
+        """
+        snapshots = []
+        for pool in self.pools:
+            lock = getattr(pool, "_lock", None)
+            if lock is None:
+                snapshots.append(list(pool.accounts))
+            else:
+                with lock:
+                    snapshots.append(list(pool.accounts))
+        return snapshots
+
+    def _rebuild(self, account_groups=None):
         accounts = []
         owners = {}
         owner_meta = {}
-        for index, pool in enumerate(self.pools):
+        groups = account_groups if account_groups is not None \
+            else self._snapshot_pools()
+        for index, (pool, pool_accounts) in enumerate(zip(self.pools, groups)):
             meta = dict(self._metadata[index] or {})
-            for account in pool.accounts:
+            for account in pool_accounts:
                 uid = str(account.uid or "")
                 if not uid or uid in owners:
                     continue
@@ -277,15 +297,18 @@ class AggregateAccountPool:
     def reload(self):
         for pool in self.pools:
             pool.load()
-        self._rebuild()
+        self._rebuild(self._snapshot_pools())
 
     def list_public(self, realm=None):
+        with self._lock:
+            accounts = list(self.accounts)
+            owner_meta = dict(self._owner_meta)
         rows = []
-        for account in self.accounts:
+        for account in accounts:
             if realm and realm != "all" and account.realm != realm:
                 continue
             row = account.public()
-            row.update(self._owner_meta.get(account.uid) or {})
+            row.update(owner_meta.get(account.uid) or {})
             rows.append(row)
         return rows
 

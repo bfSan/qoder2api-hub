@@ -1,6 +1,9 @@
 import os
 import sys
 import tempfile
+import threading
+import time
+import concurrent.futures
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -9,9 +12,9 @@ import qoder_scheduler
 import qoder_tenants
 
 
-def check(name, condition):
+def check(name, condition, detail=None):
     if not condition:
-        raise SystemExit("FAIL: " + name)
+        raise SystemExit("FAIL: %s %r" % (name, detail))
     print("PASS: " + name)
 
 
@@ -131,6 +134,46 @@ check("admin view refreshes through the owning tenant",
 check("admin view still writes new accounts to global",
       pool.add(FakeAccount("new-global"))
       and legacy.added[-1].uid == "new-global")
+
+
+class SlowPool(FakePool):
+    """Concrete AccountPool shape: load mutates accounts while holding _lock."""
+
+    def __init__(self, directory, accounts):
+        super().__init__(directory, accounts)
+        self._lock = threading.RLock()
+
+    def load(self):
+        with self._lock:
+            source = list(self.accounts)
+            self.accounts = []
+            for account in source:
+                time.sleep(0.002)
+                self.accounts.append(account)
+            return list(self.accounts)
+
+
+slow_pools = [
+    SlowPool("/slow-%d" % index, [
+        FakeAccount("slow-%d-a" % index),
+        FakeAccount("slow-%d-b" % index),
+    ])
+    for index in range(6)
+]
+
+
+def concurrent_admin_snapshot(_):
+    current = qoder_tenants.AggregateAccountPool(slow_pools)
+    current.reload()
+    return tuple(sorted(item.uid for item in current.accounts))
+
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+    snapshots = list(executor.map(concurrent_admin_snapshot, range(48)))
+check("concurrent admin refresh never observes partially loaded pools",
+      all(len(snapshot) == 12 for snapshot in snapshots)
+      and len(set(snapshots)) == 1,
+      {len(snapshot): snapshots.count(snapshot) for snapshot in set(snapshots)})
 
 with tempfile.TemporaryDirectory() as root:
     manager = qoder_tenants.TenantRuntimeManager(root)
