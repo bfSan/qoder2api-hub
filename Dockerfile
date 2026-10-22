@@ -3,8 +3,9 @@
 # ---------------------------------------------------------------------------
 # 构建期：提取 UMID 原生组件（@qoder-ai/qodercli 内嵌的 runtime-info）
 # 纯标准库 python 实现（不需要 node）；npm 包只在 builder 阶段存在——31MB 的
-# tarball 与下载过程都不会进入最终镜像。提取失败不阻断构建：那种情况下网关
-# 退化为 derived 身份（活动列表可能被服务端过滤，见 issue #10），功能仍可用。
+# tarball 与下载过程都不会进入最终镜像。提取失败直接终止构建：缺少原生身份
+# 会让每日 Credits 活动被服务端静默过滤，
+# 表现为调度器正常执行但签到永远不到账（issue #10）。
 # ---------------------------------------------------------------------------
 FROM python:3.11-alpine AS umid-builder
 ARG TARGETARCH
@@ -12,9 +13,8 @@ WORKDIR /build
 COPY _install_umid.py ./
 RUN apk add --no-cache ca-certificates && \
     arch="x64"; [ "$TARGETARCH" = "arm64" ] && arch="arm64"; \
-    python _install_umid.py --platform linux --arch "$arch" --dest /build/umid || \
-    echo "WARN: UMID extraction failed (gateway will fall back to derived identity)"; \
-    mkdir -p /build/umid
+    python _install_umid.py --platform linux --arch "$arch" --dest /build/umid && \
+    test -x /build/umid/runtime-info
 
 FROM python:3.11-alpine
 
@@ -49,7 +49,7 @@ COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
 COPY qoder_catalog_intl.json qoder_catalog_cn.json ./
 
 # UMID 原生组件（构建期提取；运行时 qoder_accounts.runtime_info_exe() 在
-# POSIX 下按 <repo>/umid/runtime-info 查找）。builder 提取失败时这里是空目录。
+# POSIX 下按 <repo>/umid/runtime-info 查找）。builder 已在上一步强制校验。
 COPY --from=umid-builder /build/umid /app/umid
 
 # 验证 / 诊断脚本一并入镜像（容器内自检用；纯标准库，零 pip 依赖）：

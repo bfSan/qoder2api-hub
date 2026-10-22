@@ -197,7 +197,8 @@ def vm_status(bridge_vm_info=None, bridge_available=None):
         # 桥不可用/无结果：退化为本机交叉校验结论
         is_vm = bool(hint) or any("虚拟化驱动" in e or "hypervisor" in e
                                  for e in evidence)
-        source = "local" if (evidence or bridge_available is None) else "runtime-info"
+        source = "local" if (evidence or bridge_available is not True) \
+            else "runtime-info"
     else:
         source = "runtime-info"
     if info:

@@ -56,7 +56,7 @@ import qoder_auth
 import qoder_tenants
 import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
-from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
+from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
@@ -2638,7 +2638,6 @@ def read_dynamic_models(realm=None):
             sess = SESSIONS.get(account)
             headers = sess.headers(sign_body, raw_url, model_key="", sse=False,
                                    accept="application/json")
-            headers["User-Agent"] = CLIENT_UA
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
@@ -5456,7 +5455,6 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 sess = SESSIONS.get(account)
                 headers = sess.headers(encoded, raw_url, model_key=model_key,
                                        sse=True)
-                headers["User-Agent"] = CLIENT_UA
                 chat_url = validate_public_http_url(raw_url)
                 req = urllib.request.Request(chat_url,
                                              data=encoded.encode("utf-8"),
